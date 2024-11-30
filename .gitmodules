@@ -1,0 +1,3 @@
+[submodule "xandeum-programs"]
+	path = xandeum-programs
+	url = git@github.com:Xandeum/xandeum-programs.git
