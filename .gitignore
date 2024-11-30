@@ -12,6 +12,9 @@ target/
 /config/
 
 .cache
+.crates.toml
+.crates2.json
+/bin/
 
 # log files
 *.log
