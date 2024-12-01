@@ -144,7 +144,7 @@ members = [
     "vortexor",
     "vote",
     "watchtower",
-    "wen-restart",
+    "wen-restart", "xandeum-programs/common", "xandeum-programs/xand-shield",
     "zk-keygen",
     "zk-sdk",
     "zk-token-sdk",

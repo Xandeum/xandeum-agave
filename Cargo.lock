@@ -1612,6 +1612,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "common"
+version = "0.0.1"
+dependencies = [
+ "solana-program",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12910,6 +12917,14 @@ dependencies = [
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",
+]
+
+[[package]]
+name = "xand-shield"
+version = "0.0.1"
+dependencies = [
+ "common",
+ "solana-program",
 ]
 
 [[package]]
