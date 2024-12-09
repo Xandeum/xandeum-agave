@@ -3853,6 +3853,9 @@ pub mod rpc_full {
                 preflight_bank,
                 preflight_bank.get_reserved_account_keys(),
             )?;
+            // StartXandeum
+            debug!("Bernie SanitizedTransaction: {:#?}", transaction);
+            // EndXandeum
             let signature = *transaction.signature();
 
             let mut last_valid_block_height = preflight_bank

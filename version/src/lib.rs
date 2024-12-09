@@ -20,6 +20,7 @@ enum ClientId {
     JitoLabs,
     Firedancer,
     Agave,
+    Xandeum,
     // If new variants are added, update From<u16> and TryFrom<ClientId>.
     Unknown(u16),
 }
@@ -99,6 +100,7 @@ impl From<u16> for ClientId {
             1u16 => Self::JitoLabs,
             2u16 => Self::Firedancer,
             3u16 => Self::Agave,
+            4u16 => Self::Xandeum,
             _ => Self::Unknown(client),
         }
     }
@@ -113,7 +115,8 @@ impl TryFrom<ClientId> for u16 {
             ClientId::JitoLabs => Ok(1u16),
             ClientId::Firedancer => Ok(2u16),
             ClientId::Agave => Ok(3u16),
-            ClientId::Unknown(client @ 0u16..=3u16) => Err(format!("Invalid client: {client}")),
+            ClientId::Xandeum => Ok(4u16),
+            ClientId::Unknown(client @ 0u16..=4u16) => Err(format!("Invalid client: {client}")),
             ClientId::Unknown(client) => Ok(client),
         }
     }
