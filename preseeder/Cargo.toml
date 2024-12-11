@@ -1,0 +1,11 @@
+[package]
+name = "preseeder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solana-ledger = { path = "../ledger" }
+solana-entry = { path = "../entry" }
+solana-sdk = { path = "../sdk" }
+bs58 = "0.5.1"
+# Add other dependencies if needed

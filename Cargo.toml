@@ -78,6 +78,7 @@ members = [
     "poh",
     "poh-bench",
     "poseidon",
+    "preseeder",
     "program-runtime",
     "program-test",
     "programs/address-lookup-table",

@@ -4700,6 +4700,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "preseeder"
+version = "0.1.0"
+dependencies = [
+ "bs58",
+ "solana-entry",
+ "solana-ledger",
+ "solana-sdk",
+]
+
+[[package]]
 name = "pretty-hex"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
