@@ -115,6 +115,7 @@ else
   DCOU_BINS=(
     agave-ledger-tool
     solana-bench-tps
+    preseeder
   )
 
   # Speed up net.sh deploys by excluding unused binaries
