@@ -64,7 +64,7 @@ stream-cancel = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["codec", "compat"] }
-xandeum-programs-common = { path = "../../xandeum-programs/common" }
+common = { path = "../../xandeum-programs/common" }
 
 [dev-dependencies]
 serial_test = { workspace = true }

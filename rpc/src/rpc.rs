@@ -118,7 +118,7 @@ use {
         time::Duration,
     },
     tokio::runtime::Runtime,
-    xandeum_programs::common::consts::XAND_SHIELD_PROGRAM_ID,
+    common::consts::XAND_SHIELD_PROGRAM_ID,
     solana_sdk::message::SanitizedMessage,
 };
 #[cfg(test)]
