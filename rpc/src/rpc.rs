@@ -3856,32 +3856,37 @@ pub mod rpc_full {
             )?;
             // StartXandeum
             debug!("Bernie SanitizedTransaction: {:#?}", transaction);
-			if !transaction.is_simple_vote_tx() {
-				let msg = transaction.message();
-                let xand_shield_pubkey = Pubkey::from_str(XAND_SHIELD_PROGRAM_ID).expect("Invalid XAND_SHIELD_PROGRAM_ID");
 
-				let xand_shield_index = match msg {
-					SanitizedMessage::Legacy(ref legacy_msg) => {
-						legacy_msg.account_keys().iter().position(|key| key == &xand_shield_pubkey)
-					}
-					SanitizedMessage::V0(ref v0_msg) => {
-						v0_msg.account_keys().iter().position(|key| key == &xand_shield_pubkey)
-					}
+			let msg = transaction.message();
+			let xand_shield_pubkey = Pubkey::from_str(XAND_SHIELD_PROGRAM_ID)
+				.expect("Invalid XAND_SHIELD_PROGRAM_ID");
+
+			let xand_shield_index = match msg {
+				SanitizedMessage::Legacy(ref legacy_msg) => {
+					// LegacyMessage: use legacy_msg.message directly (no parentheses)
+					legacy_msg.message.account_keys.iter().position(|key| key == &xand_shield_pubkey)
+				}
+				SanitizedMessage::V0(ref v0_msg) => {
+					// V0: v0_msg.message is a v0::Message with fields directly available
+					v0_msg.message.account_keys.iter().position(|key| key == &xand_shield_pubkey)
+				}
+			};
+
+			if let Some(xand_shield_pos) = xand_shield_index {
+				let instructions = match msg {
+					SanitizedMessage::Legacy(legacy_msg) => &legacy_msg.message.instructions,
+					SanitizedMessage::V0(v0_msg) => &v0_msg.message.instructions,
 				};
 
-				if let Some(xand_shield_pos) = xand_shield_index {
-					let instructions = match msg {
-						SanitizedMessage::Legacy(legacy_msg) => legacy_msg.instructions(),
-						SanitizedMessage::V0(v0_msg) => v0_msg.instructions(),
-					};
-
-					let has_xand_shield_ix = instructions.iter().any(|ix| ix.program_id_index as usize == xand_shield_pos);
-					if has_xand_shield_ix {
-						debug!("Bernie Found X Instruction");
-						return Err(solana_rpc::rpc_error::RpcCustomError::UnsupportedFeature(
-							"XAND_SHIELD instructions are not supported yet".to_string(),
-						).into());
-					}
+				let has_xand_shield_ix = instructions.iter().any(|ix| ix.program_id_index as usize == xand_shield_pos);
+				if has_xand_shield_ix {
+					debug!("Bernie Found X Instruction");
+					use jsonrpc_core::{Error, ErrorCode};
+					return Err(Error {
+						code: ErrorCode::InvalidRequest,
+						message: "XAND_SHIELD instructions are not supported yet".to_string(),
+						data: None,
+					}.into());
 				}
 			}
             // EndXandeum
