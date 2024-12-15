@@ -119,6 +119,7 @@ use {
     },
     tokio::runtime::Runtime,
     xandeum_programs::common::consts::XAND_SHIELD_PROGRAM_ID,
+    solana_sdk::message::SanitizedMessage,
 };
 #[cfg(test)]
 use {
@@ -3858,6 +3859,8 @@ pub mod rpc_full {
             debug!("Bernie SanitizedTransaction: {:#?}", transaction);
 			if !transaction.is_simple_vote_tx() {
 				let msg = transaction.message();
+
+                let xand_shield_pubkey = Pubkey::from_str(XAND_SHIELD_PROGRAM_ID).expect("Invalid XAND_SHIELD_PROGRAM_ID");
 
 				let xand_shield_index = match msg {
 					solana_sdk::sanitized_transaction::SanitizedMessage::Legacy(ref legacy_msg) => {
