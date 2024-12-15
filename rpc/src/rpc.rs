@@ -3858,32 +3858,25 @@ pub mod rpc_full {
             debug!("Bernie SanitizedTransaction: {:#?}", transaction);
 			if !transaction.is_simple_vote_tx() {
 				let msg = transaction.message();
-
                 let xand_shield_pubkey = Pubkey::from_str(XAND_SHIELD_PROGRAM_ID).expect("Invalid XAND_SHIELD_PROGRAM_ID");
 
 				let xand_shield_index = match msg {
-					solana_sdk::sanitized_transaction::SanitizedMessage::Legacy(ref legacy_msg) => {
+					SanitizedMessage::Legacy(ref legacy_msg) => {
 						legacy_msg.account_keys().iter().position(|key| key == &xand_shield_pubkey)
 					}
-					solana_sdk::sanitized_transaction::SanitizedMessage::V0(ref v0_msg) => {
+					SanitizedMessage::V0(ref v0_msg) => {
 						v0_msg.account_keys().iter().position(|key| key == &xand_shield_pubkey)
 					}
 				};
 
 				if let Some(xand_shield_pos) = xand_shield_index {
-					// Check if any instruction uses that program_id_index
 					let instructions = match msg {
-						solana_sdk::sanitized_transaction::SanitizedMessage::Legacy(legacy_msg) => {
-							legacy_msg.instructions()
-						}
-						solana_sdk::sanitized_transaction::SanitizedMessage::V0(v0_msg) => {
-							v0_msg.instructions()
-						}
+						SanitizedMessage::Legacy(legacy_msg) => legacy_msg.instructions(),
+						SanitizedMessage::V0(v0_msg) => v0_msg.instructions(),
 					};
 
 					let has_xand_shield_ix = instructions.iter().any(|ix| ix.program_id_index as usize == xand_shield_pos);
 					if has_xand_shield_ix {
-						// We found a XAND_SHIELD program instruction!
 						debug!("Bernie Found X Instruction");
 						return Err(solana_rpc::rpc_error::RpcCustomError::UnsupportedFeature(
 							"XAND_SHIELD instructions are not supported yet".to_string(),
