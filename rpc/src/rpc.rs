@@ -119,7 +119,6 @@ use {
     },
     tokio::runtime::Runtime,
     common::consts::XAND_SHIELD_PROGRAM_ID,
-    solana_sdk::message::SanitizedMessage,
 };
 #[cfg(test)]
 use {
