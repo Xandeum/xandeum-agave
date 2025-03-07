@@ -6,6 +6,6 @@ edition = "2021"
 [dependencies]
 solana-ledger = { path = "../ledger" }
 solana-entry = { path = "../entry" }
-solana-sdk = { path = "../sdk" }
+solana-sdk = "=2.2.1"  # Matches root Cargo.toml
 bs58 = "0.5.1"
 # Add other dependencies if needed
