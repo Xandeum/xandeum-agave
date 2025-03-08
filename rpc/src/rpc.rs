@@ -113,7 +113,7 @@ use {
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, RwLock,
+            Arc, RwLock, Mutex,
         },
         time::Duration,
     },
@@ -253,6 +253,7 @@ pub struct JsonRpcRequestProcessor {
     max_complete_rewards_slot: Arc<AtomicU64>,
     prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     runtime: Arc<Runtime>,
+    zmq_socket: Arc<Mutex<zmq::Socket>>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
@@ -407,6 +408,9 @@ impl JsonRpcRequestProcessor {
         runtime: Arc<Runtime>,
     ) -> (Self, Receiver<TransactionInfo>) {
         let (transaction_sender, transaction_receiver) = unbounded();
+        let context = zmq::Context::new();
+        let zmq_socket = Arc::new(Mutex::new(context.socket(zmq::PUB).expect("Failed to create ZMQ socket")));
+        zmq_socket.lock().unwrap().connect("ipc:///var/run/xandeum/dock.sock").expect("Failed to connect to Dock");
         (
             Self {
                 config,
@@ -428,6 +432,7 @@ impl JsonRpcRequestProcessor {
                 max_complete_rewards_slot,
                 prioritization_fee_cache,
                 runtime,
+                zmq_socket,
             },
             transaction_receiver,
         )
@@ -3849,6 +3854,7 @@ pub mod rpc_full {
                 min_context_slot,
             })?;
 
+            let unsanitized_tx_clone = unsanitized_tx.clone(); // Xandeum
             let transaction = sanitize_transaction(
                 unsanitized_tx,
                 preflight_bank,
@@ -3881,12 +3887,17 @@ pub mod rpc_full {
 				let has_xand_shield_ix = instructions.iter().any(|ix| ix.program_id_index as usize == xand_shield_pos);
 				if has_xand_shield_ix {
 					debug!("Bernie Found X Instruction");
-					use jsonrpc_core::{Error, ErrorCode};
-					return Err(Error {
-						code: ErrorCode::InvalidRequest,
-						message: "XAND_SHIELD instructions are not supported yet".to_string(),
-						data: None,
-					}.into());
+                    let tx_bytes = bincode::serialize(&unsanitized_tx_clone).expect("Failed to serialize transaction");
+                    meta.zmq_socket.lock().unwrap().send(tx_bytes, 0).expect("Failed to send to Dock");
+                    // Return the transaction signature as success
+                    let signature = unsanitized_tx_clone.signatures[0].to_string();
+                        return Ok(signature);
+					//use jsonrpc_core::{Error, ErrorCode};
+					//return Err(Error {
+					//	code: ErrorCode::InvalidRequest,
+					//	message: "XAND_SHIELD instructions are not supported yet".to_string(),
+					//	data: None,
+					//}.into());
 				}
 			}
             // EndXandeum
