@@ -417,7 +417,7 @@ impl JsonRpcRequestProcessor {
 
                 {
                     let socket_lock = socket.lock().unwrap();
-                    if let Err(e) = socket_lock.connect("ipc:///var/run/xandeum/dock.sock") {
+                    if let Err(e) = socket_lock.bind("ipc:///var/run/xandeum/dock.sock") {
                         log::error!("Failed to connect to Dock: {:?}", e);
                     } else {
                         log::info!("Connected to Dock at ipc:///var/run/xandeum/dock.sock");
