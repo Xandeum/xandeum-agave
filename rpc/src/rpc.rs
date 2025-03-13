@@ -9,6 +9,7 @@ use {
     },
     base64::{prelude::BASE64_STANDARD, Engine},
     bincode::{config::Options, serialize},
+    common::consts::XAND_SHIELD_PROGRAM_ID,
     crossbeam_channel::{unbounded, Receiver, Sender},
     jsonrpc_core::{
         futures::future::{self, FutureExt, OptionFuture},
@@ -113,12 +114,11 @@ use {
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, RwLock, Mutex,
+            Arc, Mutex, RwLock,
         },
         time::Duration,
     },
     tokio::runtime::Runtime,
-    common::consts::XAND_SHIELD_PROGRAM_ID,
 };
 #[cfg(test)]
 use {
@@ -409,8 +409,35 @@ impl JsonRpcRequestProcessor {
     ) -> (Self, Receiver<TransactionInfo>) {
         let (transaction_sender, transaction_receiver) = unbounded();
         let context = zmq::Context::new();
-        let zmq_socket = Arc::new(Mutex::new(context.socket(zmq::PUB).expect("Failed to create ZMQ socket")));
-        zmq_socket.lock().unwrap().connect("ipc:///var/run/xandeum/dock.sock").expect("Failed to connect to Dock");
+
+        let zmq_socket = match context.socket(zmq::PUB) {
+            Ok(socket) => {
+                log::info!("ZMQ socket created successfully.");
+                let socket = Arc::new(Mutex::new(socket));
+
+                {
+                    let socket_lock = socket.lock().unwrap();
+                    if let Err(e) = socket_lock.connect("ipc:///var/run/xandeum/dock.sock") {
+                        log::error!("Failed to connect to Dock: {:?}", e);
+                    } else {
+                        log::info!("Connected to Dock at ipc:///var/run/xandeum/dock.sock");
+                    }
+                }
+
+                socket
+            }
+            Err(e) => {
+                log::error!("Failed to create ZMQ socket: {:?}", e);
+                log::error!("Creating a Default Socket to avoid mismatch");
+
+                Arc::new(Mutex::new(
+                    context
+                        .socket(zmq::PUB)
+                        .expect("Failed to create fallback socket"),
+                ))
+            }
+        };
+
         (
             Self {
                 config,
@@ -3863,43 +3890,67 @@ pub mod rpc_full {
             // StartXandeum
             debug!("Bernie SanitizedTransaction: {:#?}", transaction);
 
-			let msg = transaction.message();
-			let xand_shield_pubkey = Pubkey::from_str(XAND_SHIELD_PROGRAM_ID)
-				.expect("Invalid XAND_SHIELD_PROGRAM_ID");
+            let msg = transaction.message();
+            let xand_shield_pubkey =
+                Pubkey::from_str(XAND_SHIELD_PROGRAM_ID).expect("Invalid XAND_SHIELD_PROGRAM_ID");
 
-			let xand_shield_index = match msg {
-				SanitizedMessage::Legacy(ref legacy_msg) => {
-					// LegacyMessage: use legacy_msg.message directly (no parentheses)
-					legacy_msg.message.account_keys.iter().position(|key| key == &xand_shield_pubkey)
-				}
-				SanitizedMessage::V0(ref v0_msg) => {
-					// V0: v0_msg.message is a v0::Message with fields directly available
-					v0_msg.message.account_keys.iter().position(|key| key == &xand_shield_pubkey)
-				}
-			};
+            let xand_shield_index = match msg {
+                SanitizedMessage::Legacy(ref legacy_msg) => {
+                    // LegacyMessage: use legacy_msg.message directly (no parentheses)
+                    legacy_msg
+                        .message
+                        .account_keys
+                        .iter()
+                        .position(|key| key == &xand_shield_pubkey)
+                }
+                SanitizedMessage::V0(ref v0_msg) => {
+                    // V0: v0_msg.message is a v0::Message with fields directly available
+                    v0_msg
+                        .message
+                        .account_keys
+                        .iter()
+                        .position(|key| key == &xand_shield_pubkey)
+                }
+            };
 
-			if let Some(xand_shield_pos) = xand_shield_index {
-				let instructions = match msg {
-					SanitizedMessage::Legacy(legacy_msg) => &legacy_msg.message.instructions,
-					SanitizedMessage::V0(v0_msg) => &v0_msg.message.instructions,
-				};
+            if let Some(xand_shield_pos) = xand_shield_index {
+                let instructions = match msg {
+                    SanitizedMessage::Legacy(legacy_msg) => &legacy_msg.message.instructions,
+                    SanitizedMessage::V0(v0_msg) => &v0_msg.message.instructions,
+                };
 
-				let has_xand_shield_ix = instructions.iter().any(|ix| ix.program_id_index as usize == xand_shield_pos);
-				if has_xand_shield_ix {
-					debug!("Bernie Found X Instruction");
-                    let tx_bytes = bincode::serialize(&unsanitized_tx_clone).expect("Failed to serialize transaction");
-                    meta.zmq_socket.lock().unwrap().send(tx_bytes, 0).expect("Failed to send to Dock");
+                let has_xand_shield_ix = instructions
+                    .iter()
+                    .any(|ix| ix.program_id_index as usize == xand_shield_pos);
+                if has_xand_shield_ix {
+                    debug!("Bernie Found X Instruction");
+
+                    if let Ok(tx_bytes) = bincode::serialize(&unsanitized_tx_clone) {
+                        match meta.zmq_socket.lock() {
+                            Ok(socket) => {
+                                if let Err(e) = socket.send(tx_bytes, 0) {
+                                    log::error!("Failed to send transaction to Dock: {:?}", e);
+                                } else {
+                                    log::info!("Transaction sent to Dock successfully.");
+                                }
+                            }
+                            Err(e) => log::error!("Failed to lock ZMQ socket: {:?}", e),
+                        }
+                    } else {
+                        log::error!("Failed to serialize transaction.");
+                    }
+
                     // Return the transaction signature as success
                     let signature = unsanitized_tx_clone.signatures[0].to_string();
-                        return Ok(signature);
-					//use jsonrpc_core::{Error, ErrorCode};
-					//return Err(Error {
-					//	code: ErrorCode::InvalidRequest,
-					//	message: "XAND_SHIELD instructions are not supported yet".to_string(),
-					//	data: None,
-					//}.into());
-				}
-			}
+                    return Ok(signature);
+                    //use jsonrpc_core::{Error, ErrorCode};
+                    //return Err(Error {
+                    //	code: ErrorCode::InvalidRequest,
+                    //	message: "XAND_SHIELD instructions are not supported yet".to_string(),
+                    //	data: None,
+                    //}.into());
+                }
+            }
             // EndXandeum
             let signature = *transaction.signature();
 
