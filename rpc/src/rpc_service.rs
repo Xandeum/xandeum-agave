@@ -10,10 +10,14 @@ use {
         rpc_health::*,
     },
     crossbeam_channel::unbounded,
-    jsonrpc_core::{futures::prelude::*, MetaIoHandler},
+    jsonrpc_core::{
+        futures::{lock::Mutex, prelude::*},
+        MetaIoHandler, Params,
+    },
     jsonrpc_http_server::{
-        hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
-        RequestMiddlewareAction, ServerBuilder,
+        hyper::{self, service::make_service_fn, Body, Request, StatusCode},
+        AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
+        RequestMiddlewareAction, Response, Server, ServerBuilder,
     },
     regex::Regex,
     solana_client::connection_cache::ConnectionCache,
@@ -39,7 +43,8 @@ use {
     solana_send_transaction_service::send_transaction_service::{self, SendTransactionService},
     solana_storage_bigtable::CredentialType,
     std::{
-        net::SocketAddr,
+        collections::HashMap,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -47,6 +52,7 @@ use {
         },
         thread::{self, Builder, JoinHandle},
     },
+    tokio::net::UdpSocket,
     tokio_util::codec::{BytesCodec, FramedRead},
 };
 
@@ -483,6 +489,8 @@ impl JsonRpcService {
         let ledger_path = ledger_path.to_path_buf();
 
         let (close_handle_sender, close_handle_receiver) = unbounded();
+        let runtime_clone = runtime.clone();
+
         let thread_hdl = Builder::new()
             .name("solJsonRpcSvc".to_string())
             .spawn(move || {
@@ -544,12 +552,148 @@ impl JsonRpcService {
             .unwrap();
 
         let close_handle = close_handle_receiver.recv().unwrap()?;
+
+        let transaction_results = Arc::new(Mutex::new(HashMap::new()));
+        let transaction_results_clone = transaction_results.clone();
+
+        let udp_listener_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9803);
+        runtime_clone.spawn(async move {
+            let socket = match UdpSocket::bind(udp_listener_addr).await {
+                Ok(socket) => socket,
+                Err(e) => {
+                    error!(
+                        "Failed to bind UDP socket to {}: {:?}",
+                        udp_listener_addr, e
+                    );
+                    return;
+                }
+            };
+            info!("UDP listener started on {}", udp_listener_addr);
+
+            let mut buf = [0u8; 1024];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((len, addr)) => {
+                        let data = &buf[..len];
+                        info!("Received Data From Atlas : {:?}", data);
+                        info!("Received Data From Atlas : {:?}", data.len());
+
+                        if data.len() != 88 {
+                            continue;
+                        }
+                        let res = XTransactionResults::from_bytes(data);
+                        info!("Received UDP data from {}: {:?}", addr, res);
+                        transaction_results_clone
+                            .lock()
+                            .await
+                            .insert(res.sig.clone(), res);
+                    }
+                    Err(e) => {
+                        error!("UDP receive error: {:?}", e);
+                    }
+                }
+                tokio::task::yield_now().await; 
+            }
+        });
+
+   
+        let data_listener_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9801);
+        let (data_close_handle_sender, data_close_handle_receiver) = unbounded();
+
+       
+        let transaction_results_clone_for_rpc = transaction_results.clone();
+
+        thread::spawn(move || {
+            renice_this_thread(rpc_niceness_adj).unwrap();
+
+            let mut io: MetaIoHandler<()> = MetaIoHandler::default();
+          
+            io.add_method("rpc-xtransaction", move |params: Params| {
+                info!("Received a rpc request : {:?}", params);
+                let transaction_results = transaction_results_clone_for_rpc.clone();
+                info!("transaction Results arry : {:?}", transaction_results);
+                async move {
+                    // let signature: String = params.parse().map_err(|e| {
+                    //     jsonrpc_core::Error::invalid_params(format!("Invalid params: {}", e))
+                    // })?;
+                    let params_vec: Vec<String> = params.parse().map_err(|e| {
+                        jsonrpc_core::Error::invalid_params(format!("Invalid params: {}", e))
+                    })?;
+                    let signature = params_vec
+                        .get(0)
+                        .ok_or_else(|| {
+                            jsonrpc_core::Error::invalid_params("Expected a transaction signature")
+                        })?
+                        .clone();
+
+                    info!("Received request for transaction signature: {}", signature);
+
+                
+                    let results = transaction_results.lock().await;
+                    log::info!("results : {:?}",results.);
+                    let result = results.get(&signature);
+
+                    match result {
+                        Some(tx_result) => {
+                          
+                            let json_result = serde_json::to_value(tx_result)
+                                .map_err(|e| jsonrpc_core::Error::internal_error())?;
+                            Ok(json_result)
+                        }
+                        None => {
+                           
+                            Err(jsonrpc_core::Error {
+                                code: jsonrpc_core::ErrorCode::InvalidParams,
+                                message: format!(
+                                    "Transaction result not found for signature: {}",
+                                    signature
+                                ),
+                                data: None,
+                            })
+                        }
+                    }
+                }
+                .boxed()
+            });
+
+            let server = ServerBuilder::new(io)
+                .event_loop_executor(runtime_clone.handle().clone())
+                .threads(1)
+                .cors(DomainsValidation::AllowOnly(vec![
+                    AccessControlAllowOrigin::Any,
+                ]))
+                .cors_max_age(86400)
+                .max_request_body_size(max_request_body_size) 
+                .start_http(&data_listener_addr);
+
+            match server {
+                Ok(server) => {
+                    info!(
+                        "JSON RPC service for transaction results started on {}",
+                        data_listener_addr
+                    );
+                    data_close_handle_sender
+                        .send(Ok(server.close_handle()))
+                        .unwrap();
+                    server.wait();
+                }
+                Err(e) => {
+                    error!("Failed to start JSON RPC service on port 9800: {:?}", e);
+                    data_close_handle_sender.send(Err(e.to_string())).unwrap();
+                }
+            }
+        });
+
+        let data_listener_close_handle = data_close_handle_receiver.recv().unwrap()?;
+
         let close_handle_ = close_handle.clone();
+        let data_listener_close_handle_ = data_listener_close_handle.clone();
         validator_exit
             .write()
             .unwrap()
             .register_exit(Box::new(move || {
                 close_handle_.close();
+                data_listener_close_handle_.close();
             }));
         Ok(Self {
             thread_hdl,

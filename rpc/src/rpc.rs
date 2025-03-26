@@ -208,6 +208,32 @@ impl JsonRpcConfig {
     }
 }
 
+#[cfg_attr(feature = "frozen-abi", derive(solana_frozen_abi_macro::AbiExample))]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+#[derive(Debug, PartialEq, Default, Eq, Clone, serde::Serialize, serde::Deserialize)]
+pub struct XTransactionResults {
+    pub sig: String,
+    pub status: String,
+    pub fs_id: String,
+    pub message: String,
+}
+
+impl XTransactionResults {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let sig = Signature::try_from(&bytes[0..64]).unwrap().to_string();
+        let status = String::from_utf8(bytes[64..72].to_vec()).unwrap();
+        let fs_id = String::from_utf8(bytes[72..80].to_vec()).unwrap();
+        let message = String::from_utf8(bytes[80..88].to_vec()).unwrap();
+
+        Self {
+            sig,
+            status,
+            fs_id,
+            message,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RpcBigtableConfig {
     pub enable_bigtable_ledger_upload: bool,
@@ -409,6 +435,41 @@ impl JsonRpcRequestProcessor {
     ) -> (Self, Receiver<TransactionInfo>) {
         let (transaction_sender, transaction_receiver) = unbounded();
         let context = zmq::Context::new();
+
+        // match context.socket(zmq::SUB) {
+        //     Ok(socket) => {
+        //         log::info!("ZMQ UDP socket created successfully.");
+        //         let socket = Arc::new(Mutex::new(socket));
+
+        //         {
+        //             runtime.spawn(async move {
+        //                 let socket_lock = socket.lock().unwrap();
+
+        //                 socket_lock.bind("tcp://0.0.0.0:9800").unwrap();
+        //                 socket_lock.set_subscribe(b"").expect("error in subscribe");
+        //                 log::info!("Connected to Socket 9800");
+
+        //                 log::info!("Started ZMQ SUB listener thread on port 9800 (TCP)");
+        //                 loop {
+        //                     match socket_lock.recv_bytes(zmq::DONTWAIT) {
+        //                         Ok(msg) => {
+        //                             log::info!("Received result xxtxx");
+        //                             let res = XTransactionResults::from_bytes(&msg);
+        //                             log::info!("Received result xxtxx : {:?}",res);
+        //                         }
+        //                         Err(e) => {
+        //                             log::error!("ZMQ receive error: {:?}", e);
+        //                         }
+        //                     }
+        //                 }
+        //             });
+        //         }
+        //     }
+        //     Err(e) => {
+        //         log::error!("Failed to create ZMQ TCP socket: {:?}", e);
+        //         log::error!("Creating a Default Socket to avoid mismatch");
+        //     }
+        // };
 
         let zmq_socket = match context.socket(zmq::PUB) {
             Ok(socket) => {

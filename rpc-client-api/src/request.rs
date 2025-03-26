@@ -68,6 +68,7 @@ pub enum RpcRequest {
     SendTransaction,
     SimulateTransaction,
     SignVote,
+    GetXTransactionStatus
 }
 
 #[allow(deprecated)]
@@ -133,6 +134,7 @@ impl fmt::Display for RpcRequest {
             RpcRequest::SendTransaction => "sendTransaction",
             RpcRequest::SimulateTransaction => "simulateTransaction",
             RpcRequest::SignVote => "signVote",
+            RpcRequest::GetXTransactionStatus =>"getXTransactionStatus"
         };
 
         write!(f, "{method}")
