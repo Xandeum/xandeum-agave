@@ -1,6 +1,7 @@
 //! The `rpc` module implements the Solana RPC interface.
 #[cfg(feature = "dev-context-only-utils")]
 use solana_runtime::installed_scheduler_pool::BankWithScheduler;
+use zeromq::{PushSocket, Socket};
 use {
     crate::{
         filter::filter_allows, max_slots::MaxSlots,
@@ -253,7 +254,9 @@ pub struct JsonRpcRequestProcessor {
     max_complete_rewards_slot: Arc<AtomicU64>,
     prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     runtime: Arc<Runtime>,
-    zmq_socket: Arc<Mutex<zmq::Socket>>,
+    vega_push_socket: Arc<Mutex<PushSocket>>,
+    altair_push_socket: Arc<Mutex<PushSocket>>,
+
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
@@ -408,34 +411,40 @@ impl JsonRpcRequestProcessor {
         runtime: Arc<Runtime>,
     ) -> (Self, Receiver<TransactionInfo>) {
         let (transaction_sender, transaction_receiver) = unbounded();
-        let context = zmq::Context::new();
+        // let context = zmq::Context::new();
 
-        let zmq_socket = match context.socket(zmq::PUB) {
-            Ok(socket) => {
-                log::info!("ZMQ socket created successfully.");
-                let socket = Arc::new(Mutex::new(socket));
-
-                {
-                    let socket_lock = socket.lock().unwrap();
-                    if let Err(e) = socket_lock.bind("ipc:///var/run/xandeum/dock.sock") {
-                        log::error!("Failed to connect to Dock: {:?}", e);
-                    } else {
-                        log::info!("Connected to Dock at ipc:///var/run/xandeum/dock.sock");
-                    }
+        let vega_push_socket = {
+            let  socket = PushSocket::new();
+            log::info!("Vega PUSH socket created successfully.");
+            let socket = Arc::new(Mutex::new(socket));
+            
+            {
+                let mut socket_lock = socket.lock().unwrap();
+                if let Err(e) = runtime.block_on(socket_lock.bind("ipc:///var/run/xandeum/vega.sock")) {
+                    log::error!("Failed to connect to vega: {:?}", e);
+                } else {
+                    log::info!("Connected to first Dock at ipc:///var/run/xandeum/vega.sock");
                 }
-
-                socket
             }
-            Err(e) => {
-                log::error!("Failed to create ZMQ socket: {:?}", e);
-                log::error!("Creating a Default Socket to avoid mismatch");
+            
+            socket
+        };
 
-                Arc::new(Mutex::new(
-                    context
-                        .socket(zmq::PUB)
-                        .expect("Failed to create fallback socket"),
-                ))
+        let altair_push_socket = {
+            let socket = PushSocket::new();
+            log::info!("Altair PUSH socket created successfully.");
+            let socket = Arc::new(Mutex::new(socket));
+            
+            {
+                let mut  socket_lock = socket.lock().unwrap();
+                if let Err(e) = runtime.block_on(socket_lock.bind("ipc:///var/run/xandeum/altair.sock")) {
+                    log::error!("Failed to connect to altair: {:?}", e);
+                } else {
+                    log::info!("Connected to first Dock at ipc:///var/run/xandeum/altair.sock");
+                }
             }
+            
+            socket
         };
 
         (
@@ -459,7 +468,8 @@ impl JsonRpcRequestProcessor {
                 max_complete_rewards_slot,
                 prioritization_fee_cache,
                 runtime,
-                zmq_socket,
+                vega_push_socket,
+                altair_push_socket
             },
             transaction_receiver,
         )
@@ -3502,7 +3512,7 @@ pub mod rpc_full {
     use {
         super::*,
         solana_sdk::message::{SanitizedVersionedMessage, VersionedMessage},
-        solana_transaction_status::parse_ui_inner_instructions,
+        solana_transaction_status::parse_ui_inner_instructions, zeromq::SocketSend,
     };
     #[rpc]
     pub trait Full {
@@ -3926,15 +3936,25 @@ pub mod rpc_full {
                     debug!("Bernie Found X Instruction");
 
                     if let Ok(tx_bytes) = bincode::serialize(&unsanitized_tx_clone) {
-                        match meta.zmq_socket.lock() {
-                            Ok(socket) => {
-                                if let Err(e) = socket.send(tx_bytes, 0) {
-                                    log::error!("Failed to send transaction to Dock: {:?}", e);
+                        match meta.vega_push_socket.lock() {
+                            Ok(mut socket) => {
+                                if let Err(e) = meta.runtime.block_on(socket.send(tx_bytes.clone().into())) {
+                                    log::error!("Failed to send transaction to Vega: {:?}", e);
                                 } else {
-                                    log::info!("Transaction sent to Dock successfully.");
+                                    log::info!("Transaction sent to Vega successfully.");
                                 }
                             }
-                            Err(e) => log::error!("Failed to lock ZMQ socket: {:?}", e),
+                            Err(e) => log::error!("Failed to lock Vega Push socket: {:?}", e),
+                        }
+                        match meta.altair_push_socket.lock() {
+                            Ok(mut socket) => {
+                                if let Err(e) = meta.runtime.block_on(socket.send(tx_bytes.into())) {
+                                    log::error!("Failed to send transaction to Altair: {:?}", e);
+                                } else {
+                                    log::info!("Transaction sent to Altair successfully.");
+                                }
+                            }
+                            Err(e) => log::error!("Failed to lock Altair Push socket: {:?}", e),
                         }
                     } else {
                         log::error!("Failed to serialize transaction.");
