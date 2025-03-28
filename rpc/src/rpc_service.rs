@@ -11,13 +11,14 @@ use {
     },
     crossbeam_channel::unbounded,
     jsonrpc_core::{
-        futures::prelude::*,
-        MetaIoHandler,
+        futures::{lock::Mutex, prelude::*},
+        MetaIoHandler, Params,
     },
     jsonrpc_http_server::{
         hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
         RequestMiddlewareAction, ServerBuilder,
     },
+    prost::Message,
     regex::Regex,
     solana_client::connection_cache::ConnectionCache,
     solana_gossip::cluster_info::ClusterInfo,
@@ -43,7 +44,7 @@ use {
     solana_storage_bigtable::CredentialType,
     std::{
         collections::HashMap,
-        net::SocketAddr,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -52,6 +53,7 @@ use {
         thread::{self, Builder, JoinHandle},
     },
     tokio_util::codec::{BytesCodec, FramedRead},
+    xandeum_protos::response::Response,
 };
 
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
@@ -387,14 +389,15 @@ impl JsonRpcService {
                     connection_cache.protocol()
                 )
             })?;
-
         let runtime = service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj);
 
-        // let transaction_results = Arc::new(Mutex::new(HashMap::new()));
-        // let transaction_results_clone1 = transaction_results.clone();
-        // let transaction_results_clone2 = transaction_results.clone();
+        let transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let transaction_results_clone1 = transaction_results.clone();
+        let transaction_results_clone2 = transaction_results.clone();
         let runtime_clone1 = runtime.clone();
         let runtime_clone2 = runtime.clone();
+        let runtime_clone3 = runtime.clone();
 
         let exit_bigtable_ledger_upload_service = Arc::new(AtomicBool::new(false));
 
@@ -553,11 +556,11 @@ impl JsonRpcService {
             })
             .unwrap();
 
-        let  context = zmq::Context::new();
+        let context = zmq::Context::new();
         let context_clone = context.clone();
         // Listening To Back channel from Vega
         runtime_clone1.spawn(async move {
-            let socket =  context_clone.socket(zmq::PULL).unwrap();
+            let socket = context_clone.socket(zmq::PULL).unwrap();
 
             if let Err(e) = socket.bind("ipc:///var/run/xandeum/vega_pull.sock") {
                 log::error!("Failed to bind first PULL socket: {:?}", e);
@@ -571,6 +574,21 @@ impl JsonRpcService {
                 match socket.recv_bytes(0) {
                     Ok(msg) => {
                         info!("Received : {:?} From vega", msg);
+                        let res = Response::decode(&msg[..]);
+                        match res {
+                            Ok(r) => {
+                                let mut lock = transaction_results_clone1.lock().await;
+
+                                if !lock.contains_key(&r.signature) {
+                                    lock.insert(r.signature.clone(), r);
+                                } else {
+                                    log::debug!("Response already exists")
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed To Decode Response : {:?}", e)
+                            }
+                        }
                     }
                     Err(e) => {
                         log::error!("Vega receive error: {:?}", e);
@@ -596,6 +614,21 @@ impl JsonRpcService {
                 match socket.recv_bytes(0) {
                     Ok(msg) => {
                         info!("Received : {:?} From Altair", msg);
+                        let res = Response::decode(&msg[..]);
+                        match res {
+                            Ok(r) => {
+                                let mut lock = transaction_results_clone2.lock().await;
+
+                                if !lock.contains_key(&r.signature) {
+                                    lock.insert(r.signature.clone(), r);
+                                } else {
+                                    log::debug!("Response already exists")
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed To Decode Response : {:?}", e)
+                            }
+                        }
                     }
                     Err(e) => {
                         log::error!("Altair receive error: {:?}", e);
@@ -606,12 +639,103 @@ impl JsonRpcService {
         });
 
         let close_handle = close_handle_receiver.recv().unwrap()?;
+
+        let data_listener_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9801);
+        let (data_close_handle_sender, data_close_handle_receiver) = unbounded();
+
+       
+        let transaction_results_clone_for_rpc = transaction_results.clone();
+
+        thread::spawn(move || {
+            renice_this_thread(rpc_niceness_adj).unwrap();
+
+            let mut io: MetaIoHandler<()> = MetaIoHandler::default();
+          
+            io.add_method("rpc-xtransaction", move |params: Params| {
+                info!("Received a rpc request : {:?}", params);
+                let transaction_results = transaction_results_clone_for_rpc.clone();
+                info!("transaction Results arry : {:?}", transaction_results);
+                async move {
+                    // let signature: String = params.parse().map_err(|e| {
+                    //     jsonrpc_core::Error::invalid_params(format!("Invalid params: {}", e))
+                    // })?;
+                    let params_vec: Vec<String> = params.parse().map_err(|e| {
+                        jsonrpc_core::Error::invalid_params(format!("Invalid params: {}", e))
+                    })?;
+                    let signature = params_vec
+                        .get(0)
+                        .ok_or_else(|| {
+                            jsonrpc_core::Error::invalid_params("Expected a transaction signature")
+                        })?
+                        .clone();
+
+                    info!("Received request for transaction signature: {}", signature);
+
+                
+                    let results = transaction_results.lock().await;
+                    // log::info!("results : {:?}",results);
+                    let result = results.get(&signature);
+
+                    match result {
+                        Some(tx_result) => {
+                          
+                            let json_result = serde_json::to_value(tx_result)
+                                .map_err(|e| jsonrpc_core::Error::internal_error())?;
+                            Ok(json_result)
+                        }
+                        None => {
+                           
+                            Err(jsonrpc_core::Error {
+                                code: jsonrpc_core::ErrorCode::InvalidParams,
+                                message: format!(
+                                    "Transaction result not found for signature: {}",
+                                    signature
+                                ),
+                                data: None,
+                            })
+                        }
+                    }
+                }
+                .boxed()
+            });
+
+            let server = ServerBuilder::new(io)
+                .event_loop_executor(runtime_clone3.handle().clone())
+                .threads(1)
+                .cors(DomainsValidation::AllowOnly(vec![
+                    AccessControlAllowOrigin::Any,
+                ]))
+                .cors_max_age(86400)
+                .max_request_body_size(max_request_body_size) 
+                .start_http(&data_listener_addr);
+
+            match server {
+                Ok(server) => {
+                    info!(
+                        "JSON RPC service for transaction results started on {}",
+                        data_listener_addr
+                    );
+                    data_close_handle_sender
+                        .send(Ok(server.close_handle()))
+                        .unwrap();
+                    server.wait();
+                }
+                Err(e) => {
+                    error!("Failed to start JSON RPC service on port 9800: {:?}", e);
+                    data_close_handle_sender.send(Err(e.to_string())).unwrap();
+                }
+            }
+        });
+
+        let data_listener_close_handle = data_close_handle_receiver.recv().unwrap()?;
+
         let close_handle_ = close_handle.clone();
         validator_exit
             .write()
             .unwrap()
             .register_exit(Box::new(move || {
                 close_handle_.close();
+                data_listener_close_handle.close();
             }));
         Ok(Self {
             thread_hdl,

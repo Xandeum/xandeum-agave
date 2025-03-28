@@ -66,6 +66,9 @@ tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["codec", "compat"] }
 common = { path = "../xandeum-programs/common" }
 zmq = { workspace = true }
+xandeum-protos ={path = "../xandeum-protos"}
+prost = { workspace = true }
+
 
 [dev-dependencies]
 serial_test = { workspace = true }
