@@ -1,7 +1,7 @@
 //! The `rpc` module implements the Solana RPC interface.
 #[cfg(feature = "dev-context-only-utils")]
 use solana_runtime::installed_scheduler_pool::BankWithScheduler;
-use zeromq::{PushSocket, Socket};
+use zmq::Socket;
 use {
     crate::{
         filter::filter_allows, max_slots::MaxSlots,
@@ -254,8 +254,8 @@ pub struct JsonRpcRequestProcessor {
     max_complete_rewards_slot: Arc<AtomicU64>,
     prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     runtime: Arc<Runtime>,
-    vega_push_socket: Arc<Mutex<PushSocket>>,
-    altair_push_socket: Arc<Mutex<PushSocket>>,
+    vega_push_socket: Arc<Mutex<Socket>>,
+    altair_push_socket: Arc<Mutex<Socket>>,
 
 }
 impl Metadata for JsonRpcRequestProcessor {}
@@ -411,16 +411,16 @@ impl JsonRpcRequestProcessor {
         runtime: Arc<Runtime>,
     ) -> (Self, Receiver<TransactionInfo>) {
         let (transaction_sender, transaction_receiver) = unbounded();
-        // let context = zmq::Context::new();
+        let context = zmq::Context::new();
 
         let vega_push_socket = {
-            let  socket = PushSocket::new();
+            let  socket = context.socket(zmq::PUSH).unwrap();
             log::info!("Vega PUSH socket created successfully.");
             let socket = Arc::new(Mutex::new(socket));
             
             {
-                let mut socket_lock = socket.lock().unwrap();
-                if let Err(e) = runtime.block_on(socket_lock.bind("ipc:///var/run/xandeum/vega.sock")) {
+                let socket_lock = socket.lock().unwrap();
+                if let Err(e) = socket_lock.bind("ipc:///var/run/xandeum/vega.sock") {
                     log::error!("Failed to connect to vega: {:?}", e);
                 } else {
                     log::info!("Connected to first Dock at ipc:///var/run/xandeum/vega.sock");
@@ -431,19 +431,18 @@ impl JsonRpcRequestProcessor {
         };
 
         let altair_push_socket = {
-            let socket = PushSocket::new();
+            let socket = context.socket(zmq::PUSH).unwrap();
             log::info!("Altair PUSH socket created successfully.");
             let socket = Arc::new(Mutex::new(socket));
             
             {
-                let mut  socket_lock = socket.lock().unwrap();
-                if let Err(e) = runtime.block_on(socket_lock.bind("ipc:///var/run/xandeum/altair.sock")) {
+                let  socket_lock = socket.lock().unwrap();
+                if let Err(e) = socket_lock.bind("ipc:///var/run/xandeum/altair.sock") {
                     log::error!("Failed to connect to altair: {:?}", e);
                 } else {
                     log::info!("Connected to first Dock at ipc:///var/run/xandeum/altair.sock");
                 }
             }
-            
             socket
         };
 
@@ -3512,7 +3511,7 @@ pub mod rpc_full {
     use {
         super::*,
         solana_sdk::message::{SanitizedVersionedMessage, VersionedMessage},
-        solana_transaction_status::parse_ui_inner_instructions, zeromq::SocketSend,
+        solana_transaction_status::parse_ui_inner_instructions,
     };
     #[rpc]
     pub trait Full {
@@ -3937,8 +3936,8 @@ pub mod rpc_full {
 
                     if let Ok(tx_bytes) = bincode::serialize(&unsanitized_tx_clone) {
                         match meta.vega_push_socket.lock() {
-                            Ok(mut socket) => {
-                                if let Err(e) = meta.runtime.block_on(socket.send(tx_bytes.clone().into())) {
+                            Ok(socket) => {
+                                if let Err(e) = socket.send(tx_bytes.clone(),0) {
                                     log::error!("Failed to send transaction to Vega: {:?}", e);
                                 } else {
                                     log::info!("Transaction sent to Vega successfully.");
@@ -3947,8 +3946,8 @@ pub mod rpc_full {
                             Err(e) => log::error!("Failed to lock Vega Push socket: {:?}", e),
                         }
                         match meta.altair_push_socket.lock() {
-                            Ok(mut socket) => {
-                                if let Err(e) = meta.runtime.block_on(socket.send(tx_bytes.into())) {
+                            Ok(socket) => {
+                                if let Err(e) = socket.send(tx_bytes,0) {
                                     log::error!("Failed to send transaction to Altair: {:?}", e);
                                 } else {
                                     log::info!("Transaction sent to Altair successfully.");

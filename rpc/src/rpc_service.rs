@@ -10,7 +10,10 @@ use {
         rpc_health::*,
     },
     crossbeam_channel::unbounded,
-    jsonrpc_core::{futures::{lock::Mutex, prelude::*}, MetaIoHandler},
+    jsonrpc_core::{
+        futures::prelude::*,
+        MetaIoHandler,
+    },
     jsonrpc_http_server::{
         hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
         RequestMiddlewareAction, ServerBuilder,
@@ -39,12 +42,16 @@ use {
     solana_send_transaction_service::send_transaction_service::{self, SendTransactionService},
     solana_storage_bigtable::CredentialType,
     std::{
-        collections::HashMap, net::SocketAddr, path::{Path, PathBuf}, sync::{
+        collections::HashMap,
+        net::SocketAddr,
+        path::{Path, PathBuf},
+        sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, RwLock,
-        }, thread::{self, Builder, JoinHandle}
+        },
+        thread::{self, Builder, JoinHandle},
     },
-    tokio_util::codec::{BytesCodec, FramedRead}, zeromq::{PullSocket, Socket, SocketRecv},
+    tokio_util::codec::{BytesCodec, FramedRead},
 };
 
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
@@ -546,50 +553,57 @@ impl JsonRpcService {
             })
             .unwrap();
 
-            runtime_clone1.spawn(async move {
-                let mut socket = PullSocket::new() ;
-            
-                if let Err(e) = socket.bind("ipc:///var/run/xandeum/vega_pull.sock").await {
-                    log::error!("Failed to bind first PULL socket: {:?}", e);
-                    return;
-                }
-                log::info!("First PULL socket listener started on ipc:///var/run/xandeum/vega_pull.sock");
-            
-                loop {
-                    match socket.recv().await {
-                        Ok(msg) => {
-                           info!("Received : {:?} From vega",msg);
-                        }
-                        Err(e) => {
-                            log::error!("Vega receive error: {:?}", e);
-                        }
-                    }
-                    tokio::task::yield_now().await; 
-                }
-            });
+        let  context = zmq::Context::new();
+        let context_clone = context.clone();
+        // Listening To Back channel from Vega
+        runtime_clone1.spawn(async move {
+            let socket =  context_clone.socket(zmq::PULL).unwrap();
 
-            runtime_clone2.spawn(async move {
-                let mut socket = PullSocket::new() ;
-            
-                if let Err(e) = socket.bind("ipc:///var/run/xandeum/altair_pull.sock").await {
-                    log::error!("Failed to bind first PULL socket: {:?}", e);
-                    return;
-                }
-                log::info!("First PULL socket listener started on ipc:///var/run/xandeum/altair_pull.sock");
-            
-                loop {
-                    match socket.recv().await {
-                        Ok(msg) => {
-                           info!("Received : {:?} From Altair",msg);
-                        }
-                        Err(e) => {
-                            log::error!("Altair receive error: {:?}", e);
-                        }
-                    }
-                    tokio::task::yield_now().await;  
-                }
-            });
+            if let Err(e) = socket.bind("ipc:///var/run/xandeum/vega_pull.sock") {
+                log::error!("Failed to bind first PULL socket: {:?}", e);
+                return;
+            }
+            log::info!(
+                "First PULL socket listener started on ipc:///var/run/xandeum/vega_pull.sock"
+            );
 
+            loop {
+                match socket.recv_bytes(0) {
+                    Ok(msg) => {
+                        info!("Received : {:?} From vega", msg);
+                    }
+                    Err(e) => {
+                        log::error!("Vega receive error: {:?}", e);
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Listening To Back channel from Altair
+        runtime_clone2.spawn(async move {
+            let socket = context.socket(zmq::PULL).unwrap();
+
+            if let Err(e) = socket.bind("ipc:///var/run/xandeum/altair_pull.sock") {
+                log::error!("Failed to bind first PULL socket: {:?}", e);
+                return;
+            }
+            log::info!(
+                "First PULL socket listener started on ipc:///var/run/xandeum/altair_pull.sock"
+            );
+
+            loop {
+                match socket.recv_bytes(0) {
+                    Ok(msg) => {
+                        info!("Received : {:?} From Altair", msg);
+                    }
+                    Err(e) => {
+                        log::error!("Altair receive error: {:?}", e);
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        });
 
         let close_handle = close_handle_receiver.recv().unwrap()?;
         let close_handle_ = close_handle.clone();

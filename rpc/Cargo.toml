@@ -65,7 +65,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["codec", "compat"] }
 common = { path = "../xandeum-programs/common" }
-zeromq = { workspace = true }
+zmq = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }
