@@ -256,7 +256,6 @@ pub struct JsonRpcRequestProcessor {
     runtime: Arc<Runtime>,
     vega_push_socket: Arc<Mutex<Socket>>,
     altair_push_socket: Arc<Mutex<Socket>>,
-
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
@@ -414,19 +413,19 @@ impl JsonRpcRequestProcessor {
         let context = zmq::Context::new();
 
         let vega_push_socket = {
-            let  socket = context.socket(zmq::PUSH).unwrap();
+            let socket = context.socket(zmq::PUSH).unwrap();
             log::info!("Vega PUSH socket created successfully.");
             let socket = Arc::new(Mutex::new(socket));
-            
+
             {
                 let socket_lock = socket.lock().unwrap();
                 if let Err(e) = socket_lock.bind("ipc:///var/run/xandeum/vega.sock") {
                     log::error!("Failed to connect to vega: {:?}", e);
                 } else {
-                    log::info!("Connected to first Dock at ipc:///var/run/xandeum/vega.sock");
+                    log::info!("Connected to Vega at ipc:///var/run/xandeum/vega.sock");
                 }
             }
-            
+
             socket
         };
 
@@ -434,13 +433,13 @@ impl JsonRpcRequestProcessor {
             let socket = context.socket(zmq::PUSH).unwrap();
             log::info!("Altair PUSH socket created successfully.");
             let socket = Arc::new(Mutex::new(socket));
-            
+
             {
-                let  socket_lock = socket.lock().unwrap();
+                let socket_lock = socket.lock().unwrap();
                 if let Err(e) = socket_lock.bind("ipc:///var/run/xandeum/altair.sock") {
                     log::error!("Failed to connect to altair: {:?}", e);
                 } else {
-                    log::info!("Connected to first Dock at ipc:///var/run/xandeum/altair.sock");
+                    log::info!("Connected to Altair at ipc:///var/run/xandeum/altair.sock");
                 }
             }
             socket
@@ -468,7 +467,7 @@ impl JsonRpcRequestProcessor {
                 prioritization_fee_cache,
                 runtime,
                 vega_push_socket,
-                altair_push_socket
+                altair_push_socket,
             },
             transaction_receiver,
         )
@@ -3936,23 +3935,23 @@ pub mod rpc_full {
 
                     if let Ok(tx_bytes) = bincode::serialize(&unsanitized_tx_clone) {
                         match meta.vega_push_socket.lock() {
-                            Ok(socket) => {
-                                if let Err(e) = socket.send(tx_bytes.clone(),0) {
-                                    log::error!("Failed to send transaction to Vega: {:?}", e);
-                                } else {
-                                    log::info!("Transaction sent to Vega successfully.");
+                            Ok(socket) => match socket.send(tx_bytes.clone(), zmq::DONTWAIT) {
+                                Ok(()) => log::info!("Transaction sent to Vega successfully."),
+                                Err(zmq::Error::EAGAIN) => log::info!("No Receiver,Skipping"),
+                                Err(e) => {
+                                    log::error!("Failed to send transaction to Vega: {:?}", e)
                                 }
-                            }
+                            },
                             Err(e) => log::error!("Failed to lock Vega Push socket: {:?}", e),
                         }
                         match meta.altair_push_socket.lock() {
-                            Ok(socket) => {
-                                if let Err(e) = socket.send(tx_bytes,0) {
-                                    log::error!("Failed to send transaction to Altair: {:?}", e);
-                                } else {
-                                    log::info!("Transaction sent to Altair successfully.");
+                            Ok(socket) => match socket.send(tx_bytes.clone(), zmq::DONTWAIT) {
+                                Ok(()) => log::info!("Transaction sent to Altair successfully."),
+                                Err(zmq::Error::EAGAIN) => log::info!("No Receiver,Skipping"),
+                                Err(e) => {
+                                    log::error!("Failed to send transaction to Altair: {:?}", e)
                                 }
-                            }
+                            },
                             Err(e) => log::error!("Failed to lock Altair Push socket: {:?}", e),
                         }
                     } else {
