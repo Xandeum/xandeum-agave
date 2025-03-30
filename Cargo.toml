@@ -149,6 +149,7 @@ members = [
     "zk-keygen",
     "zk-sdk",
     "zk-token-sdk",
+    "xandeum-protos"
 ]
 
 exclude = ["programs/sbf", "svm/examples", "svm/tests/example-programs"]
