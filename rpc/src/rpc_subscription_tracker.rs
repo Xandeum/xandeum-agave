@@ -40,6 +40,12 @@ impl From<SubscriptionId> for u64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SignatureSubscriptionType {
+    Regular,       // For regular signature notifications
+    XandeumResult, // For Xandeum result notifications
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SubscriptionParams {
     Account(AccountSubscriptionParams),
     Block(BlockSubscriptionParams),
@@ -174,6 +180,7 @@ pub struct SignatureSubscriptionParams {
     pub signature: Signature,
     pub commitment: CommitmentConfig,
     pub enable_received_notification: bool,
+    pub subscription_type: SignatureSubscriptionType
 }
 
 #[derive(Clone)]
@@ -677,6 +684,7 @@ mod tests {
             signature: Signature::default(),
             commitment: CommitmentConfig::processed(),
             enable_received_notification: false,
+            subscription_type : SignatureSubscriptionType::Regular
         });
         let token_signature1 = control.control.subscribe(signature_params.clone()).unwrap();
         control.assert_subscribed(&signature_params, 1);
@@ -782,6 +790,7 @@ mod tests {
             signature: Signature::default(),
             commitment: CommitmentConfig::processed(),
             enable_received_notification: false,
+            subscription_type: SignatureSubscriptionType::Regular
         });
         tracker.subscribe(signature_params.clone(), 3.into(), || 0);
         assert_eq!(counts(&tracker), (1, 1, 0, 0));

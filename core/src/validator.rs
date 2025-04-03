@@ -1076,6 +1076,11 @@ impl Validator {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
 
+            let transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+            let transaction_results_clone = transaction_results.clone();
+
         let rpc_subscriptions = Arc::new(RpcSubscriptions::new_with_config(
             exit.clone(),
             max_complete_transaction_status_slot.clone(),
@@ -1086,6 +1091,7 @@ impl Validator {
             optimistically_confirmed_bank.clone(),
             &config.pubsub_config,
             None,
+            transaction_results
         ));
 
         let max_slots = Arc::new(MaxSlots::default());
@@ -1187,6 +1193,8 @@ impl Validator {
                 max_complete_transaction_status_slot,
                 max_complete_rewards_slot,
                 prioritization_fee_cache.clone(),
+                transaction_results_clone,
+                &rpc_subscriptions.clone()
             )
             .map_err(ValidatorError::Other)?;
 
