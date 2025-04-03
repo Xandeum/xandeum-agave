@@ -9,8 +9,8 @@ use {
         rpc_subscription_tracker::{
             AccountSubscriptionParams, BlockSubscriptionKind, BlockSubscriptionParams,
             LogsSubscriptionKind, LogsSubscriptionParams, ProgramSubscriptionParams,
-            SignatureSubscriptionParams, SubscriptionControl, SubscriptionId, SubscriptionInfo,
-            SubscriptionParams, SubscriptionsTracker,
+            SignatureSubscriptionParams, SignatureSubscriptionType, SubscriptionControl,
+            SubscriptionId, SubscriptionInfo, SubscriptionParams, SubscriptionsTracker,
         },
     },
     crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender},
@@ -20,6 +20,7 @@ use {
     solana_account_decoder::{
         encode_ui_account, parse_token::is_known_spl_token_id, UiAccount, UiAccountEncoding,
     },
+    solana_client::rpc_response::RpcApiVersion,
     solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path},
     solana_measure::measure::Measure,
     solana_rpc_client_api::response::{
@@ -103,6 +104,7 @@ pub enum NotificationEntry {
     SignaturesReceived((Slot, Vec<Signature>)),
     Subscribed(SubscriptionParams, SubscriptionId),
     Unsubscribed(SubscriptionParams, SubscriptionId),
+    XandeumResult(Signature, serde_json::Value),
 }
 
 impl std::fmt::Debug for NotificationEntry {
@@ -126,6 +128,9 @@ impl std::fmt::Debug for NotificationEntry {
             }
             NotificationEntry::Unsubscribed(params, id) => {
                 write!(f, "Unsubscribed({params:?}, {id:?})")
+            }
+            NotificationEntry::XandeumResult(signature, value) => {
+                write!(f, "XandeumResult({signature:?}, {value:?})")
             }
         }
     }
@@ -536,6 +541,7 @@ impl RpcSubscriptions {
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
     ) -> Self {
         Self::new_with_config(
             exit,
@@ -547,6 +553,7 @@ impl RpcSubscriptions {
             optimistically_confirmed_bank,
             &PubSubConfig::default(),
             None,
+            transaction_results,
         )
     }
 
@@ -557,6 +564,7 @@ impl RpcSubscriptions {
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
     ) -> Self {
         let ledger_path = get_tmp_ledger_path!();
         let blockstore = Blockstore::open(&ledger_path).unwrap();
@@ -570,6 +578,7 @@ impl RpcSubscriptions {
             bank_forks,
             block_commitment_cache,
             optimistically_confirmed_bank,
+            transaction_results,
         )
     }
 
@@ -581,6 +590,7 @@ impl RpcSubscriptions {
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
     ) -> Self {
         let rpc_notifier_ready = Arc::new(AtomicBool::new(false));
 
@@ -594,6 +604,7 @@ impl RpcSubscriptions {
             optimistically_confirmed_bank,
             &PubSubConfig::default_for_tests(),
             Some(rpc_notifier_ready.clone()),
+            transaction_results,
         );
 
         // Ensure RPC notifier is ready to receive notifications before proceeding
@@ -619,9 +630,9 @@ impl RpcSubscriptions {
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
         config: &PubSubConfig,
         rpc_notifier_ready: Option<Arc<AtomicBool>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
     ) -> Self {
         let (notification_sender, notification_receiver) = crossbeam_channel::unbounded();
-
         let subscriptions = SubscriptionsTracker::new(bank_forks.clone());
 
         let (broadcast_sender, _) = broadcast::channel(config.queue_capacity_items);
@@ -659,6 +670,7 @@ impl RpcSubscriptions {
                             bank_forks,
                             block_commitment_cache,
                             optimistically_confirmed_bank,
+                            transaction_results.clone()
                         )
                     });
                 })
@@ -670,7 +682,6 @@ impl RpcSubscriptions {
             notification_sender.clone(),
             broadcast_sender,
         );
-
         Self {
             notification_sender: config.notification_threads.map(|_| notification_sender),
             t_cleanup,
@@ -684,6 +695,7 @@ impl RpcSubscriptions {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         max_complete_rewards_slot: Arc<AtomicU64>,
         bank_forks: Arc<RwLock<BankForks>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
     ) -> Self {
         let ledger_path = get_tmp_ledger_path!();
         let blockstore = Blockstore::open(&ledger_path).unwrap();
@@ -698,6 +710,7 @@ impl RpcSubscriptions {
             bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::default())),
             optimistically_confirmed_bank,
+            transaction_results,
         )
     }
 
@@ -732,6 +745,11 @@ impl RpcSubscriptions {
 
     pub fn notify_signatures_received(&self, slot_signatures: (Slot, Vec<Signature>)) {
         self.enqueue_notification(NotificationEntry::SignaturesReceived(slot_signatures));
+    }
+
+    // Notification For Xandeum result
+    pub fn notify_xandeum_result(&self, signature: Signature, value: serde_json::Value) {
+        self.enqueue_notification(NotificationEntry::XandeumResult(signature, value));
     }
 
     pub fn notify_vote(&self, vote_pubkey: Pubkey, vote: VoteTransaction, signature: Signature) {
@@ -775,6 +793,7 @@ impl RpcSubscriptions {
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
     ) {
         let mut stats = PubsubNotificationStats::default();
 
@@ -888,22 +907,96 @@ impl RpcSubscriptions {
                                             subscription.params()
                                         {
                                             if params.enable_received_notification {
-                                                notifier.notify(
-                                                    RpcResponse::from(RpcNotificationResponse {
-                                                        context: RpcNotificationContext { slot },
-                                                        value: RpcSignatureResult::ReceivedSignature(
-                                                            ReceivedSignatureResult::ReceivedSignature,
-                                                        ),
-                                                    }),
-                                                    subscription,
-                                                    false,
-                                                );
+                                                match params.subscription_type {
+                                                    SignatureSubscriptionType::Regular => {
+                                                        notifier.notify(
+                                                            RpcResponse::from(RpcNotificationResponse {
+                                                                context: RpcNotificationContext { slot },
+                                                                value: RpcSignatureResult::ReceivedSignature(
+                                                                    ReceivedSignatureResult::ReceivedSignature,
+                                                                ),
+                                                            }),
+                                                            subscription,
+                                                            false,
+                                                        );
+                                                    }
+                                                    SignatureSubscriptionType::XandeumResult => {
+                                                        let signature_str =
+                                                            slot_signature.to_string();
+                                                        let transaction_results = 
+                                                            transaction_results
+                                                            .lock().unwrap();
+                                                        if let Some(xandeum_result) =
+                                                            transaction_results.get(&signature_str)
+                                                        {
+                                                            let json_value = serde_json::to_value(xandeum_result)
+                                                            .unwrap_or_else(|e| {
+                                                                error!("Failed to serialize XandeumResult: {:?}", e);
+                                                                serde_json::json!({ "error": "Failed to serialize result" })
+                                                            });
+                                                            debug!("Xandeum result notify: subscription_id={:?}, signature={:?}, value={:?}", subscription.id(), slot_signature, json_value);
+                                                            inc_new_counter_info!("rpc-subscription-notify-xandeum-result", 1);
+                                                            notifier.notify(
+                                                                RpcResponse {
+                                                                    context: RpcResponseContext {
+                                                                        slot,
+                                                                        api_version: Some(
+                                                                            RpcApiVersion::default(
+                                                                            ),
+                                                                        ),
+                                                                    },
+                                                                    value: json_value,
+                                                                },
+                                                                subscription,
+                                                                false,
+                                                            );
+                                                        }
+                                                    }
+                                                }
                                             }
                                         } else {
                                             error!("invalid params type in visit_by_signature");
                                         }
                                     }
                                 }
+                            }
+                        }
+                        NotificationEntry::XandeumResult(signature, value) => {
+                            if let Some(subs) = subscriptions.by_signature().get(&signature) {
+                                let value_clone = value.clone();
+                                for subscription in subs.values() {
+                                    if let SubscriptionParams::Signature(params) =
+                                        subscription.params()
+                                    {
+                                        if params.subscription_type
+                                            == SignatureSubscriptionType::XandeumResult
+                                        {
+                                            debug!("Xandeum result notify: subscription_id={:?}, signature={:?}, value={:?}", subscription.id(), signature, value_clone.clone());
+                                            inc_new_counter_info!(
+                                                "rpc-subscription-notify-xandeum-result",
+                                                1
+                                            );
+                                            notifier.notify(
+                                                RpcResponse {
+                                                    context: RpcResponseContext {
+                                                        slot: 0,
+                                                        api_version: Some(RpcApiVersion::default()),
+                                                    }, 
+                                                    value: value.clone(),
+                                                },
+                                                subscription,
+                                                false,
+                                            );
+                                        }
+                                    } else {
+                                        error!("invalid params type in visit_by_signature");
+                                    }
+                                }
+                            } else {
+                                info!(
+                                    "No Xandeum subscriptions found for signature: {:?}",
+                                    signature
+                                );
                             }
                         }
                     }

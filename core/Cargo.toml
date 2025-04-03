@@ -106,6 +106,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 trees = { workspace = true }
+xandeum-protos ={path = "../xandeum-protos"}
 
 [dev-dependencies]
 fs_extra = { workspace = true }

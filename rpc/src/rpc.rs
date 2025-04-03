@@ -1,4 +1,5 @@
 //! The `rpc` module implements the Solana RPC interface.
+use std::sync::Mutex;
 #[cfg(feature = "dev-context-only-utils")]
 use solana_runtime::installed_scheduler_pool::BankWithScheduler;
 use zmq::Socket;
@@ -115,7 +116,7 @@ use {
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, Mutex, RwLock,
+            Arc, RwLock,
         },
         time::Duration,
     },
@@ -256,6 +257,7 @@ pub struct JsonRpcRequestProcessor {
     runtime: Arc<Runtime>,
     vega_push_socket: Arc<Mutex<Socket>>,
     altair_push_socket: Arc<Mutex<Socket>>,
+    // transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
@@ -408,6 +410,7 @@ impl JsonRpcRequestProcessor {
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         runtime: Arc<Runtime>,
+        // transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
     ) -> (Self, Receiver<TransactionInfo>) {
         let (transaction_sender, transaction_receiver) = unbounded();
         let context = zmq::Context::new();
@@ -468,6 +471,7 @@ impl JsonRpcRequestProcessor {
                 runtime,
                 vega_push_socket,
                 altair_push_socket,
+                // transaction_results
             },
             transaction_receiver,
         )
