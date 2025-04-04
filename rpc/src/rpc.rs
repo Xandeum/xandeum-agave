@@ -257,7 +257,6 @@ pub struct JsonRpcRequestProcessor {
     runtime: Arc<Runtime>,
     vega_push_socket: Arc<Mutex<Socket>>,
     altair_push_socket: Arc<Mutex<Socket>>,
-    // transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
@@ -415,6 +414,8 @@ impl JsonRpcRequestProcessor {
         let (transaction_sender, transaction_receiver) = unbounded();
         let context = zmq::Context::new();
 
+        // Creating UDS sockets and binding them to send Xandeum Transactions
+        // to the dock
         let vega_push_socket = {
             let socket = context.socket(zmq::PUSH).unwrap();
             log::info!("Vega PUSH socket created successfully.");
@@ -471,7 +472,6 @@ impl JsonRpcRequestProcessor {
                 runtime,
                 vega_push_socket,
                 altair_push_socket,
-                // transaction_results
             },
             transaction_receiver,
         )
@@ -3899,9 +3899,8 @@ pub mod rpc_full {
                 preflight_bank,
                 preflight_bank.get_reserved_account_keys(),
             )?;
-            // StartXandeum
-            debug!("Bernie SanitizedTransaction: {:#?}", transaction);
 
+            // StartXandeum
             let msg = transaction.message();
             let xand_shield_pubkey =
                 Pubkey::from_str(XAND_SHIELD_PROGRAM_ID).expect("Invalid XAND_SHIELD_PROGRAM_ID");
@@ -3924,7 +3923,7 @@ pub mod rpc_full {
                         .position(|key| key == &xand_shield_pubkey)
                 }
             };
-
+            // Checking if the Transaction is Xtransaction or not
             if let Some(xand_shield_pos) = xand_shield_index {
                 let instructions = match msg {
                     SanitizedMessage::Legacy(legacy_msg) => &legacy_msg.message.instructions,
@@ -3935,12 +3934,12 @@ pub mod rpc_full {
                     .iter()
                     .any(|ix| ix.program_id_index as usize == xand_shield_pos);
                 if has_xand_shield_ix {
-                    debug!("Bernie Found X Instruction");
-
+                    debug!("Found X Instruction");
                     if let Ok(tx_bytes) = bincode::serialize(&unsanitized_tx_clone) {
+                        // Sending the Xtransaction to vega and altair
                         match meta.vega_push_socket.lock() {
                             Ok(socket) => match socket.send(tx_bytes.clone(), zmq::DONTWAIT) {
-                                Ok(()) => log::info!("Transaction sent to Vega successfully."),
+                                Ok(()) => log::debug!("Transaction sent to Vega successfully."),
                                 Err(zmq::Error::EAGAIN) => log::info!("No Receiver,Skipping"),
                                 Err(e) => {
                                     log::error!("Failed to send transaction to Vega: {:?}", e)
@@ -3962,15 +3961,9 @@ pub mod rpc_full {
                         log::error!("Failed to serialize transaction.");
                     }
 
-                    // Return the transaction signature as success
+                    // Return the transaction signature as success,
                     let signature = unsanitized_tx_clone.signatures[0].to_string();
                     return Ok(signature);
-                    //use jsonrpc_core::{Error, ErrorCode};
-                    //return Err(Error {
-                    //	code: ErrorCode::InvalidRequest,
-                    //	message: "XAND_SHIELD instructions are not supported yet".to_string(),
-                    //	data: None,
-                    //}.into());
                 }
             }
             // EndXandeum
