@@ -566,17 +566,17 @@ impl JsonRpcService {
             let socket = context_clone.socket(zmq::PULL).unwrap();
 
             if let Err(e) = socket.bind("ipc:///var/run/xandeum/vega_pull.sock") {
-                log::error!("Failed to bind first PULL socket: {:?}", e);
+                error!("Failed to bind first PULL socket: {:?}", e);
                 return;
             }
-            log::info!(
+            info!(
                 "First PULL socket listener started on ipc:///var/run/xandeum/vega_pull.sock"
             );
 
             loop {
                 match socket.recv_bytes(0) {
                     Ok(msg) => {
-                        info!("Received : {:?} From vega", msg);
+                        debug!("Received : {:?} From vega", msg);
                         let res = Response::decode(&msg[..]);
                         match res {
                             Ok(r) => {
@@ -585,7 +585,7 @@ impl JsonRpcService {
                                 let sig = match Signature::from_str(&r.signature) {
                                     Ok(s) => s,
                                     Err(e) => {
-                                        log::error!("Invalid signature format: {:?}", e);
+                                        error!("Invalid signature format: {:?}", e);
                                         return;
                                     }
                                 };
@@ -597,7 +597,7 @@ impl JsonRpcService {
                                     );
                                     lock.insert(r.signature.clone(), r);
                                 } else {
-                                    log::debug!("Response already exists")
+                                    debug!("Response already exists")
                                 }
                             }
                             Err(e) => {
@@ -606,7 +606,7 @@ impl JsonRpcService {
                         }
                     }
                     Err(e) => {
-                        log::error!("Vega receive error: {:?}", e);
+                        error!("Vega receive error: {:?}", e);
                     }
                 }
                 tokio::task::yield_now().await;
@@ -618,17 +618,17 @@ impl JsonRpcService {
             let socket = context.socket(zmq::PULL).unwrap();
 
             if let Err(e) = socket.bind("ipc:///var/run/xandeum/altair_pull.sock") {
-                log::error!("Failed to bind first PULL socket: {:?}", e);
+                error!("Failed to bind first PULL socket: {:?}", e);
                 return;
             }
-            log::info!(
+            info!(
                 "First PULL socket listener started on ipc:///var/run/xandeum/altair_pull.sock"
             );
 
             loop {
                 match socket.recv_bytes(0) {
                     Ok(msg) => {
-                        info!("Received : {:?} From Altair", msg);
+                        debug!("Received : {:?} From Altair", msg);
                         let res = Response::decode(&msg[..]);
                         match res {
                             Ok(r) => {
@@ -636,7 +636,7 @@ impl JsonRpcService {
                                 let sig = match Signature::from_str(&r.signature) {
                                     Ok(s) => s,
                                     Err(e) => {
-                                        log::error!("Invalid signature format: {:?}", e);
+                                        error!("Invalid signature format: {:?}", e);
                                         return;
                                     }
                                 };
@@ -648,7 +648,7 @@ impl JsonRpcService {
                                     );
                                     lock.insert(r.signature.clone(), r);
                                 } else {
-                                    log::debug!("Response already exists")
+                                    debug!("Response already exists")
                                 }
                             }
                             Err(e) => {
@@ -657,7 +657,7 @@ impl JsonRpcService {
                         }
                     }
                     Err(e) => {
-                        log::error!("Altair receive error: {:?}", e);
+                        error!("Altair receive error: {:?}", e);
                     }
                 }
                 tokio::task::yield_now().await;
@@ -671,14 +671,16 @@ impl JsonRpcService {
 
         let transaction_results_clone_for_rpc = transaction_results.clone();
 
+        // Creating the Rpc Api in a separate thread to handle serving xandeum result as a
+        // Rpc request
+        // TO DO : Move this RPC method along with other RPC api methods
         thread::spawn(move || {
             renice_this_thread(rpc_niceness_adj).unwrap();
 
             let mut io: MetaIoHandler<()> = MetaIoHandler::default();
-            io.add_method("rpc-xtransaction", move |params: Params| {
-                info!("Received a rpc request : {:?}", params);
+            io.add_method("getXandeumResult", move |params: Params| {
+                debug!("Received a rpc request : {:?}", params);
                 let transaction_res = transaction_results_clone_for_rpc.clone();
-                info!("transaction Results arry : {:?}", transaction_results);
                 async move {
                     let params_vec: Vec<String> = params.parse().map_err(|e| {
                         jsonrpc_core::Error::invalid_params(format!("Invalid params: {}", e))
@@ -690,7 +692,7 @@ impl JsonRpcService {
                         })?
                         .clone();
 
-                    info!("Received request for transaction signature: {}", signature);
+                    info!("Received RPC request for transaction signature: {}", signature);
                     let results = transaction_res.lock().unwrap();
 
                     let result = results.get(&signature);
@@ -736,7 +738,7 @@ impl JsonRpcService {
                     server.wait();
                 }
                 Err(e) => {
-                    error!("Failed to start JSON RPC service on port 9801: {:?}", e);
+                    error!("Failed to start JSON RPC service for Xandeum result on port 9801: {:?}", e);
                     data_close_handle_sender.send(Err(e.to_string())).unwrap();
                 }
             }
