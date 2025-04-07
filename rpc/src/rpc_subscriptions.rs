@@ -747,9 +747,61 @@ impl RpcSubscriptions {
         self.enqueue_notification(NotificationEntry::SignaturesReceived(slot_signatures));
     }
 
+	fn emit_standard_events(&self, signature: Signature, value: &serde_json::Value) {
+		// Check if the XTx result indicates an error (status == Failed)
+		let is_error = value.get("status").and_then(|s| s.as_i64()).map(|s| s == 2).unwrap_or(false);
+		let error_message = if is_error {
+			value.get("message").and_then(|m| m.as_str()).map(|m| serde_json::json!(m))
+		} else {
+			None
+		};
+
+		// Create the RpcSignatureResult for the event
+		let signature_result = RpcSignatureResult {
+			err: error_message,
+		};
+
+		// Emit a signatureSubscribe event for "confirmed" status
+		let confirmed_notification = NotificationEntry::SignatureSubscribe {
+			signature,
+			result: Response {
+				context: self.context.clone(),
+				value: signature_result.clone(),
+			},
+			commitment: CommitmentConfig {
+				commitment: CommitmentLevel::Confirmed,
+			},
+		};
+		self.enqueue_notification(confirmed_notification);
+
+		// Add a 1-second delay to simulate Solana's typical confirmation timing (optional)
+		sleep(Duration::from_millis(100));
+
+		// Emit a signatureSubscribe event for "finalized" status
+		let finalized_notification = NotificationEntry::SignatureSubscribe {
+			signature,
+			result: Response {
+				context: self.context.clone(),
+				value: signature_result,
+			},
+			commitment: CommitmentConfig {
+				commitment: CommitmentLevel::Finalized,
+			},
+		};
+		self.enqueue_notification(finalized_notification);
+
+		// Emit a logsSubscribe event with the XTx result
+		let log_message = format!("Xandeum XTx completed: {:?}", value);
+		let logs_notification = NotificationEntry::LogSubscribe {
+			logs: vec![log_message],
+		};
+		self.enqueue_notification(logs_notification);
+	}
+
     // Notification For Xandeum result
     pub fn notify_xandeum_result(&self, signature: Signature, value: serde_json::Value) {
         self.enqueue_notification(NotificationEntry::XandeumResult(signature, value));
+        self.emit_standard_events(signature, &value);
     }
 
     pub fn notify_vote(&self, vote_pubkey: Pubkey, vote: VoteTransaction, signature: Signature) {
