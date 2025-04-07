@@ -255,8 +255,7 @@ pub struct JsonRpcRequestProcessor {
     max_complete_rewards_slot: Arc<AtomicU64>,
     prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     runtime: Arc<Runtime>,
-    vega_push_socket: Arc<Mutex<Socket>>,
-    altair_push_socket: Arc<Mutex<Socket>>,
+    to_dock_push_socket: Arc<Mutex<Socket>>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
@@ -416,36 +415,20 @@ impl JsonRpcRequestProcessor {
 
         // Creating UDS sockets and binding them to send Xandeum Transactions
         // to the dock
-        let vega_push_socket = {
+        let to_dock_push_socket = {
             let socket = context.socket(zmq::PUSH).unwrap();
-            log::info!("Vega PUSH socket created successfully.");
+            log::info!("todock PUSH socket created successfully.");
             let socket = Arc::new(Mutex::new(socket));
 
             {
                 let socket_lock = socket.lock().unwrap();
-                if let Err(e) = socket_lock.bind("ipc:///var/run/xandeum/vega.sock") {
-                    log::error!("Failed to connect to vega: {:?}", e);
+                if let Err(e) = socket_lock.bind("ipc:///var/run/xandeum/todock.sock") {
+                    log::error!("Failed to connect to todock socket: {:?}", e);
                 } else {
-                    log::info!("Connected to Vega at ipc:///var/run/xandeum/vega.sock");
+                    log::info!("Connected to socket at ipc:///var/run/xandeum/todock.sock");
                 }
             }
 
-            socket
-        };
-
-        let altair_push_socket = {
-            let socket = context.socket(zmq::PUSH).unwrap();
-            log::info!("Altair PUSH socket created successfully.");
-            let socket = Arc::new(Mutex::new(socket));
-
-            {
-                let socket_lock = socket.lock().unwrap();
-                if let Err(e) = socket_lock.bind("ipc:///var/run/xandeum/altair.sock") {
-                    log::error!("Failed to connect to altair: {:?}", e);
-                } else {
-                    log::info!("Connected to Altair at ipc:///var/run/xandeum/altair.sock");
-                }
-            }
             socket
         };
 
@@ -470,8 +453,7 @@ impl JsonRpcRequestProcessor {
                 max_complete_rewards_slot,
                 prioritization_fee_cache,
                 runtime,
-                vega_push_socket,
-                altair_push_socket,
+                to_dock_push_socket,
             },
             transaction_receiver,
         )
@@ -3936,26 +3918,16 @@ pub mod rpc_full {
                 if has_xand_shield_ix {
                     debug!("Found X Instruction");
                     if let Ok(tx_bytes) = bincode::serialize(&unsanitized_tx_clone) {
-                        // Sending the Xtransaction to vega and altair
-                        match meta.vega_push_socket.lock() {
+                        // Sending the Xtransaction to Docks
+                        match meta.to_dock_push_socket.lock() {
                             Ok(socket) => match socket.send(tx_bytes.clone(), zmq::DONTWAIT) {
-                                Ok(()) => log::debug!("Transaction sent to Vega successfully."),
+                                Ok(()) => log::debug!("Transaction sent to docks successfully."),
                                 Err(zmq::Error::EAGAIN) => log::info!("No Receiver,Skipping"),
                                 Err(e) => {
-                                    log::error!("Failed to send transaction to Vega: {:?}", e)
+                                    log::error!("Failed to send transaction to docks: {:?}", e)
                                 }
                             },
-                            Err(e) => log::error!("Failed to lock Vega Push socket: {:?}", e),
-                        }
-                        match meta.altair_push_socket.lock() {
-                            Ok(socket) => match socket.send(tx_bytes.clone(), zmq::DONTWAIT) {
-                                Ok(()) => log::info!("Transaction sent to Altair successfully."),
-                                Err(zmq::Error::EAGAIN) => log::info!("No Receiver,Skipping"),
-                                Err(e) => {
-                                    log::error!("Failed to send transaction to Altair: {:?}", e)
-                                }
-                            },
-                            Err(e) => log::error!("Failed to lock Altair Push socket: {:?}", e),
+                            Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
                         }
                     } else {
                         log::error!("Failed to serialize transaction.");
