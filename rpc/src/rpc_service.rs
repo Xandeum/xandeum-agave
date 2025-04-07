@@ -391,12 +391,10 @@ impl JsonRpcService {
             })?;
         let runtime = service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj);
 
-        let transaction_results_clone1 = transaction_results.clone();
-        let transaction_results_clone2 = transaction_results.clone();
+        let transaction_results_clone = transaction_results.clone();
 
         let runtime_clone1 = runtime.clone();
         let runtime_clone2 = runtime.clone();
-        let runtime_clone3 = runtime.clone();
 
         let exit_bigtable_ledger_upload_service = Arc::new(AtomicBool::new(false));
 
@@ -475,7 +473,6 @@ impl JsonRpcService {
             max_complete_rewards_slot,
             prioritization_fee_cache,
             Arc::clone(&runtime),
-            // transaction_results.clone(),
         );
 
         let leader_info =
@@ -560,27 +557,26 @@ impl JsonRpcService {
         let context_clone = context.clone();
 
         let rpc_sub_clone1 = rpc_subscriptions.clone();
-        let rpc_sub_clone2 = rpc_subscriptions.clone();
 
         runtime_clone1.spawn(async move {
             let socket = context_clone.socket(zmq::PULL).unwrap();
 
-            if let Err(e) = socket.bind("ipc:///var/run/xandeum/vega_pull.sock") {
-                error!("Failed to bind first PULL socket: {:?}", e);
+            if let Err(e) = socket.bind("ipc:///var/run/xandeum/fromdock.sock") {
+                error!("Failed to bind fromdock pull socket: {:?}", e);
                 return;
             }
             info!(
-                "First PULL socket listener started on ipc:///var/run/xandeum/vega_pull.sock"
+                "First PULL socket listener started on ipc:///var/run/xandeum/fromdock.sock"
             );
 
             loop {
                 match socket.recv_bytes(0) {
                     Ok(msg) => {
-                        debug!("Received : {:?} From vega", msg);
+                        debug!("Received : {:?} From Docks", msg);
                         let res = Response::decode(&msg[..]);
                         match res {
                             Ok(r) => {
-                                let mut lock = transaction_results_clone1.lock().unwrap();
+                                let mut lock = transaction_results_clone.lock().unwrap();
 
                                 let sig = match Signature::from_str(&r.signature) {
                                     Ok(s) => s,
@@ -606,58 +602,7 @@ impl JsonRpcService {
                         }
                     }
                     Err(e) => {
-                        error!("Vega receive error: {:?}", e);
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-        });
-
-        // Listening To Back channel from Altair
-        runtime_clone2.spawn(async move {
-            let socket = context.socket(zmq::PULL).unwrap();
-
-            if let Err(e) = socket.bind("ipc:///var/run/xandeum/altair_pull.sock") {
-                error!("Failed to bind first PULL socket: {:?}", e);
-                return;
-            }
-            info!(
-                "First PULL socket listener started on ipc:///var/run/xandeum/altair_pull.sock"
-            );
-
-            loop {
-                match socket.recv_bytes(0) {
-                    Ok(msg) => {
-                        debug!("Received : {:?} From Altair", msg);
-                        let res = Response::decode(&msg[..]);
-                        match res {
-                            Ok(r) => {
-                                let mut lock = transaction_results_clone2.lock().unwrap();
-                                let sig = match Signature::from_str(&r.signature) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        error!("Invalid signature format: {:?}", e);
-                                        return;
-                                    }
-                                };
-                                if !lock.contains_key(&r.signature) {
-                                    debug!("Adding Result : {:?} ", r.clone());
-                                    rpc_sub_clone2.notify_xandeum_result(
-                                        sig,
-                                        serde_json::to_value(&r).unwrap(),
-                                    );
-                                    lock.insert(r.signature.clone(), r);
-                                } else {
-                                    debug!("Response already exists")
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed To Decode Response : {:?}", e)
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Altair receive error: {:?}", e);
+                        error!("receive error: {:?}", e);
                     }
                 }
                 tokio::task::yield_now().await;
@@ -717,7 +662,7 @@ impl JsonRpcService {
             });
 
             let server = ServerBuilder::new(io)
-                .event_loop_executor(runtime_clone3.handle().clone())
+                .event_loop_executor(runtime_clone2.handle().clone())
                 .threads(1)
                 .cors(DomainsValidation::AllowOnly(vec![
                     AccessControlAllowOrigin::Any,
