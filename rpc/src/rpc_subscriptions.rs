@@ -3,7 +3,7 @@
 use {
     crate::{
         filter::filter_allows,
-        optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
+        optimistically_confirmed_bank_tracker::{OptimisticallyConfirmedBank},
         parsed_token_accounts::{get_parsed_token_account, get_parsed_token_accounts},
         rpc_pubsub_service::PubSubConfig,
         rpc_subscription_tracker::{
@@ -20,7 +20,7 @@ use {
     solana_account_decoder::{
         encode_ui_account, parse_token::is_known_spl_token_id, UiAccount, UiAccountEncoding,
     },
-    solana_client::rpc_response::RpcApiVersion,
+    solana_client::rpc_response::{RpcApiVersion},
     solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path},
     solana_measure::measure::Measure,
     solana_rpc_client_api::response::{
@@ -36,10 +36,12 @@ use {
     solana_sdk::{
         account::{AccountSharedData, ReadableAccount},
         clock::Slot,
+        commitment_config::CommitmentConfig,
         pubkey::Pubkey,
         signature::Signature,
         timing::timestamp,
         transaction,
+        transaction::TransactionError,
     },
     solana_transaction_status::{
         BlockEncodingOptions, ConfirmedBlock, EncodeError, VersionedConfirmedBlock,
@@ -54,13 +56,14 @@ use {
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc, Mutex, RwLock, Weak,
         },
-        thread::{Builder, JoinHandle},
+        thread::{Builder, JoinHandle, sleep},
         time::{Duration, Instant},
     },
     tokio::sync::broadcast,
 };
 
 const RECEIVE_DELAY_MILLIS: u64 = 100;
+pub type SlotSignatures = (Slot, Vec<Signature>);
 
 fn get_transaction_logs(
     bank: &Bank,
@@ -96,33 +99,33 @@ impl From<NotificationEntry> for TimestampedNotificationEntry {
 
 pub enum NotificationEntry {
     Slot(SlotInfo),
-    SlotUpdate(SlotUpdate),
-    Vote((Pubkey, VoteTransaction, Signature)),
-    Root(Slot),
-    Bank(CommitmentSlots),
-    Gossip(Slot),
-    SignaturesReceived((Slot, Vec<Signature>)),
+    Vote(Pubkey, VoteTransaction, Signature),
+    Root(u64),
+    Bank(CommitmentSlots), // Corrected from Bank(Bank) to CommitmentSlots
+    SignaturesReceived(SlotSignatures),
     Subscribed(SubscriptionParams, SubscriptionId),
     Unsubscribed(SubscriptionParams, SubscriptionId),
-    XandeumResult(Signature, serde_json::Value),
+    XandeumResult(Signature, serde_json::Value), // Your Xandeum addition
+    SignatureSubscribe(Signature, RpcSignatureResult),
+    LogsSubscribe(Vec<String>),
+    SlotUpdate(SlotUpdate), // Added missing variant
+    Gossip(Slot),           // Added missing variant
 }
 
 impl std::fmt::Debug for NotificationEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            NotificationEntry::Root(root) => write!(f, "Root({root})"),
-            NotificationEntry::Vote(vote) => write!(f, "Vote({vote:?})"),
             NotificationEntry::Slot(slot_info) => write!(f, "Slot({slot_info:?})"),
-            NotificationEntry::SlotUpdate(slot_update) => {
-                write!(f, "SlotUpdate({slot_update:?})")
+            NotificationEntry::Vote(pubkey, vote, signature) => {
+                write!(f, "Vote({pubkey:?}, {vote:?}, {signature:?})")
             }
+            NotificationEntry::Root(root) => write!(f, "Root({root})"),
             NotificationEntry::Bank(commitment_slots) => {
-                write!(f, "Bank({{slot: {:?}}})", commitment_slots.slot)
+                write!(f, "Bank(slot: {}, root: {})", commitment_slots.slot, commitment_slots.root)
             }
             NotificationEntry::SignaturesReceived(slot_signatures) => {
                 write!(f, "SignaturesReceived({slot_signatures:?})")
             }
-            NotificationEntry::Gossip(slot) => write!(f, "Gossip({slot:?})"),
             NotificationEntry::Subscribed(params, id) => {
                 write!(f, "Subscribed({params:?}, {id:?})")
             }
@@ -132,6 +135,12 @@ impl std::fmt::Debug for NotificationEntry {
             NotificationEntry::XandeumResult(signature, value) => {
                 write!(f, "XandeumResult({signature:?}, {value:?})")
             }
+            NotificationEntry::SignatureSubscribe(signature, result) => {
+                write!(f, "SignatureSubscribe({signature:?}, {result:?})")
+            }
+            NotificationEntry::LogsSubscribe(logs) => write!(f, "LogsSubscribe({logs:?})"),
+            NotificationEntry::SlotUpdate(slot_update) => write!(f, "SlotUpdate({slot_update:?})"),
+            NotificationEntry::Gossip(slot) => write!(f, "Gossip({slot:?})"),
         }
     }
 }
@@ -748,64 +757,44 @@ impl RpcSubscriptions {
     }
 
 	fn emit_standard_events(&self, signature: Signature, value: &serde_json::Value) {
-		// Check if the XTx result indicates an error (status == Failed)
-		let is_error = value.get("status").and_then(|s| s.as_i64()).map(|s| s == 2).unwrap_or(false);
-		let error_message = if is_error {
-			value.get("message").and_then(|m| m.as_str()).map(|m| serde_json::json!(m))
-		} else {
-			None
-		};
+        // Check if the XTx result indicates an error (assuming status == 2 means Failed)
+        let is_error = value.get("status").and_then(|s| s.as_i64()).map(|s| s == 2).unwrap_or(false);
+        let error_message = if is_error {
+                value.get("message").and_then(|m| m.as_str()).map(|_| TransactionError::SanitizeFailure)
+        } else {
+                None
+        };
 
-		// Create the RpcSignatureResult for the event
-		let signature_result = RpcSignatureResult {
-			err: error_message,
-		};
+        // Construct RpcSignatureResult for subscription notifications
+        let signature_result = RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
+            err: error_message,
+        });
 
-		// Emit a signatureSubscribe event for "confirmed" status
-		let confirmed_notification = NotificationEntry::SignatureSubscribe {
-			signature,
-			result: Response {
-				context: self.context.clone(),
-				value: signature_result.clone(),
-			},
-			commitment: CommitmentConfig {
-				commitment: CommitmentLevel::Confirmed,
-			},
-		};
-		self.enqueue_notification(confirmed_notification);
+        // Emit "confirmed" notification
+        let confirmed_notification = NotificationEntry::SignatureSubscribe(signature, signature_result.clone());
+        self.enqueue_notification(confirmed_notification);
 
-		// Add a 1-second delay to simulate Solana's typical confirmation timing (optional)
-		sleep(Duration::from_millis(100));
+        // Simulate delay between confirmed and finalized (mimicking Solana timing)
+        sleep(Duration::from_millis(100));
 
-		// Emit a signatureSubscribe event for "finalized" status
-		let finalized_notification = NotificationEntry::SignatureSubscribe {
-			signature,
-			result: Response {
-				context: self.context.clone(),
-				value: signature_result,
-			},
-			commitment: CommitmentConfig {
-				commitment: CommitmentLevel::Finalized,
-			},
-		};
-		self.enqueue_notification(finalized_notification);
+        // Emit "finalized" notification
+        let finalized_notification = NotificationEntry::SignatureSubscribe(signature, signature_result);
+        self.enqueue_notification(finalized_notification);
 
-		// Emit a logsSubscribe event with the XTx result
-		let log_message = format!("Xandeum XTx completed: {:?}", value);
-		let logs_notification = NotificationEntry::LogSubscribe {
-			logs: vec![log_message],
-		};
-		self.enqueue_notification(logs_notification);
-	}
+        // Emit logs notification with XTx result
+        let log_message = format!("Xandeum XTx completed: {:?}", value);
+        let logs_notification = NotificationEntry::LogsSubscribe(vec![log_message]);
+        self.enqueue_notification(logs_notification);
+    }
 
-    // Notification For Xandeum result
+    // Your existing method to notify Xandeum result and trigger standard events
     pub fn notify_xandeum_result(&self, signature: Signature, value: serde_json::Value) {
-        self.enqueue_notification(NotificationEntry::XandeumResult(signature, value));
+        self.enqueue_notification(NotificationEntry::XandeumResult(signature, value.clone()));
         self.emit_standard_events(signature, &value);
     }
 
     pub fn notify_vote(&self, vote_pubkey: Pubkey, vote: VoteTransaction, signature: Signature) {
-        self.enqueue_notification(NotificationEntry::Vote((vote_pubkey, vote, signature)));
+        self.enqueue_notification(NotificationEntry::Vote(vote_pubkey, vote, signature));
     }
 
     pub fn notify_roots(&self, mut rooted_slots: Vec<Slot>) {
@@ -893,23 +882,25 @@ impl RpcSubscriptions {
                         // These notifications are only triggered by votes observed on gossip,
                         // unlike `NotificationEntry::Gossip`, which also accounts for slots seen
                         // in VoteState's from bank states built in ReplayStage.
-                        NotificationEntry::Vote((vote_pubkey, ref vote_info, signature)) => {
-                            if let Some(sub) = subscriptions
-                                .node_progress_watchers()
-                                .get(&SubscriptionParams::Vote)
-                            {
-                                let rpc_vote = RpcVote {
-                                    vote_pubkey: vote_pubkey.to_string(),
-                                    slots: vote_info.slots(),
-                                    hash: bs58::encode(vote_info.hash()).into_string(),
-                                    timestamp: vote_info.timestamp(),
-                                    signature: signature.to_string(),
-                                };
-                                debug!("vote notify: {:?}", vote_info);
-                                inc_new_counter_info!("rpc-subscription-notify-vote", 1);
-                                notifier.notify(&rpc_vote, sub, false);
-                            }
-                        }
+
+						NotificationEntry::Vote(vote_pubkey, ref vote_info, signature) => {
+							if let Some(sub) = subscriptions
+								.node_progress_watchers()
+								.get(&SubscriptionParams::Vote)
+							{
+								let rpc_vote = RpcVote {
+									vote_pubkey: vote_pubkey.to_string(),
+									slots: vote_info.slots().into_iter().map(|s| s as u64).collect(), // Ensure Slot is u64
+									hash: bs58::encode(vote_info.hash()).into_string(),
+									timestamp: vote_info.timestamp(),
+									signature: signature.to_string(),
+								};
+								debug!("vote notify: {:?}", vote_info);
+								inc_new_counter_info!("rpc-subscription-notify-vote", 1);
+								notifier.notify(&rpc_vote, sub, false);
+							}
+						}
+
                         NotificationEntry::Root(root) => {
                             if let Some(sub) = subscriptions
                                 .node_progress_watchers()
@@ -1051,6 +1042,51 @@ impl RpcSubscriptions {
                                 );
                             }
                         }
+						NotificationEntry::SignatureSubscribe(signature, result) => {
+								if let Some(subs) = subscriptions.by_signature().get(&signature) {
+									for subscription in subs.values() {
+										if let SubscriptionParams::Signature(_params) = subscription.params() {
+											// Notify subscribers listening for signature updates
+											debug!("Signature notify: subscription_id={:?}, signature={:?}, result={:?}", subscription.id(), signature, result);
+											inc_new_counter_info!("rpc-subscription-notify-signature", 1);
+											notifier.notify(
+												RpcResponse::from(RpcNotificationResponse {
+													context: RpcNotificationContext { slot: 0 }, // Slot might need adjustment based on context
+													value: result.clone(),
+												}),
+												subscription,
+												false,
+											);
+										} else {
+											error!("Invalid params type in visit_by_signature for SignatureSubscribe");
+										}
+									}
+								} else {
+									info!("No signature subscriptions found for signature: {:?}", signature);
+								}
+							}
+						NotificationEntry::LogsSubscribe(logs) => {
+							// Notify subscribers listening for logs (e.g., logsSubscribe)
+							if let Some(sub) = subscriptions.node_progress_watchers().get(&SubscriptionParams::Logs(LogsSubscriptionParams {
+								kind: LogsSubscriptionKind::All, // Adjust based on your subscription logic
+								commitment: CommitmentConfig::processed(), // Adjust as needed
+							})) {
+								debug!("Logs notify: {:?}", logs);
+								inc_new_counter_info!("rpc-subscription-notify-logs", 1);
+								notifier.notify(
+									RpcResponse::from(RpcNotificationResponse {
+										context: RpcNotificationContext { slot: 0 }, // Slot might need adjustment
+										value: RpcLogsResponse {
+											signature: "".to_string(), // No specific signature for logs in this context
+											err: None,
+											logs,
+										},
+									}),
+									sub,
+									false,
+								);
+							}
+						}
                     }
                     stats.notification_entry_processing_time_us +=
                         queued_at.elapsed().as_micros() as u64;
