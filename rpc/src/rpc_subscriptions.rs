@@ -756,36 +756,45 @@ impl RpcSubscriptions {
         self.enqueue_notification(NotificationEntry::SignaturesReceived(slot_signatures));
     }
 
+
 	fn emit_standard_events(&self, signature: Signature, value: &serde_json::Value) {
-        // Check if the XTx result indicates an error (assuming status == 2 means Failed)
-        let is_error = value.get("status").and_then(|s| s.as_i64()).map(|s| s == 2).unwrap_or(false);
-        let error_message = if is_error {
-                value.get("message").and_then(|m| m.as_str()).map(|_| TransactionError::SanitizeFailure)
-        } else {
-                None
-        };
+		// Delay before emitting "confirmed" to allow clients to subscribe
+		debug!("Delaying 2000ms before emitting confirmed notification for signature: {:?}", signature);
+		sleep(Duration::from_millis(2000));
 
-        // Construct RpcSignatureResult for subscription notifications
-        let signature_result = RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
-            err: error_message,
-        });
+		// Check if the XTx result indicates an error (assuming status == 2 means Failed)
+		let is_error = value.get("status").and_then(|s| s.as_i64()).map(|s| s == 2).unwrap_or(false);
+		let error_message = if is_error {
+			value.get("message").and_then(|m| m.as_str()).map(|_| TransactionError::SanitizeFailure)
+		} else {
+			None
+		};
 
-        // Emit "confirmed" notification
-        let confirmed_notification = NotificationEntry::SignatureSubscribe(signature, signature_result.clone());
-        self.enqueue_notification(confirmed_notification);
+		// Construct RpcSignatureResult for subscription notifications
+		let signature_result = RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
+			err: error_message,
+		});
 
-        // Simulate delay between confirmed and finalized (mimicking Solana timing)
-        sleep(Duration::from_millis(100));
+		// Emit "confirmed" notification
+		debug!("Emitting signatureSubscribe (confirmed) for signature: {:?}", signature);
+		let confirmed_notification = NotificationEntry::SignatureSubscribe(signature, signature_result.clone());
+		self.enqueue_notification(confirmed_notification);
 
-        // Emit "finalized" notification
-        let finalized_notification = NotificationEntry::SignatureSubscribe(signature, signature_result);
-        self.enqueue_notification(finalized_notification);
+		// Delay before emitting "finalized" to allow further processing
+		debug!("Delaying 1000ms before emitting finalized notification for signature: {:?}", signature);
+		sleep(Duration::from_millis(1000));
 
-        // Emit logs notification with XTx result
-        let log_message = format!("Xandeum XTx completed: {:?}", value);
-        let logs_notification = NotificationEntry::LogsSubscribe(vec![log_message]);
-        self.enqueue_notification(logs_notification);
-    }
+		// Emit "finalized" notification
+		debug!("Emitting signatureSubscribe (finalized) for signature: {:?}", signature);
+		let finalized_notification = NotificationEntry::SignatureSubscribe(signature, signature_result);
+		self.enqueue_notification(finalized_notification);
+
+		// Emit logs notification with XTx result
+		debug!("Emitting logsSubscribe for signature: {:?}", signature);
+		let log_message = format!("Xandeum XTx completed: {:?}", value);
+		let logs_notification = NotificationEntry::LogsSubscribe(vec![log_message]);
+		self.enqueue_notification(logs_notification);
+	}
 
     // Your existing method to notify Xandeum result and trigger standard events
     pub fn notify_xandeum_result(&self, signature: Signature, value: serde_json::Value) {
