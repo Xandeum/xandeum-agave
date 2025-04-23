@@ -36,10 +36,11 @@ use {
     },
     solana_sdk::{
         exit::Exit, genesis_config::DEFAULT_GENESIS_DOWNLOAD_PATH, hash::Hash,
-        native_token::lamports_to_sol, signature::Signature,
+        message::v0::LoadedAddresses, native_token::lamports_to_sol, signature::Signature,
     },
     solana_send_transaction_service::send_transaction_service::{self, SendTransactionService},
     solana_storage_bigtable::CredentialType,
+    solana_transaction_status::TransactionStatusMeta,
     std::{
         collections::HashMap,
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -396,6 +397,9 @@ impl JsonRpcService {
         let runtime_clone1 = runtime.clone();
         let runtime_clone2 = runtime.clone();
 
+        let block_store_clone = blockstore.clone();
+        let bank_fork_clone = bank_forks.clone();
+
         let exit_bigtable_ledger_upload_service = Arc::new(AtomicBool::new(false));
 
         let (bigtable_ledger_storage, _bigtable_ledger_upload_service) =
@@ -565,9 +569,7 @@ impl JsonRpcService {
                 error!("Failed to bind fromdock pull socket: {:?}", e);
                 return;
             }
-            info!(
-                "First PULL socket listener started on ipc:///var/run/xandeum/fromdock.sock"
-            );
+            info!("First PULL socket listener started on ipc:///var/run/xandeum/fromdock.sock");
 
             loop {
                 match socket.recv_bytes(0) {
@@ -587,11 +589,47 @@ impl JsonRpcService {
                                 };
                                 if !lock.contains_key(&r.signature) {
                                     debug!("Adding Result : {:?} ", r.clone());
+                                    let message = r.message.clone();
                                     rpc_sub_clone1.notify_xandeum_result(
                                         sig,
                                         serde_json::to_value(&r).unwrap(),
                                     );
                                     lock.insert(r.signature.clone(), r);
+
+                                    debug!("Adding the signature to block-store");
+
+                                    let status = TransactionStatusMeta {
+                                        status: Ok(()),
+                                        fee: 0,
+                                        pre_balances: vec![],
+                                        post_balances: vec![],
+                                        inner_instructions: None,
+                                        log_messages: Some(vec![message.clone()]),
+                                        pre_token_balances: None,
+                                        post_token_balances: None,
+                                        rewards: None,
+                                        loaded_addresses: LoadedAddresses {
+                                            writable: vec![],
+                                            readonly: vec![],
+                                        },
+                                        return_data: None,
+                                        compute_units_consumed: None,
+                                    };
+
+                                    let slot = bank_fork_clone.read().unwrap().root_bank().slot();
+                                    debug!("Using bank slot: {} for signature: {}", slot, sig);
+
+                                    if let Err(e) = block_store_clone.write_transaction_status(
+                                        slot,
+                                        sig,
+                                        std::iter::empty(),
+                                        status,0
+
+                                    ) {
+                                        error!("Failed to insert transaction status into blockstore: {:?}", e);
+                                    } else {
+                                        info!("Transaction status stored in blockstore for signature: {} at slot: {}", sig, slot);
+                                    }
                                 } else {
                                     debug!("Response already exists")
                                 }
@@ -637,7 +675,10 @@ impl JsonRpcService {
                         })?
                         .clone();
 
-                    info!("Received RPC request for transaction signature: {}", signature);
+                    info!(
+                        "Received RPC request for transaction signature: {}",
+                        signature
+                    );
                     let results = transaction_res.lock().unwrap();
 
                     let result = results.get(&signature);
@@ -683,7 +724,10 @@ impl JsonRpcService {
                     server.wait();
                 }
                 Err(e) => {
-                    error!("Failed to start JSON RPC service for Xandeum result on port 9801: {:?}", e);
+                    error!(
+                        "Failed to start JSON RPC service for Xandeum result on port 9801: {:?}",
+                        e
+                    );
                     data_close_handle_sender.send(Err(e.to_string())).unwrap();
                 }
             }
