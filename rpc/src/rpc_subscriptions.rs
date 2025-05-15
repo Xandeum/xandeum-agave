@@ -550,7 +550,7 @@ impl RpcSubscriptions {
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
-        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) -> Self {
         Self::new_with_config(
             exit,
@@ -573,7 +573,7 @@ impl RpcSubscriptions {
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
-        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) -> Self {
         let ledger_path = get_tmp_ledger_path!();
         let blockstore = Blockstore::open(&ledger_path).unwrap();
@@ -599,7 +599,7 @@ impl RpcSubscriptions {
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
-        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) -> Self {
         let rpc_notifier_ready = Arc::new(AtomicBool::new(false));
 
@@ -639,7 +639,7 @@ impl RpcSubscriptions {
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
         config: &PubSubConfig,
         rpc_notifier_ready: Option<Arc<AtomicBool>>,
-        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) -> Self {
         let (notification_sender, notification_receiver) = crossbeam_channel::unbounded();
         let subscriptions = SubscriptionsTracker::new(bank_forks.clone());
@@ -704,7 +704,7 @@ impl RpcSubscriptions {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         max_complete_rewards_slot: Arc<AtomicU64>,
         bank_forks: Arc<RwLock<BankForks>>,
-        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) -> Self {
         let ledger_path = get_tmp_ledger_path!();
         let blockstore = Blockstore::open(&ledger_path).unwrap();
@@ -843,7 +843,7 @@ impl RpcSubscriptions {
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
-        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) {
         let mut stats = PubsubNotificationStats::default();
 

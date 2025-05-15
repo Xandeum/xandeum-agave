@@ -408,30 +408,9 @@ impl JsonRpcRequestProcessor {
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         runtime: Arc<Runtime>,
-        // transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
+        to_dock_push_socket :Arc<Mutex<Socket>>
     ) -> (Self, Receiver<TransactionInfo>) {
         let (transaction_sender, transaction_receiver) = unbounded();
-        let context = zmq::Context::new();
-
-        // Creating UDS sockets and binding them to send Xandeum Transactions
-        // to the dock
-        let to_dock_push_socket = {
-            let socket = context.socket(zmq::PUSH).unwrap();
-            log::info!("todock PUSH socket created successfully.");
-            let socket = Arc::new(Mutex::new(socket));
-
-            {
-                let socket_lock = socket.lock().unwrap();
-                if let Err(e) = socket_lock.bind("ipc:///var/run/xandeum/todock.sock") {
-                    log::error!("Failed to connect to todock socket: {:?}", e);
-                } else {
-                    log::info!("Connected to socket at ipc:///var/run/xandeum/todock.sock");
-                }
-            }
-
-            socket
-        };
-
         (
             Self {
                 config,

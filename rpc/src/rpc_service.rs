@@ -9,39 +9,22 @@ use {
         rpc_cache::LargestAccountsCache,
         rpc_health::*,
         rpc_subscriptions::RpcSubscriptions,
-    },
-    crossbeam_channel::unbounded,
-    jsonrpc_core::{futures::prelude::*, MetaIoHandler, Params},
-    jsonrpc_http_server::{
+    }, crossbeam_channel::unbounded, jsonrpc_core::{futures::{channel::oneshot, prelude::*}, MetaIoHandler, Params}, jsonrpc_http_server::{
         hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
         RequestMiddlewareAction, ServerBuilder,
-    },
-    prost::Message,
-    regex::Regex,
-    solana_client::connection_cache::ConnectionCache,
-    solana_gossip::cluster_info::ClusterInfo,
-    solana_ledger::{
+    }, prost::Message, regex::Regex, solana_client::connection_cache::ConnectionCache, solana_gossip::cluster_info::ClusterInfo, solana_ledger::{
         bigtable_upload::ConfirmedBlockUploadConfig,
         bigtable_upload_service::BigTableUploadService, blockstore::Blockstore,
         leader_schedule_cache::LeaderScheduleCache,
-    },
-    solana_metrics::inc_new_counter_info,
-    solana_perf::thread::renice_this_thread,
-    solana_poh::poh_recorder::PohRecorder,
-    solana_runtime::{
+    }, solana_metrics::inc_new_counter_info, solana_perf::thread::renice_this_thread, solana_poh::poh_recorder::PohRecorder, solana_runtime::{
         bank_forks::BankForks, commitment::BlockCommitmentCache,
         prioritization_fee_cache::PrioritizationFeeCache,
         snapshot_archive_info::SnapshotArchiveInfoGetter, snapshot_config::SnapshotConfig,
         snapshot_utils,
-    },
-    solana_sdk::{
+    }, solana_sdk::{
         exit::Exit, genesis_config::DEFAULT_GENESIS_DOWNLOAD_PATH, hash::Hash,
         message::v0::LoadedAddresses, native_token::lamports_to_sol, signature::Signature,
-    },
-    solana_send_transaction_service::send_transaction_service::{self, SendTransactionService},
-    solana_storage_bigtable::CredentialType,
-    solana_transaction_status::TransactionStatusMeta,
-    std::{
+    }, solana_send_transaction_service::send_transaction_service::{self, SendTransactionService}, solana_storage_bigtable::CredentialType, solana_transaction_status::TransactionStatusMeta, std::{
         collections::HashMap,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
@@ -51,9 +34,8 @@ use {
             Arc, Mutex, RwLock,
         },
         thread::{self, Builder, JoinHandle},
-    },
-    tokio_util::codec::{BytesCodec, FramedRead},
-    xandeum_protos::response::Response,
+    }, tokio_util::codec::{BytesCodec, FramedRead}, xandeum_protos::response::{response::{self}, ResponseWrapper, TxResponse},
+    xandeum_protos::types::{Opcode,Request}
 };
 
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
@@ -361,7 +343,7 @@ impl JsonRpcService {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
-        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>>,
+        transaction_results: Arc<Mutex<HashMap<String, TxResponse>>>,
         rpc_subscriptions: &Arc<RpcSubscriptions>,
     ) -> Result<Self, String> {
         info!("rpc bound to {:?}", rpc_addr);
@@ -396,6 +378,8 @@ impl JsonRpcService {
 
         let runtime_clone1 = runtime.clone();
         let runtime_clone2 = runtime.clone();
+        let runtime_clone3 = runtime.clone();
+
 
         let block_store_clone = blockstore.clone();
         let bank_fork_clone = bank_forks.clone();
@@ -458,6 +442,30 @@ impl JsonRpcService {
         let max_request_body_size = config
             .max_request_body_size
             .unwrap_or(MAX_REQUEST_BODY_SIZE);
+
+            let context = zmq::Context::new();
+            let context_clone = context.clone();
+
+        // Creating UDS sockets and binding them to send Xandeum Transactions
+        // to the dock
+        let to_dock_push_socket = {
+            let socket = context.socket(zmq::PUSH).unwrap();
+            log::info!("todock PUSH socket created successfully.");
+            let socket = Arc::new(Mutex::new(socket));
+
+            {
+                let socket_lock = socket.lock().unwrap();
+                if let Err(e) = socket_lock.bind("ipc:///var/run/xandeum/todock.sock") {
+                    log::error!("Failed to connect to todock socket: {:?}", e);
+                } else {
+                    log::info!("Connected to socket at ipc:///var/run/xandeum/todock.sock");
+                }
+            }
+
+            socket
+        };
+
+
         let (request_processor, receiver) = JsonRpcRequestProcessor::new(
             config,
             snapshot_config.clone(),
@@ -477,6 +485,8 @@ impl JsonRpcService {
             max_complete_rewards_slot,
             prioritization_fee_cache,
             Arc::clone(&runtime),
+            to_dock_push_socket.clone()
+
         );
 
         let leader_info =
@@ -557,10 +567,9 @@ impl JsonRpcService {
             })
             .unwrap();
 
-        let context = zmq::Context::new();
-        let context_clone = context.clone();
-
         let rpc_sub_clone1 = rpc_subscriptions.clone();
+        let (transaction_sender, transaction_receiver) = unbounded();
+
 
         runtime_clone1.spawn(async move {
             let socket = context_clone.socket(zmq::PULL).unwrap();
@@ -574,73 +583,98 @@ impl JsonRpcService {
             loop {
                 match socket.recv_bytes(0) {
                     Ok(msg) => {
-                        debug!("Received : {:?} From Docks", msg);
-                        let res = Response::decode(&msg[..]);
-                        match res {
-                            Ok(r) => {
-                                let mut lock = transaction_results_clone.lock().unwrap();
-
-                                let sig = match Signature::from_str(&r.signature) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        error!("Invalid signature format: {:?}", e);
+                        debug!("Received message from dock: {:?}", msg);
+                        match ResponseWrapper::decode(&msg[..]) {
+                            Ok(wrapper) => {
+                                let response = match wrapper.response {
+                                    Some(ref resp) => resp.clone(),
+                                    None => {
+                                        error!("Received empty Response in ResponseWrapper: id={}", wrapper.id);
                                         return;
                                     }
                                 };
-                                if !lock.contains_key(&r.signature) {
-                                    debug!("Adding Result : {:?} ", r.clone());
-                                    let message = r.message.clone();
-                                    rpc_sub_clone1.notify_xandeum_result(
-                                        sig,
-                                        serde_json::to_value(&r).unwrap(),
-                                    );
-                                    lock.insert(r.signature.clone(), r);
-
-                                    debug!("Adding the signature to block-store");
-
-                                    let status = TransactionStatusMeta {
-                                        status: Ok(()),
-                                        fee: 0,
-                                        pre_balances: vec![],
-                                        post_balances: vec![],
-                                        inner_instructions: None,
-                                        log_messages: Some(vec![message.clone()]),
-                                        pre_token_balances: None,
-                                        post_token_balances: None,
-                                        rewards: None,
-                                        loaded_addresses: LoadedAddresses {
-                                            writable: vec![],
-                                            readonly: vec![],
-                                        },
-                                        return_data: None,
-                                        compute_units_consumed: None,
-                                    };
-
-                                    let slot = bank_fork_clone.read().unwrap().root_bank().slot();
-                                    debug!("Using bank slot: {} for signature: {}", slot, sig);
-
-                                    if let Err(e) = block_store_clone.write_transaction_status(
-                                        slot,
-                                        sig,
-                                        std::iter::empty(),
-                                        status,0
-
-                                    ) {
-                                        error!("Failed to insert transaction status into blockstore: {:?}", e);
-                                    } else {
-                                        info!("Transaction status stored in blockstore for signature: {} at slot: {}", sig, slot);
+                
+                                match response.response {
+                                    Some(response::Response::Tx(r)) => {
+                                        // Handle TxResponse (transaction logic)
+                                        let mut lock = transaction_results_clone.lock().unwrap();
+                                        let sig = match Signature::from_str(&r.signature) {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                error!("Invalid signature format: {:?}", e);
+                                                return;
+                                            }
+                                        };
+                                        if !lock.contains_key(&r.signature) {
+                                            debug!("Adding Result : {:?} ", r.clone());
+                                            let message = r.message.clone();
+                                            rpc_sub_clone1.notify_xandeum_result(
+                                                sig,
+                                                serde_json::to_value(&r).unwrap(),
+                                            );
+                                            lock.insert(r.signature.clone(), r);
+            
+                                            debug!("Adding the signature to block-store");
+            
+                                            let status = TransactionStatusMeta {
+                                                status: Ok(()),
+                                                fee: 0,
+                                                pre_balances: vec![],
+                                                post_balances: vec![],
+                                                inner_instructions: None,
+                                                log_messages: Some(vec![message.clone()]),
+                                                pre_token_balances: None,
+                                                post_token_balances: None,
+                                                rewards: None,
+                                                loaded_addresses: LoadedAddresses {
+                                                    writable: vec![],
+                                                    readonly: vec![],
+                                                },
+                                                return_data: None,
+                                                compute_units_consumed: None,
+                                            };
+            
+                                            let slot = bank_fork_clone.read().unwrap().root_bank().slot();
+                                            debug!("Using bank slot: {} for signature: {}", slot, sig);
+            
+                                            if let Err(e) = block_store_clone.write_transaction_status(
+                                                slot,
+                                                sig,
+                                                std::iter::empty(),
+                                                status,0
+            
+                                            ) {
+                                                error!("Failed to insert transaction status into blockstore: {:?}", e);
+                                            } else {
+                                                info!("Transaction status stored in blockstore for signature: {} at slot: {}", sig, slot);
+                                            }
+                                        } else {
+                                            debug!("Response already exists")
+                                        }
                                     }
-                                } else {
-                                    debug!("Response already exists")
+                                    Some(response::Response::Metadata(_))
+                                    | Some(response::Response::Exists(_))
+                                    | Some(response::Response::ListDir(_)) => {
+            
+                                        debug!(" Received Response for Request-id = {}", wrapper.id);
+                                        match transaction_sender.try_send(wrapper) {
+                                            Ok(()) => debug!("Sent ResponseWrapper"),
+                                            Err(e) => error!("Failed to send ResponseWrapper: {:?}", e),
+                                        }
+                                    }
+                                    None => {
+                                        error!("Received empty response variant in ResponseWrapper: id={}", wrapper.id);
+                                    }
                                 }
                             }
                             Err(e) => {
-                                error!("Failed To Decode Response : {:?}", e)
+                                error!("Failed to decode ResponseWrapper: {:?}", e);
+                                debug!("Raw message: {:?}", msg);
                             }
                         }
                     }
                     Err(e) => {
-                        error!("receive error: {:?}", e);
+                        error!("Receive error: {:?}", e);
                     }
                 }
                 tokio::task::yield_now().await;
@@ -649,16 +683,55 @@ impl JsonRpcService {
 
         let close_handle = close_handle_receiver.recv().unwrap()?;
 
+        let context = zmq::Context::new();
+
         let data_listener_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 9801);
         let (data_close_handle_sender, data_close_handle_receiver) = unbounded();
 
         let transaction_results_clone_for_rpc = transaction_results.clone();
+
+        let request_id_counter = Arc::new(AtomicU64::new(1));
+
 
         // Creating the Rpc Api in a separate thread to handle serving xandeum result as a
         // Rpc request
         // TO DO : Move this RPC method along with other RPC api methods
         thread::spawn(move || {
             renice_this_thread(rpc_niceness_adj).unwrap();
+
+            let pending_requests = Arc::new(Mutex::new(HashMap::<u64, oneshot::Sender<serde_json::Value>>::new()));
+            let runtime_handle = runtime_clone3.clone();
+
+            // Spawn thread to process transaction_receiver messages
+            let pending_requests_clone = pending_requests.clone();
+            thread::spawn(move || {
+                let runtime_handle = runtime_handle.handle();
+
+                while let Ok(response) = transaction_receiver.recv() {
+
+                    debug!("Received RpcResponse: {:?}", response);
+                    let pending_requests_clone = pending_requests_clone.clone();
+                    runtime_handle.spawn(async move {
+                        let mut pending = pending_requests_clone.lock().unwrap();
+                        if let Some(sender) = pending.remove(&response.id) {
+                            let json_result = match serde_json::to_value(&response) {
+                                Ok(value) => value,
+                                Err(e) => {
+                                    error!("Failed to serialize ResponseWrapper: {:?}", e);
+                                    return;
+                                }
+                            };
+                            if let Err(e) = sender.send(json_result) {
+                                error!("Failed to send JsonRpcResponse to RPC handler: {:?}", e);
+                            } else {
+                                debug!("Sent JsonRpcResponse for id: {}", response.id);
+                            }
+                        } else {
+                            debug!("No pending request found for id: {}", response.id);
+                        }
+                    });
+                }
+            });
 
             let mut io: MetaIoHandler<()> = MetaIoHandler::default();
             io.add_method("getXandeumResult", move |params: Params| {
@@ -701,6 +774,106 @@ impl JsonRpcService {
                 }
                 .boxed()
             });
+
+            macro_rules! add_dock_method {
+                ($method_name:expr, $pending_requests:expr, $to_dock_socket:expr, $request_id_counter:expr) => {
+                    io.add_method($method_name, {
+                        let pending_requests = $pending_requests.clone();
+                        let push_socket = $to_dock_socket.clone();
+                        let request_id_counter = $request_id_counter.clone();
+                        move |params: Params| {
+                            info!("Received JSON-RPC request for {}: {:?}", $method_name, params);
+                            let pending_requests = pending_requests.clone();
+                            let socket = push_socket.clone();
+                            let request_id_counter = request_id_counter.clone();
+                            async move {
+                                let params_vec: Vec<String> = params.parse().map_err(|e| {
+                                    jsonrpc_core::Error::invalid_params(format!("Invalid params: expected a string, got {}", e))
+                                })?;
+
+                                let param_str = params_vec
+                                .get(0)
+                                .ok_or_else(|| {
+                                    jsonrpc_core::Error::invalid_params("Expected a string")
+                                })?
+                                .clone();
+    
+                                let request_id = request_id_counter.fetch_add(1, Ordering::SeqCst);
+    
+                                let (tx, rx) = oneshot::channel();
+    
+                                {
+                                    let mut pending = pending_requests.lock().unwrap();
+                                    pending.insert(request_id, tx);
+                                    info!("Stored tx for request id: {}", request_id);
+                                }
+                                
+                                let op = match $method_name {
+                                    "getMetadata" => Opcode::GetMetadata,
+                                    "isExist" => Opcode::Exists,
+                                    "listDirs" => Opcode::ListDirs,
+                                    _ => return Err(jsonrpc_core::Error::method_not_found()),
+                                };
+            
+                                let mut data = Vec::new();
+                                data.extend_from_slice(&request_id.to_be_bytes()); 
+                                data.extend_from_slice(param_str.as_bytes()); 
+            
+                                let request = Request {
+                                    op: op as i32,
+                                    pubkey: Vec::new(), 
+                                    data,
+                                    signature: String::new(),
+                                };
+                              
+                                let request_bytes = match bincode::serialize(&request) {
+                                    Ok(bytes) => bytes,
+                                    Err(e) => {
+                                        error!("Failed to serialize Request: {:?}", e);
+                                        pending_requests.lock().unwrap().remove(&request_id);
+                                        return Err(jsonrpc_core::Error {
+                                            code: jsonrpc_core::ErrorCode::InternalError,
+                                            message: format!("Serialization error: {}", e),
+                                            data: None,
+                                        });
+                                    }
+                                };
+
+                                match socket.lock() {
+                                    Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
+                                        Ok(()) => log::debug!("Transaction sent to docks successfully."),
+                                        Err(zmq::Error::EAGAIN) => log::info!("No Receiver,Skipping"),
+                                        Err(e) => {
+                                            log::error!("Failed to send transaction to docks: {:?}", e)
+                                        }
+                                    },
+                                    Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
+                                }
+    
+                                // Wait for response with timeout
+                                match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                                    Ok(Ok(response)) => {
+                                        info!("Received response {:?} ", response);
+                                        Ok(serde_json::to_value(response).map_err(|_| {
+                                            jsonrpc_core::Error::internal_error()
+                                        })?)
+                                    }
+                                    _ => Err(jsonrpc_core::Error {
+                                        code: jsonrpc_core::ErrorCode::InternalError,
+                                        message: "Timeout or no response from dock".to_string(),
+                                        data: None,
+                                    }),
+                                }
+                            }
+                            .boxed()
+                        }
+                    });
+                };
+            }
+    
+            add_dock_method!("getMetadata", pending_requests, to_dock_push_socket, request_id_counter);
+            add_dock_method!("isExist", pending_requests, to_dock_push_socket, request_id_counter);
+            add_dock_method!("listDirs", pending_requests, to_dock_push_socket, request_id_counter);
 
             let server = ServerBuilder::new(io)
                 .event_loop_executor(runtime_clone2.handle().clone())

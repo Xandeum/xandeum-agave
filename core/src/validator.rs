@@ -1076,7 +1076,7 @@ impl Validator {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
 
-            let transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::Response>>> =
+            let transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
             let transaction_results_clone = transaction_results.clone();
