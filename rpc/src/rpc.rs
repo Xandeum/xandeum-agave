@@ -1,7 +1,7 @@
 //! The `rpc` module implements the Solana RPC interface.
-use std::sync::Mutex;
 #[cfg(feature = "dev-context-only-utils")]
 use solana_runtime::installed_scheduler_pool::BankWithScheduler;
+use std::sync::Mutex;
 use zmq::Socket;
 use {
     crate::{
@@ -408,7 +408,7 @@ impl JsonRpcRequestProcessor {
         max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         runtime: Arc<Runtime>,
-        to_dock_push_socket :Arc<Mutex<Socket>>
+        to_dock_push_socket: Arc<Mutex<Socket>>,
     ) -> (Self, Receiver<TransactionInfo>) {
         let (transaction_sender, transaction_receiver) = unbounded();
         (
@@ -3476,6 +3476,7 @@ pub mod rpc_full {
         super::*,
         solana_sdk::message::{SanitizedVersionedMessage, VersionedMessage},
         solana_transaction_status::parse_ui_inner_instructions,
+        xandeum_protos::types::{Opcode, Request},
     };
     #[rpc]
     pub trait Full {
@@ -3894,27 +3895,141 @@ pub mod rpc_full {
                 let has_xand_shield_ix = instructions
                     .iter()
                     .any(|ix| ix.program_id_index as usize == xand_shield_pos);
-                if has_xand_shield_ix {
-                    debug!("Found X Instruction");
-                    if let Ok(tx_bytes) = bincode::serialize(&unsanitized_tx_clone) {
-                        // Sending the Xtransaction to Docks
-                        match meta.to_dock_push_socket.lock() {
-                            Ok(socket) => match socket.send(tx_bytes.clone(), zmq::DONTWAIT) {
-                                Ok(()) => log::debug!("Transaction sent to docks successfully."),
-                                Err(zmq::Error::EAGAIN) => log::info!("No Receiver,Skipping"),
-                                Err(e) => {
-                                    log::error!("Failed to send transaction to docks: {:?}", e)
-                                }
-                            },
-                            Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
-                        }
-                    } else {
-                        log::error!("Failed to serialize transaction.");
-                    }
 
-                    // Return the transaction signature as success,
-                    let signature = unsanitized_tx_clone.signatures[0].to_string();
-                    return Ok(signature);
+                if has_xand_shield_ix {
+                    let poke_instructions: Vec<_> = instructions
+                        .iter()
+                        .filter(|ix| ix.program_id_index as usize == xand_shield_pos)
+                        .filter(|ix| {
+                            ix.data
+                                .split_first()
+                                .map(|(&op, _)| op == 4)
+                                .unwrap_or(false)
+                        })
+                        .collect();
+
+                    if !poke_instructions.is_empty() {
+                        debug!("Found X Instruction with Poke opcode");
+                        let tx_hash = unsanitized_tx_clone
+                            .signatures
+                            .get(0)
+                            .map(|sig| sig.to_string())
+                            .unwrap_or_else(|| {
+                                warn!("Transaction has no signatures, using default");
+                                "no-signature".to_string()
+                            });
+
+                        for ix in poke_instructions {
+                            if ix.accounts.len() != 2 {
+                                log::error!(
+                                    "Poke instruction must have exactly 2 accounts, skipping"
+                                );
+                                continue;
+                            }
+
+                            let signers: Vec<&Pubkey> = ix
+                                .accounts
+                                .iter()
+                                .filter_map(|&index| {
+                                    if msg.is_signer(index as usize) {
+                                        Some(&msg.static_account_keys()[index as usize])
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            if signers.len() != 1 {
+                                log::error!(
+                                    "Poke instruction must have exactly 1 signer, skipping"
+                                );
+                                continue;
+                            }
+
+                            let signer = signers[0];
+                            let pda = &msg.static_account_keys()[ix.accounts[1] as usize];
+
+                            // Fetch PDA account data
+                            let pda_data = match preflight_bank.get_account(pda) {
+                                Some(account) => account.data_clone(),
+                                None => {
+                                    log::error!("PDA account {} not found, skipping", pda);
+                                    continue;
+                                }
+                            };
+
+                            match ix.data.split_first() {
+                                Some((op, instruction_data)) => {
+                                    if *op != 4 {
+                                        continue; // Safety check
+                                    }
+                                    let mut request_data = instruction_data.to_vec();
+                                    request_data.extend_from_slice(&pda_data); // Append PDA data
+
+                                    let req = Request {
+                                        op: Opcode::Poke as i32,
+                                        pubkey: signer.to_bytes().to_vec(),
+                                        data: request_data,
+                                        signature: tx_hash.clone(),
+                                    };
+
+                                    if let Ok(req_bytes) = bincode::serialize(&req) {
+                                        match meta.to_dock_push_socket.lock() {
+                                            Ok(socket) => {
+                                                match socket.send(req_bytes, zmq::DONTWAIT) {
+                                                    Ok(()) => log::debug!(
+                                                        "Request sent to docks successfully."
+                                                    ),
+                                                    Err(zmq::Error::EAGAIN) => {
+                                                        log::info!("No Receiver, Skipping")
+                                                    }
+                                                    Err(e) => {
+                                                        log::error!(
+                                                            "Failed to send request to docks: {:?}",
+                                                            e
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::error!("Failed to lock todock socket: {:?}", e)
+                                            }
+                                        }
+                                    } else {
+                                        log::error!("Failed to serialize request.");
+                                    }
+                                }
+                                None => {
+                                    log::warn!("Poke instruction has empty data, skipping");
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let signature = unsanitized_tx_clone.signatures[0].to_string();
+                        return Ok(signature);
+                    } else {
+                        debug!("Found X Instruction without Poke opcode");
+                        if let Ok(tx_bytes) = bincode::serialize(&unsanitized_tx_clone) {
+                            match meta.to_dock_push_socket.lock() {
+                                Ok(socket) => match socket.send(tx_bytes, zmq::DONTWAIT) {
+                                    Ok(()) => {
+                                        log::debug!("Transaction sent to docks successfully.")
+                                    }
+                                    Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
+                                    Err(e) => {
+                                        log::error!("Failed to send transaction to docks: {:?}", e)
+                                    }
+                                },
+                                Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
+                            }
+                        } else {
+                            log::error!("Failed to serialize transaction.");
+                        }
+
+                        let signature = unsanitized_tx_clone.signatures[0].to_string();
+                        return Ok(signature);
+                    }
                 }
             }
             // EndXandeum
