@@ -158,7 +158,7 @@ pub trait RpcSolPubSub {
     #[pubsub(
         subscription = "xandeumResultNotification",
         unsubscribe,
-        name = "xandeum_result_unsubscribe"
+        name = "xandeumResultUnsubscribe"
     )]
     fn xandeum_result_unsubscribe(
         &self,
@@ -343,7 +343,7 @@ mod internal {
         ) -> Result<SubscriptionId>;
 
         // Unsubscribe from signature notification subscription.
-        #[rpc(name = "xandeumResultUnscribe")]
+        #[rpc(name = "xandeumResultUnsubscribe")]
         fn xandeum_result_unsubscribe(&self, id: SubscriptionId) -> Result<bool>;
 
         // Get notification when slot is encountered
