@@ -1,7 +1,14 @@
 //! The `rpc` module implements the Solana RPC interface.
+use jsonrpc_core::ErrorCode;
+
 #[cfg(feature = "dev-context-only-utils")]
 use solana_runtime::installed_scheduler_pool::BankWithScheduler;
 use std::sync::Mutex;
+use tokio::time::sleep;
+use xandeum_protos::{
+    response::{ResponseWrapper, TxResponse},
+    types::{Opcode, Request},
+};
 use zmq::Socket;
 use {
     crate::{
@@ -256,6 +263,9 @@ pub struct JsonRpcRequestProcessor {
     prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     runtime: Arc<Runtime>,
     to_dock_push_socket: Arc<Mutex<Socket>>,
+    transaction_results: Arc<Mutex<HashMap<String, TxResponse>>>,
+    responses: Arc<Mutex<HashMap<u64, ResponseWrapper>>>,
+    request_id_counter: Arc<AtomicU64>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
@@ -409,6 +419,9 @@ impl JsonRpcRequestProcessor {
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         runtime: Arc<Runtime>,
         to_dock_push_socket: Arc<Mutex<Socket>>,
+        transaction_results: Arc<Mutex<HashMap<String, TxResponse>>>,
+        responses: Arc<Mutex<HashMap<u64, ResponseWrapper>>>,
+        request_id_counter: Arc<AtomicU64>,
     ) -> (Self, Receiver<TransactionInfo>) {
         let (transaction_sender, transaction_receiver) = unbounded();
         (
@@ -433,6 +446,9 @@ impl JsonRpcRequestProcessor {
                 prioritization_fee_cache,
                 runtime,
                 to_dock_push_socket,
+                transaction_results,
+                responses,
+                request_id_counter,
             },
             transaction_receiver,
         )
@@ -2399,6 +2415,164 @@ impl JsonRpcRequestProcessor {
             })
             .collect())
     }
+
+    pub fn get_xandeum_result(&self, signature: String) -> Result<TxResponse> {
+        info!("Processing getXandeumResult for signature: {}", signature);
+        let results = self.transaction_results.lock().unwrap();
+        match results.get(&signature) {
+            Some(tx_result) => Ok(tx_result.clone()),
+            None => Err(Error {
+                code: ErrorCode::InvalidParams,
+                message: format!("Transaction result not found for signature: {}", signature),
+                data: None,
+            }),
+        }
+    }
+
+    pub async fn get_metadata(&self, param_str: String) -> Result<ResponseWrapper> {
+        info!("Processing getMetadata for path: {}", param_str);
+        let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
+
+        let request = Request {
+            op: Opcode::GetMetadata as i32,
+            pubkey: Vec::new(),
+            data: {
+                let mut data = Vec::new();
+                data.extend_from_slice(&request_id.to_be_bytes());
+                data.extend_from_slice(param_str.as_bytes());
+                data
+            },
+            signature: String::new(),
+        };
+
+        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
+
+        match self.to_dock_push_socket.lock() {
+            Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
+                Ok(()) => log::debug!("Transaction sent to docks successfully."),
+                Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
+                Err(e) => log::error!("Failed to send transaction to docks: {:?}", e),
+            },
+            Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
+        }
+
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(30);
+        loop {
+            if start.elapsed() > timeout {
+                self.responses.lock().unwrap().remove(&request_id);
+                return Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: "Timeout waiting for dock response".to_string(),
+                    data: None,
+                });
+            }
+
+            if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+                info!("Received response for request id: {}", request_id);
+                return Ok(response);
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub async fn is_exist(&self, param_str: String) -> Result<ResponseWrapper> {
+        info!("Processing isExist for path: {}", param_str);
+        let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
+
+        let request = Request {
+            op: Opcode::Exists as i32,
+            pubkey: Vec::new(),
+            data: {
+                let mut data = Vec::new();
+                data.extend_from_slice(&request_id.to_be_bytes());
+                data.extend_from_slice(param_str.as_bytes());
+                data
+            },
+            signature: String::new(),
+        };
+
+        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
+
+        match self.to_dock_push_socket.lock() {
+            Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
+                Ok(()) => log::debug!("Transaction sent to docks successfully."),
+                Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
+                Err(e) => log::error!("Failed to send transaction to docks: {:?}", e),
+            },
+            Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
+        }
+
+        // Poll for response
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(30);
+        loop {
+            if start.elapsed() > timeout {
+                self.responses.lock().unwrap().remove(&request_id);
+                return Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: "Timeout waiting for dock response".to_string(),
+                    data: None,
+                });
+            }
+
+            if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+                info!("Received response for request id: {}", request_id);
+                return Ok(response);
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub async fn list_dirs(&self, param_str: String) -> Result<ResponseWrapper> {
+        info!("Processing listDirs for path: {}", param_str);
+        let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
+
+        let request = Request {
+            op: Opcode::ListDirs as i32,
+            pubkey: Vec::new(),
+            data: {
+                let mut data = Vec::new();
+                data.extend_from_slice(&request_id.to_be_bytes());
+                data.extend_from_slice(param_str.as_bytes());
+                data
+            },
+            signature: String::new(),
+        };
+
+        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
+
+        match self.to_dock_push_socket.lock() {
+            Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
+                Ok(()) => log::debug!("Transaction sent to docks successfully."),
+                Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
+                Err(e) => log::error!("Failed to send transaction to docks: {:?}", e),
+            },
+            Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
+        }
+
+        let start = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(30);
+        loop {
+            if start.elapsed() > timeout {
+                self.responses.lock().unwrap().remove(&request_id);
+                return Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: "Timeout waiting for dock response".to_string(),
+                    data: None,
+                });
+            }
+
+            if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+                info!("Received response for request id: {}", request_id);
+                return Ok(response);
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
 }
 
 fn optimize_filters(filters: &mut [RpcFilterType]) {
@@ -2774,6 +2948,15 @@ pub mod rpc_minimal {
             options: Option<RpcLeaderScheduleConfigWrapper>,
             config: Option<RpcLeaderScheduleConfig>,
         ) -> Result<Option<RpcLeaderSchedule>>;
+
+        #[rpc(meta, name = "getXandeumResult")]
+        fn get_xandeum_result(&self, meta: Self::Metadata, params: String) -> Result<TxResponse>;
+        #[rpc(meta, name = "getMetadata")]
+        fn get_metadata(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        #[rpc(meta, name = "isExist")]
+        fn is_exist(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        #[rpc(meta, name = "listDirs")]
+        fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
     }
 
     pub struct MinimalImpl;
@@ -2936,6 +3119,23 @@ pub mod rpc_minimal {
                     }
                     schedule_by_identity
                 }))
+        }
+
+        fn get_xandeum_result(&self, meta: Self::Metadata, params: String) -> Result<TxResponse> {
+            let h = meta.get_xandeum_result(params)?;
+            Ok(h)
+        }
+
+        fn get_metadata(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+            Box::pin(async move { meta.get_metadata(params).await })
+        }
+
+        fn is_exist(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+            Box::pin(async move { meta.is_exist(params).await })
+        }
+
+        fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+            Box::pin(async move { meta.list_dirs(params).await })
         }
     }
 }
@@ -3630,6 +3830,15 @@ pub mod rpc_full {
             meta: Self::Metadata,
             pubkey_strs: Option<Vec<String>>,
         ) -> Result<Vec<RpcPrioritizationFee>>;
+
+        #[rpc(meta, name = "getXandeumResult")]
+        fn get_xandeum_result(&self, meta: Self::Metadata, params: String) -> Result<TxResponse>;
+        #[rpc(meta, name = "getMetadata")]
+        fn get_metadata(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        #[rpc(meta, name = "isExist")]
+        fn is_exist(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        #[rpc(meta, name = "listDirs")]
+        fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
     }
 
     pub struct FullImpl;
@@ -4457,6 +4666,25 @@ pub mod rpc_full {
                 .map(|pubkey_str| verify_pubkey(&pubkey_str))
                 .collect::<Result<Vec<_>>>()?;
             meta.get_recent_prioritization_fees(pubkeys)
+        }
+
+        fn get_xandeum_result(&self, meta: Self::Metadata, params: String) -> Result<TxResponse> {
+            let h = meta.get_xandeum_result(params)?;
+            Ok(h)
+        }
+
+        fn get_metadata(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+            info!("Received GetMetadata with params : {:?}", params);
+            Box::pin(async move { meta.get_metadata(params).await })
+        }
+
+        fn is_exist(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+            Box::pin(async move { meta.is_exist(params).await })
+        }
+
+        fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+            Box::pin(async move { meta.list_dirs(params).await })
+
         }
     }
 }
