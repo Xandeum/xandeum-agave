@@ -588,9 +588,10 @@ impl JsonRpcService {
                                     Some(ref resp) => resp.clone(),
                                     None => {
                                         error!("Received empty Response in ResponseWrapper: id={}", wrapper.id);
-                                        return;
+                                        continue;
                                     }
                                 };
+                                info!("response wrapper : {:?}",response);
                                 match response.response {
                                     Some(response::Response::Tx(r)) => {
                                         // Handle TxResponse (transaction logic)
@@ -599,7 +600,7 @@ impl JsonRpcService {
                                             Ok(s) => s,
                                             Err(e) => {
                                                 error!("Invalid signature format: {:?}", e);
-                                                return;
+                                                continue;
                                             }
                                         };
                                         if !lock.contains_key(&r.signature) {
