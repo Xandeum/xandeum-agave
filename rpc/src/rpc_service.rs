@@ -579,7 +579,7 @@ impl JsonRpcService {
             info!("First PULL socket listener started on ipc:///var/run/xandeum/fromdock.sock");
 
             loop {
-                match socket.recv_bytes(0) {
+                match socket.recv_bytes(zmq::DONTWAIT) {
                     Ok(msg) => {
                         debug!("Received message from dock: {:?}", msg);
                         match ResponseWrapper::decode(&msg[..]) {
@@ -678,11 +678,14 @@ impl JsonRpcService {
                             }
                         }
                     }
+                    Err(zmq::Error::EAGAIN) => {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
                     Err(e) => {
                         error!("Receive error: {:?}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     }
                 }
-                tokio::task::yield_now().await;
             }
         });
 

@@ -2445,7 +2445,7 @@ impl JsonRpcRequestProcessor {
             signature: String::new(),
         };
 
-        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
+        let request_bytes = bincode::serialize(&request).map_err(|_e| Error::internal_error())?;
 
         match self.to_dock_push_socket.lock() {
             Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
@@ -2493,7 +2493,7 @@ impl JsonRpcRequestProcessor {
             signature: String::new(),
         };
 
-        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
+        let request_bytes = bincode::serialize(&request).map_err(|_e| Error::internal_error())?;
 
         match self.to_dock_push_socket.lock() {
             Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
@@ -2542,7 +2542,7 @@ impl JsonRpcRequestProcessor {
             signature: String::new(),
         };
 
-        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
+        let request_bytes = bincode::serialize(&request).map_err(|_e| Error::internal_error())?;
 
         match self.to_dock_push_socket.lock() {
             Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
