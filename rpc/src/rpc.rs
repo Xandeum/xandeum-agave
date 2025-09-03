@@ -3,7 +3,7 @@ use jsonrpc_core::ErrorCode;
 
 #[cfg(feature = "dev-context-only-utils")]
 use solana_runtime::installed_scheduler_pool::BankWithScheduler;
-use std::sync::Mutex;
+
 use tokio::time::sleep;
 use xandeum_protos::{
     response::{ResponseWrapper, TxResponse},
@@ -123,7 +123,7 @@ use {
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, RwLock,
+            Arc, Mutex, RwLock,
         },
         time::Duration,
     },
@@ -266,6 +266,8 @@ pub struct JsonRpcRequestProcessor {
     transaction_results: Arc<Mutex<HashMap<String, TxResponse>>>,
     responses: Arc<Mutex<HashMap<u64, ResponseWrapper>>>,
     request_id_counter: Arc<AtomicU64>,
+    // Add response notifiers for event-driven handling
+    pub response_notifiers: Arc<Mutex<HashMap<u64, tokio::sync::watch::Sender<bool>>>>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
@@ -449,6 +451,7 @@ impl JsonRpcRequestProcessor {
                 transaction_results,
                 responses,
                 request_id_counter,
+                response_notifiers: Arc::new(Mutex::new(HashMap::new())),
             },
             transaction_receiver,
         )
@@ -2433,6 +2436,10 @@ impl JsonRpcRequestProcessor {
         info!("Processing getMetadata for path: {}", param_str);
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
 
+        // Register for response notification BEFORE sending request
+        let (notify_tx, mut notify_rx) = tokio::sync::watch::channel(false);
+        self.response_notifiers.lock().unwrap().insert(request_id, notify_tx);
+
         let request = Request {
             op: Opcode::GetMetadata as i32,
             pubkey: Vec::new(),
@@ -2445,41 +2452,79 @@ impl JsonRpcRequestProcessor {
             signature: String::new(),
         };
 
-        let request_bytes = bincode::serialize(&request).map_err(|_e| Error::internal_error())?;
+        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
 
-        match self.to_dock_push_socket.lock() {
-            Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
-                Ok(()) => log::debug!("Transaction sent to docks successfully."),
-                Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
-                Err(e) => log::error!("Failed to send transaction to docks: {:?}", e),
-            },
-            Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
-        }
-
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(30);
-        loop {
-            if start.elapsed() > timeout {
-                self.responses.lock().unwrap().remove(&request_id);
+        // Send request
+        match self.to_dock_push_socket.lock().unwrap().send(request_bytes, zmq::DONTWAIT) {
+            Ok(()) => log::debug!("Request {} sent successfully", request_id),
+            Err(zmq::Error::EAGAIN) => {
+                self.response_notifiers.lock().unwrap().remove(&request_id);
                 return Err(Error {
                     code: ErrorCode::InternalError,
-                    message: "Timeout waiting for dock response".to_string(),
+                    message: "Dock socket buffer full - try again".to_string(),
                     data: None,
                 });
             }
-
-            if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
-                info!("Received response for request id: {}", request_id);
-                return Ok(response);
+            Err(e) => {
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                log::error!("Failed to send to dock: {:?}", e);
+                return Err(Error::internal_error());
             }
+        }
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for response with timeout
+        let timeout = Duration::from_secs(30);
+        match tokio::time::timeout(timeout, notify_rx.changed()).await {
+            Ok(Ok(_)) => {
+                // Response arrived - check responses map
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                
+                if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+                    info!("Received response for request id: {} (fast path)", request_id);
+                    Ok(response)
+                } else {
+                    Err(Error {
+                        code: ErrorCode::InternalError,
+                        message: "Response lost between notification and retrieval".to_string(),
+                        data: None,
+                    })
+                }
+            }
+            Ok(Err(_)) => {
+                // Channel closed unexpectedly
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                self.responses.lock().unwrap().remove(&request_id);
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: "Response handler crashed".to_string(),
+                    data: None,
+                })
+            }
+            Err(_) => {
+                // Timeout
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                self.responses.lock().unwrap().remove(&request_id);
+                
+                // Log diagnostic info on timeout
+                let pending_ids: Vec<u64> = self.responses.lock().unwrap().keys().cloned().collect();
+                error!("Timeout for request_id: {}. Pending responses: {:?}", request_id, pending_ids);
+                
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: format!("Timeout waiting for dock response (id: {})", request_id),
+                    data: None,
+                })
+            }
         }
     }
 
     pub async fn is_exist(&self, param_str: String) -> Result<ResponseWrapper> {
         info!("Processing isExist for path: {}", param_str);
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
+
+        // Register for response notification BEFORE sending request
+        let (notify_tx, mut notify_rx) = tokio::sync::watch::channel(false);
+        self.response_notifiers.lock().unwrap().insert(request_id, notify_tx);
 
         let request = Request {
             op: Opcode::Exists as i32,
@@ -2493,36 +2538,69 @@ impl JsonRpcRequestProcessor {
             signature: String::new(),
         };
 
-        let request_bytes = bincode::serialize(&request).map_err(|_e| Error::internal_error())?;
+        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
 
-        match self.to_dock_push_socket.lock() {
-            Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
-                Ok(()) => log::debug!("Transaction sent to docks successfully."),
-                Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
-                Err(e) => log::error!("Failed to send transaction to docks: {:?}", e),
-            },
-            Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
-        }
-
-        // Poll for response
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(30);
-        loop {
-            if start.elapsed() > timeout {
-                self.responses.lock().unwrap().remove(&request_id);
+        // Send request
+        match self.to_dock_push_socket.lock().unwrap().send(request_bytes, zmq::DONTWAIT) {
+            Ok(()) => log::debug!("Request {} sent successfully", request_id),
+            Err(zmq::Error::EAGAIN) => {
+                self.response_notifiers.lock().unwrap().remove(&request_id);
                 return Err(Error {
                     code: ErrorCode::InternalError,
-                    message: "Timeout waiting for dock response".to_string(),
+                    message: "Dock socket buffer full - try again".to_string(),
                     data: None,
                 });
             }
-
-            if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
-                info!("Received response for request id: {}", request_id);
-                return Ok(response);
+            Err(e) => {
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                log::error!("Failed to send to dock: {:?}", e);
+                return Err(Error::internal_error());
             }
+        }
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for response with timeout
+        let timeout = Duration::from_secs(30);
+        match tokio::time::timeout(timeout, notify_rx.changed()).await {
+            Ok(Ok(_)) => {
+                // Response arrived - check responses map
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                
+                if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+                    info!("Received response for request id: {} (fast path)", request_id);
+                    Ok(response)
+                } else {
+                    Err(Error {
+                        code: ErrorCode::InternalError,
+                        message: "Response lost between notification and retrieval".to_string(),
+                        data: None,
+                    })
+                }
+            }
+            Ok(Err(_)) => {
+                // Channel closed unexpectedly
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                self.responses.lock().unwrap().remove(&request_id);
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: "Response handler crashed".to_string(),
+                    data: None,
+                })
+            }
+            Err(_) => {
+                // Timeout
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                self.responses.lock().unwrap().remove(&request_id);
+                
+                // Log diagnostic info on timeout
+                let pending_ids: Vec<u64> = self.responses.lock().unwrap().keys().cloned().collect();
+                error!("Timeout for request_id: {}. Pending responses: {:?}", request_id, pending_ids);
+                
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: format!("Timeout waiting for dock response (id: {})", request_id),
+                    data: None,
+                })
+            }
         }
     }
 
@@ -2542,35 +2620,73 @@ impl JsonRpcRequestProcessor {
             signature: String::new(),
         };
 
-        let request_bytes = bincode::serialize(&request).map_err(|_e| Error::internal_error())?;
+        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
 
-        match self.to_dock_push_socket.lock() {
-            Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
-                Ok(()) => log::debug!("Transaction sent to docks successfully."),
-                Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
-                Err(e) => log::error!("Failed to send transaction to docks: {:?}", e),
-            },
-            Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
-        }
+        // Register for response notification BEFORE sending request
+        let (notify_tx, mut notify_rx) = tokio::sync::watch::channel(false);
+        self.response_notifiers.lock().unwrap().insert(request_id, notify_tx);
 
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(30);
-        loop {
-            if start.elapsed() > timeout {
-                self.responses.lock().unwrap().remove(&request_id);
+        // Send request
+        match self.to_dock_push_socket.lock().unwrap().send(request_bytes, zmq::DONTWAIT) {
+            Ok(()) => log::debug!("Request {} sent successfully", request_id),
+            Err(zmq::Error::EAGAIN) => {
+                self.response_notifiers.lock().unwrap().remove(&request_id);
                 return Err(Error {
                     code: ErrorCode::InternalError,
-                    message: "Timeout waiting for dock response".to_string(),
+                    message: "Dock socket buffer full - try again".to_string(),
                     data: None,
                 });
             }
-
-            if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
-                info!("Received response for request id: {}", request_id);
-                return Ok(response);
+            Err(e) => {
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                log::error!("Failed to send to dock: {:?}", e);
+                return Err(Error::internal_error());
             }
+        }
 
-            sleep(Duration::from_millis(100)).await;
+        // Wait for response with timeout
+        let timeout = Duration::from_secs(30);
+        match tokio::time::timeout(timeout, notify_rx.changed()).await {
+            Ok(Ok(_)) => {
+                // Response arrived - check responses map
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                
+                if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+                    info!("Received response for request id: {} (fast path)", request_id);
+                    Ok(response)
+                } else {
+                    Err(Error {
+                        code: ErrorCode::InternalError,
+                        message: "Response lost between notification and retrieval".to_string(),
+                        data: None,
+                    })
+                }
+            }
+            Ok(Err(_)) => {
+                // Channel closed unexpectedly
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                self.responses.lock().unwrap().remove(&request_id);
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: "Response handler crashed".to_string(),
+                    data: None,
+                })
+            }
+            Err(_) => {
+                // Timeout
+                self.response_notifiers.lock().unwrap().remove(&request_id);
+                self.responses.lock().unwrap().remove(&request_id);
+                
+                // Log diagnostic info on timeout
+                let pending_ids: Vec<u64> = self.responses.lock().unwrap().keys().cloned().collect();
+                error!("Timeout for request_id: {}. Pending responses: {:?}", request_id, pending_ids);
+                
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: format!("Timeout waiting for dock response (id: {})", request_id),
+                    data: None,
+                })
+            }
         }
     }
 }

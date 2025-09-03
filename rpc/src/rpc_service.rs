@@ -34,6 +34,7 @@ use {
             Arc, Mutex, RwLock,
         },
         thread::{self, Builder, JoinHandle},
+        time::Duration,
     }, tokio_util::codec::{BytesCodec, FramedRead}, xandeum_protos::response::{response::{self}, ResponseWrapper, TxResponse}
 };
 
@@ -441,14 +442,20 @@ impl JsonRpcService {
             .max_request_body_size
             .unwrap_or(MAX_REQUEST_BODY_SIZE);
 
-            let context = zmq::Context::new();
-            let context_clone = context.clone();
+        let context = zmq::Context::new();
+        let context_clone = context.clone();
 
         // Creating UDS sockets and binding them to send Xandeum Transactions
         // to the dock
         let to_dock_push_socket = {
             let socket = context.socket(zmq::PUSH).unwrap();
-            log::info!("todock PUSH socket created successfully.");
+            
+            // Performance tuning
+            socket.set_sndhwm(10000).unwrap(); // High water mark
+            socket.set_sndtimeo(100).unwrap(); // 100ms send timeout
+            socket.set_linger(0).unwrap(); // Don't wait on close
+            
+            log::info!("todock PUSH socket created with performance tuning");
             let socket = Arc::new(Mutex::new(socket));
 
             {
@@ -487,6 +494,8 @@ impl JsonRpcService {
             responses_clone,
             request_id_counter
         );
+
+        let response_notifiers = request_processor.response_notifiers.clone();
 
         let leader_info =
             poh_recorder.map(|recorder| ClusterTpuInfo::new(cluster_info.clone(), recorder));
@@ -568,22 +577,75 @@ impl JsonRpcService {
             .unwrap();
 
         let rpc_sub_clone1 = rpc_subscriptions.clone();
+        let response_notifiers_clone = response_notifiers.clone();
+        let responses_clone2 = responses.clone();
+        let transaction_results_clone2 = transaction_results.clone();
+        let bank_fork_clone2 = bank_fork_clone.clone();
+        let block_store_clone2 = block_store_clone.clone();
 
-        runtime_clone1.spawn(async move {
+        let _response_handler = runtime_clone1.spawn(async move {
+            let response_notifiers = response_notifiers_clone;
+            let responses = responses_clone2;
+            let transaction_results = transaction_results_clone2;
+            let bank_fork_clone = bank_fork_clone2;
+            let block_store_clone = block_store_clone2;
             let socket = context_clone.socket(zmq::PULL).unwrap();
+            
+            
+            socket.set_rcvhwm(10000).unwrap(); // High water mark
+            socket.set_linger(0).unwrap(); // Don't wait on close
 
             if let Err(e) = socket.bind("ipc:///var/run/xandeum/fromdock.sock") {
                 error!("Failed to bind fromdock pull socket: {:?}", e);
                 return;
             }
-            info!("First PULL socket listener started on ipc:///var/run/xandeum/fromdock.sock");
+            info!("Optimized PULL socket listener started on ipc:///var/run/xandeum/fromdock.sock");
+
+            // Batch processing buffer
+            let mut msg_buffer = Vec::with_capacity(100);
 
             loop {
+                // Clear batch buffer
+                msg_buffer.clear();
+                
+                // Try to receive messages in batch
                 match socket.recv_bytes(zmq::DONTWAIT) {
                     Ok(msg) => {
-                        debug!("Received message from dock: {:?}", msg);
-                        match ResponseWrapper::decode(&msg[..]) {
-                            Ok(wrapper) => {
+                        msg_buffer.push(msg);
+                        
+                        // Try to receive more messages without blocking
+                        for _ in 0..99 {
+                            match socket.recv_bytes(zmq::DONTWAIT) {
+                                Ok(msg) => msg_buffer.push(msg),
+                                Err(zmq::Error::EAGAIN) => break, // No more messages available
+                                Err(e) => {
+                                    error!("Batch receive error: {:?}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(zmq::Error::EAGAIN) => {
+                        // No messages available, wait a bit
+                        tokio::time::sleep(Duration::from_micros(100)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("Primary receive error: {:?}", e);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                }
+                
+                if !msg_buffer.is_empty() {
+                    debug!("Processing batch of {} messages", msg_buffer.len());
+                }
+                
+                // Process all messages in batch
+                for msg in &msg_buffer {
+                    debug!("Processing message from dock");
+                    match ResponseWrapper::decode(&msg[..]) {
+                        Ok(wrapper) => {
                                 let response = match wrapper.response {
                                     Some(ref resp) => resp.clone(),
                                     None => {
@@ -604,6 +666,15 @@ impl JsonRpcService {
                                             }
                                         };
                                         if !lock.contains_key(&r.signature) {
+                                            const MAX_TRANSACTION_RESULTS: usize = 100_000;
+                                            if lock.len() >= MAX_TRANSACTION_RESULTS {
+                                                // Remove oldest entry (first in iteration order)
+                                                if let Some(oldest_key) = lock.keys().next().cloned() {
+                                                    lock.remove(&oldest_key);
+                                                    debug!("Evicted old transaction result: {}", oldest_key);
+                                                }
+                                            }
+                                            
                                             debug!("Adding Result : {:?} ", r.clone());
                                             let message = r.message.clone();
                                             rpc_sub_clone1.notify_xandeum_result(
@@ -639,8 +710,8 @@ impl JsonRpcService {
                                                 slot,
                                                 sig,
                                                 std::iter::empty(),
-                                                status,0
-            
+                                                status,
+                                                0
                                             ) {
                                                 error!("Failed to insert transaction status into blockstore: {:?}", e);
                                             } else {
@@ -655,9 +726,12 @@ impl JsonRpcService {
                                     | Some(response::Response::ListDir(_)) => {
             
                                         debug!(" Received Response for Request-id = {}", wrapper.id);
+                                        let request_id = wrapper.id;
+                                        
+                                        // Store response
                                         match responses.lock() {
                                             Ok(mut map) => {
-                                                match map.insert(wrapper.id, wrapper) {
+                                                match map.insert(request_id, wrapper) {
                                                     Some(_) => debug!("Overwrote existing ResponseWrapper"),
                                                     None => debug!("Inserted new ResponseWrapper"),
                                                 }
@@ -666,28 +740,37 @@ impl JsonRpcService {
                                                 error!("Failed to acquire lock on responses: {:?}", e);
                                             }
                                         }
+                                        
+                                        // Notify waiting request if exists
+                                        if let Ok(mut notifiers) = response_notifiers.lock() {
+                                            if let Some(notifier) = notifiers.remove(&request_id) {
+                                                if let Err(_) = notifier.send(true) {
+                                                    debug!("Failed to notify waiter for request_id: {} (receiver dropped)", request_id);
+                                                } else {
+                                                    debug!("Notified waiter for request_id: {}", request_id);
+                                                }
+                                            }
+                                        }
                                     }
                                     None => {
                                         error!("Received empty response variant in ResponseWrapper: id={}", wrapper.id);
                                     }
                                 }
                             }
-                            Err(e) => {
-                                error!("Failed to decode ResponseWrapper: {:?}", e);
-                                debug!("Raw message: {:?}", msg);
-                            }
+                        // }
+                        Err(e) => {
+                            error!("Failed to decode ResponseWrapper: {:?}", e);
+                            debug!("Raw message: {:?}", msg);
                         }
                     }
-                    Err(zmq::Error::EAGAIN) => {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    }
-                    Err(e) => {
-                        error!("Receive error: {:?}", e);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    }
+                }
+                
+                // Only yield if we processed messages
+                if !msg_buffer.is_empty() {
+                    tokio::task::yield_now().await;
                 }
             }
-        });
+        }); // End of runtime_clone1.spawn
 
         let close_handle = close_handle_receiver.recv().unwrap()?;
 
