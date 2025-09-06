@@ -2421,15 +2421,47 @@ impl JsonRpcRequestProcessor {
 
     pub fn get_xandeum_result(&self, signature: String) -> Result<TxResponse> {
         info!("Processing getXandeumResult for signature: {}", signature);
-        let results = self.transaction_results.lock().unwrap();
-        match results.get(&signature) {
-            Some(tx_result) => Ok(tx_result.clone()),
-            None => Err(Error {
-                code: ErrorCode::InvalidParams,
-                message: format!("Transaction result not found for signature: {}", signature),
-                data: None,
-            }),
+        
+        // Try up to 10 times with 100ms delay to handle race condition
+        const MAX_ATTEMPTS: u32 = 10;
+        const DELAY_MS: u64 = 100;
+        
+        for attempt in 0..MAX_ATTEMPTS {
+            let results = self.transaction_results.lock().unwrap();
+            
+            if attempt == 0 {
+                debug!("Total transaction results stored: {}", results.len());
+                if results.len() < 10 {
+                    debug!("Current signatures in cache: {:?}", results.keys().collect::<Vec<_>>());
+                }
+            }
+            
+            match results.get(&signature) {
+                Some(tx_result) => {
+                    info!("Found transaction result for signature: {} (attempt {})", signature, attempt + 1);
+                    return Ok(tx_result.clone());
+                },
+                None => {
+                    drop(results); 
+                    
+                    if attempt < MAX_ATTEMPTS - 1 {
+                        debug!("Transaction result not yet available for signature: {}. Waiting... (attempt {}/{})", 
+                               signature, attempt + 1, MAX_ATTEMPTS);
+                        std::thread::sleep(std::time::Duration::from_millis(DELAY_MS));
+                    }
+                }
+            }
         }
+        
+        let results = self.transaction_results.lock().unwrap();
+        error!("Transaction result not found for signature: {} after {} attempts. Cache size: {}", 
+               signature, MAX_ATTEMPTS, results.len());
+            
+        Err(Error {
+            code: ErrorCode::InvalidParams,
+            message: format!("Transaction result not found for signature: {}", signature),
+            data: None,
+        })
     }
 
     pub async fn get_metadata(&self, param_str: String) -> Result<ResponseWrapper> {
