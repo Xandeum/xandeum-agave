@@ -125,7 +125,7 @@ use {
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, RwLock,
         },
-        time::Duration,
+        time::{Duration, Instant},
     },
     tokio::runtime::Runtime,
 };
@@ -266,8 +266,71 @@ pub struct JsonRpcRequestProcessor {
     transaction_results: Arc<Mutex<HashMap<String, TxResponse>>>,
     responses: Arc<Mutex<HashMap<u64, ResponseWrapper>>>,
     request_id_counter: Arc<AtomicU64>,
+    // Use oneshot channels for precise response delivery
+    pub response_channels: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<ResponseWrapper>>>>,
+    // Performance metrics
+    pub metrics: Arc<RpcMetrics>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
+
+#[derive(Default)]
+pub struct RpcMetrics {
+    pub total_requests: AtomicU64,
+    pub successful_requests: AtomicU64,
+    pub timeout_requests: AtomicU64,
+    pub failed_sends: AtomicU64,
+    pub active_requests: AtomicU64,
+    pub response_times: Mutex<Vec<Duration>>,
+}
+
+impl RpcMetrics {
+    pub fn record_request(&self) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_success(&self, duration: Duration) {
+        self.successful_requests.fetch_add(1, Ordering::Relaxed);
+        self.active_requests.fetch_sub(1, Ordering::Relaxed);
+        
+        let mut times = self.response_times.lock().unwrap();
+        times.push(duration);
+        // Keep only last 1000 response times
+        if times.len() > 1000 {
+            times.remove(0);
+        }
+    }
+
+    pub fn record_timeout(&self) {
+        self.timeout_requests.fetch_add(1, Ordering::Relaxed);
+        self.active_requests.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn record_send_failure(&self) {
+        self.failed_sends.fetch_add(1, Ordering::Relaxed);
+        self.active_requests.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn get_stats(&self) -> String {
+        let times = self.response_times.lock().unwrap();
+        let avg_time = if !times.is_empty() {
+            let sum: Duration = times.iter().sum();
+            sum / times.len() as u32
+        } else {
+            Duration::from_millis(0)
+        };
+
+        format!(
+            "RPC Stats - Total: {}, Success: {}, Timeout: {}, Failed: {}, Active: {}, Avg Response: {:?}",
+            self.total_requests.load(Ordering::Relaxed),
+            self.successful_requests.load(Ordering::Relaxed),
+            self.timeout_requests.load(Ordering::Relaxed),
+            self.failed_sends.load(Ordering::Relaxed),
+            self.active_requests.load(Ordering::Relaxed),
+            avg_time
+        )
+    }
+}
 
 impl JsonRpcRequestProcessor {
     pub fn clone_without_bigtable(&self) -> JsonRpcRequestProcessor {
@@ -449,6 +512,8 @@ impl JsonRpcRequestProcessor {
                 transaction_results,
                 responses,
                 request_id_counter,
+                response_channels: Arc::new(Mutex::new(HashMap::new())),
+                metrics: Arc::new(RpcMetrics::default()),
             },
             transaction_receiver,
         )
@@ -533,6 +598,12 @@ impl JsonRpcRequestProcessor {
             max_complete_rewards_slot: Arc::new(AtomicU64::default()),
             prioritization_fee_cache: Arc::new(PrioritizationFeeCache::default()),
             runtime: service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj),
+            to_dock_push_socket: Arc::new(Mutex::new(zmq::Context::new().socket(zmq::PUSH).unwrap())),
+            transaction_results: Arc::new(Mutex::new(HashMap::new())),
+            responses: Arc::new(Mutex::new(HashMap::new())),
+            request_id_counter: Arc::new(AtomicU64::new(0)),
+            response_channels: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(RpcMetrics::default()),
         }
     }
 
@@ -2418,20 +2489,61 @@ impl JsonRpcRequestProcessor {
 
     pub fn get_xandeum_result(&self, signature: String) -> Result<TxResponse> {
         info!("Processing getXandeumResult for signature: {}", signature);
-        let results = self.transaction_results.lock().unwrap();
-        match results.get(&signature) {
-            Some(tx_result) => Ok(tx_result.clone()),
-            None => Err(Error {
-                code: ErrorCode::InvalidParams,
-                message: format!("Transaction result not found for signature: {}", signature),
-                data: None,
-            }),
+        
+        // Use a read-write pattern to minimize lock time
+        let result = {
+            let results = self.transaction_results.lock().unwrap();
+            results.get(&signature).cloned()
+        };
+        
+        match result {
+            Some(tx_result) => {
+                info!("Found transaction result for signature: {}", signature);
+                Ok(tx_result)
+            },
+            None => {
+                // If not found immediately, wait a short time for pending transactions
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                
+                let results = self.transaction_results.lock().unwrap();
+                match results.get(&signature) {
+                    Some(tx_result) => {
+                        info!("Found transaction result for signature: {} (after delay)", signature);
+                        Ok(tx_result.clone())
+                    },
+                    None => {
+                        error!("Transaction result not found for signature: {}. Cache size: {}", 
+                               signature, results.len());
+                        Err(Error {
+                            code: ErrorCode::InvalidParams,
+                            message: format!("Transaction result not found for signature: {}", signature),
+                            data: None,
+                        })
+                    }
+                }
+            }
         }
     }
 
     pub async fn get_metadata(&self, param_str: String) -> Result<ResponseWrapper> {
         info!("Processing getMetadata for path: {}", param_str);
+        let start_time = Instant::now();
+        self.metrics.record_request();
+        
+        // Log metrics periodically
+        if self.metrics.total_requests.load(Ordering::Relaxed) % 100 == 0 {
+            info!("{}", self.metrics.get_stats());
+        }
+        
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
+        
+        // Create oneshot channel for this specific request
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        
+        {
+            let mut channels = self.response_channels.lock().unwrap();
+            channels.insert(request_id, tx);
+        }
 
         let request = Request {
             op: Opcode::GetMetadata as i32,
@@ -2445,41 +2557,100 @@ impl JsonRpcRequestProcessor {
             signature: String::new(),
         };
 
-        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
+        let request_bytes = match bincode::serialize(&request) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.response_channels.lock().unwrap().remove(&request_id);
+                return Err(Error::internal_error());
+            }
+        };
 
-        match self.to_dock_push_socket.lock() {
-            Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
-                Ok(()) => log::debug!("Transaction sent to docks successfully."),
-                Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
-                Err(e) => log::error!("Failed to send transaction to docks: {:?}", e),
-            },
-            Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
+        // Send request with retries
+        const MAX_SEND_ATTEMPTS: u32 = 3;
+        let mut sent = false;
+        
+        for attempt in 0..MAX_SEND_ATTEMPTS {
+            let send_result = {
+                // Acquire lock, send, and immediately drop the lock before await
+                let socket = self.to_dock_push_socket.lock().unwrap();
+                socket.send(&request_bytes, zmq::DONTWAIT)
+            };
+            
+            match send_result {
+                Ok(()) => {
+                    log::debug!("Request {} sent successfully (attempt {})", request_id, attempt + 1);
+                    sent = true;
+                    break;
+                }
+                Err(zmq::Error::EAGAIN) => {
+                    if attempt < MAX_SEND_ATTEMPTS - 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to send to dock: {:?}", e);
+                    break;
+                }
+            }
+        }
+        
+        if !sent {
+            self.response_channels.lock().unwrap().remove(&request_id);
+            return Err(Error {
+                code: ErrorCode::InternalError,
+                message: "Failed to send request to dock".to_string(),
+                data: None,
+            });
         }
 
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(30);
-        loop {
-            if start.elapsed() > timeout {
-                self.responses.lock().unwrap().remove(&request_id);
-                return Err(Error {
-                    code: ErrorCode::InternalError,
-                    message: "Timeout waiting for dock response".to_string(),
-                    data: None,
-                });
-            }
-
-            if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+        // Wait for response with timeout
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(response)) => {
                 info!("Received response for request id: {}", request_id);
-                return Ok(response);
+                Ok(response)
             }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(Err(_)) => {
+                // Channel closed without sending
+                self.response_channels.lock().unwrap().remove(&request_id);
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: "Response channel closed unexpectedly".to_string(),
+                    data: None,
+                })
+            }
+            Err(_) => {
+                // Timeout
+                self.response_channels.lock().unwrap().remove(&request_id);
+                
+                // Check if response arrived after timeout
+                if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+                    warn!("Found response after timeout for request_id: {}", request_id);
+                    return Ok(response);
+                }
+                
+                error!("Timeout for request_id: {}", request_id);
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: format!("Timeout waiting for dock response (id: {})", request_id),
+                    data: None,
+                })
+            }
         }
     }
 
     pub async fn is_exist(&self, param_str: String) -> Result<ResponseWrapper> {
         info!("Processing isExist for path: {}", param_str);
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
+        
+        // Create oneshot channel for this specific request
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        
+        // Register channel BEFORE sending request to avoid race condition
+        {
+            let mut channels = self.response_channels.lock().unwrap();
+            channels.insert(request_id, tx);
+        }
 
         let request = Request {
             op: Opcode::Exists as i32,
@@ -2493,42 +2664,100 @@ impl JsonRpcRequestProcessor {
             signature: String::new(),
         };
 
-        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
+        let request_bytes = match bincode::serialize(&request) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.response_channels.lock().unwrap().remove(&request_id);
+                return Err(Error::internal_error());
+            }
+        };
 
-        match self.to_dock_push_socket.lock() {
-            Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
-                Ok(()) => log::debug!("Transaction sent to docks successfully."),
-                Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
-                Err(e) => log::error!("Failed to send transaction to docks: {:?}", e),
-            },
-            Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
+        // Send request with retries
+        const MAX_SEND_ATTEMPTS: u32 = 3;
+        let mut sent = false;
+        
+        for attempt in 0..MAX_SEND_ATTEMPTS {
+            let send_result = {
+                // Acquire lock, send, and immediately drop the lock before await
+                let socket = self.to_dock_push_socket.lock().unwrap();
+                socket.send(&request_bytes, zmq::DONTWAIT)
+            };
+            
+            match send_result {
+                Ok(()) => {
+                    log::debug!("Request {} sent successfully (attempt {})", request_id, attempt + 1);
+                    sent = true;
+                    break;
+                }
+                Err(zmq::Error::EAGAIN) => {
+                    if attempt < MAX_SEND_ATTEMPTS - 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to send to dock: {:?}", e);
+                    break;
+                }
+            }
+        }
+        
+        if !sent {
+            self.response_channels.lock().unwrap().remove(&request_id);
+            return Err(Error {
+                code: ErrorCode::InternalError,
+                message: "Failed to send request to dock".to_string(),
+                data: None,
+            });
         }
 
-        // Poll for response
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(30);
-        loop {
-            if start.elapsed() > timeout {
-                self.responses.lock().unwrap().remove(&request_id);
-                return Err(Error {
-                    code: ErrorCode::InternalError,
-                    message: "Timeout waiting for dock response".to_string(),
-                    data: None,
-                });
-            }
-
-            if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+        // Wait for response with timeout
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(response)) => {
                 info!("Received response for request id: {}", request_id);
-                return Ok(response);
+                Ok(response)
             }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(Err(_)) => {
+                // Channel closed without sending
+                self.response_channels.lock().unwrap().remove(&request_id);
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: "Response channel closed unexpectedly".to_string(),
+                    data: None,
+                })
+            }
+            Err(_) => {
+                // Timeout
+                self.response_channels.lock().unwrap().remove(&request_id);
+                
+                // Check if response arrived after timeout
+                if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+                    warn!("Found response after timeout for request_id: {}", request_id);
+                    return Ok(response);
+                }
+                
+                error!("Timeout for request_id: {}", request_id);
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: format!("Timeout waiting for dock response (id: {})", request_id),
+                    data: None,
+                })
+            }
         }
     }
 
     pub async fn list_dirs(&self, param_str: String) -> Result<ResponseWrapper> {
         info!("Processing listDirs for path: {}", param_str);
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
+        
+        // Create oneshot channel for this specific request
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        
+        // Register channel BEFORE sending request to avoid race condition
+        {
+            let mut channels = self.response_channels.lock().unwrap();
+            channels.insert(request_id, tx);
+        }
 
         let request = Request {
             op: Opcode::ListDirs as i32,
@@ -2542,35 +2771,85 @@ impl JsonRpcRequestProcessor {
             signature: String::new(),
         };
 
-        let request_bytes = bincode::serialize(&request).map_err(|e| Error::internal_error())?;
+        let request_bytes = match bincode::serialize(&request) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.response_channels.lock().unwrap().remove(&request_id);
+                return Err(Error::internal_error());
+            }
+        };
 
-        match self.to_dock_push_socket.lock() {
-            Ok(socket) => match socket.send(request_bytes, zmq::DONTWAIT) {
-                Ok(()) => log::debug!("Transaction sent to docks successfully."),
-                Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
-                Err(e) => log::error!("Failed to send transaction to docks: {:?}", e),
-            },
-            Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
+        // Send request with retries
+        const MAX_SEND_ATTEMPTS: u32 = 3;
+        let mut sent = false;
+        
+        for attempt in 0..MAX_SEND_ATTEMPTS {
+            let send_result = {
+                // Acquire lock, send, and immediately drop the lock before await
+                let socket = self.to_dock_push_socket.lock().unwrap();
+                socket.send(&request_bytes, zmq::DONTWAIT)
+            };
+            
+            match send_result {
+                Ok(()) => {
+                    log::debug!("Request {} sent successfully (attempt {})", request_id, attempt + 1);
+                    sent = true;
+                    break;
+                }
+                Err(zmq::Error::EAGAIN) => {
+                    if attempt < MAX_SEND_ATTEMPTS - 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to send to dock: {:?}", e);
+                    break;
+                }
+            }
+        }
+        
+        if !sent {
+            self.response_channels.lock().unwrap().remove(&request_id);
+            return Err(Error {
+                code: ErrorCode::InternalError,
+                message: "Failed to send request to dock".to_string(),
+                data: None,
+            });
         }
 
-        let start = tokio::time::Instant::now();
-        let timeout = Duration::from_secs(30);
-        loop {
-            if start.elapsed() > timeout {
-                self.responses.lock().unwrap().remove(&request_id);
-                return Err(Error {
-                    code: ErrorCode::InternalError,
-                    message: "Timeout waiting for dock response".to_string(),
-                    data: None,
-                });
-            }
-
-            if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+        // Wait for response with timeout
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(response)) => {
                 info!("Received response for request id: {}", request_id);
-                return Ok(response);
+                Ok(response)
             }
-
-            sleep(Duration::from_millis(100)).await;
+            Ok(Err(_)) => {
+                // Channel closed without sending
+                self.response_channels.lock().unwrap().remove(&request_id);
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: "Response channel closed unexpectedly".to_string(),
+                    data: None,
+                })
+            }
+            Err(_) => {
+                // Timeout
+                self.response_channels.lock().unwrap().remove(&request_id);
+                
+                // Check if response arrived after timeout
+                if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+                    warn!("Found response after timeout for request_id: {}", request_id);
+                    return Ok(response);
+                }
+                
+                error!("Timeout for request_id: {}", request_id);
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: format!("Timeout waiting for dock response (id: {})", request_id),
+                    data: None,
+                })
+            }
         }
     }
 }
@@ -5102,6 +5381,10 @@ pub mod tests {
                 max_complete_rewards_slot,
                 Arc::new(PrioritizationFeeCache::default()),
                 service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj),
+                Arc::new(Mutex::new(zmq::Context::new().socket(zmq::PUSH).unwrap())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(AtomicU64::new(0)),
             )
             .0;
 
@@ -7076,6 +7359,10 @@ pub mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
             service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj),
+            Arc::new(Mutex::new(zmq::Context::new().socket(zmq::PUSH).unwrap())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicU64::new(0)),
         );
         SendTransactionService::new::<NullTpuInfo>(
             tpu_address,
@@ -7358,6 +7645,10 @@ pub mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
             service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj),
+            Arc::new(Mutex::new(zmq::Context::new().socket(zmq::PUSH).unwrap())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicU64::new(0)),
         );
         SendTransactionService::new::<NullTpuInfo>(
             tpu_address,
@@ -9009,7 +9300,7 @@ pub mod tests {
         bank_forks.write().unwrap().insert(bank3);
 
         let optimistically_confirmed_bank =
-            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
+            OptimisticallyConfirmedBankTracker::locked_from_bank_forks_root(&bank_forks);
         let mut pending_optimistically_confirmed_banks = HashSet::new();
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
         let max_complete_rewards_slot = Arc::new(AtomicU64::default());
@@ -9048,6 +9339,10 @@ pub mod tests {
             max_complete_rewards_slot,
             Arc::new(PrioritizationFeeCache::default()),
             service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj),
+            Arc::new(Mutex::new(zmq::Context::new().socket(zmq::PUSH).unwrap())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicU64::new(0)),
         );
 
         let mut io = MetaIoHandler::default();
