@@ -2536,9 +2536,25 @@ impl JsonRpcRequestProcessor {
         }
         
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
+        info!("Generated request_id: {} (as u64) for get_metadata", request_id);
         
         // Create oneshot channel for this specific request
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        
+        // Test the channel immediately
+        let (test_tx, mut test_rx) = tokio::sync::oneshot::channel::<String>();
+        if test_tx.send("test".to_string()).is_ok() {
+            match test_rx.try_recv() {
+                Ok(msg) => info!("Channel test successful: {}", msg),
+                Err(e) => error!("Channel test failed: {:?}", e),
+            }
+        }
+        
+        // Check runtime handle
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => info!("Runtime handle available"),
+            Err(e) => error!("No runtime handle: {:?}", e),
+        }
         
         {
             let mut channels = self.response_channels.lock().unwrap();
@@ -2613,43 +2629,56 @@ impl JsonRpcRequestProcessor {
 
         // Wait for response with timeout
         info!("About to wait for response with timeout for request_id: {} (get_metadata)", request_id);
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
-            Ok(Ok(response)) => {
-                let elapsed = start_time.elapsed();
-                info!("Received response for request id: {} in {:?}", request_id, elapsed);
-                self.metrics.record_success(elapsed);
-                
-                // Check if connection is still alive
-                if tokio::task::spawn(async { tokio::time::sleep(Duration::from_micros(1)).await }).await.is_err() {
-                    error!("Connection closed after receiving response - client disconnected");
-                }
-                
-                info!("Successfully received response, returning it");
-                Ok(response)
+        
+        // Try to poll the receiver first
+        match rx.try_recv() {
+            Ok(response) => {
+                info!("Response already available in channel!");
+                return Ok(response);
             }
-            Ok(Err(_)) => {
-                // Channel closed without sending
-                error!("Response channel closed for request_id {}", request_id);
-                self.response_channels.lock().unwrap().remove(&request_id);
-                self.metrics.record_timeout();
-                Err(Error {
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                info!("Channel empty, proceeding with timeout wait");
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                error!("Channel already closed!");
+                return Err(Error {
                     code: ErrorCode::InternalError,
-                    message: "Response channel closed unexpectedly".to_string(),
+                    message: "Response channel closed before receiving".to_string(),
                     data: None,
-                })
+                });
             }
-            Err(_) => {
-                // Timeout
-                self.response_channels.lock().unwrap().remove(&request_id);
-                
-                // Check if response arrived after timeout
-                if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
-                    warn!("Found response after timeout for request_id: {}", request_id);
-                    self.metrics.record_success(start_time.elapsed());
-                    return Ok(response);
+        }
+        
+        info!("Starting to await on receiver");
+        
+        // First try without timeout to see if that works
+        let response_future = rx;
+        
+        // Use select to manually implement timeout
+        tokio::select! {
+            response_result = response_future => {
+                match response_result {
+                    Ok(response) => {
+                        let elapsed = start_time.elapsed();
+                        info!("Received response for request id: {} in {:?}", request_id, elapsed);
+                        self.metrics.record_success(elapsed);
+                        
+                        info!("Successfully received response, returning it");
+                        Ok(response)
+                    }
+                    Err(e) => {
+                        error!("Receiver error: {:?}", e);
+                        Err(Error {
+                            code: ErrorCode::InternalError,
+                            message: "Failed to receive response".to_string(),
+                            data: None,
+                        })
+                    }
                 }
-                
-                error!("Timeout for request_id: {}. {}", request_id, self.metrics.get_stats());
+            }
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                error!("Timeout waiting for response");
+                self.response_channels.lock().unwrap().remove(&request_id);
                 self.metrics.record_timeout();
                 Err(Error {
                     code: ErrorCode::InternalError,

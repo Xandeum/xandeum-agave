@@ -661,13 +661,18 @@ impl JsonRpcService {
                                     | Some(response::Response::Exists(_))
                                     | Some(response::Response::ListDir(_)) => {
             
-                                        info!(" Received Response for Request-id = {}", wrapper.id);
+                                        info!(" Received Response for Request-id = {} (as u64)", wrapper.id);
                                         let request_id = wrapper.id;
+                                        info!("Using request_id: {} for channel lookup", request_id);
                                         
                                         // First try to deliver via oneshot channel for immediate delivery
                                         let delivered = {
                                             if let Ok(mut channels) = request_processor.response_channels.lock() {
+                                                info!("Acquired lock, looking for channel for request_id: {}", request_id);
+                                                info!("Available channels: {:?}", channels.keys().collect::<Vec<_>>());
+                                                
                                                 if let Some(sender) = channels.remove(&request_id) {
+                                                    info!("Found channel for request_id: {}, attempting to send", request_id);
                                                     match sender.send(wrapper.clone()) {
                                                         Ok(()) => {
                                                             info!("Response delivered via channel for request_id: {}", request_id);
@@ -680,7 +685,7 @@ impl JsonRpcService {
                                                         }
                                                     }
                                                 } else {
-                                                    debug!("No channel found for request_id: {} - likely already timed out", request_id);
+                                                    error!("No channel found for request_id: {} - available ids: {:?}", request_id, channels.keys().collect::<Vec<_>>());
                                                     false
                                                 }
                                             } else {
