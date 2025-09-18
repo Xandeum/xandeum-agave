@@ -2543,8 +2543,12 @@ impl JsonRpcRequestProcessor {
         {
             let mut channels = self.response_channels.lock().unwrap();
             channels.insert(request_id, tx);
+            info!("Registered channel for request_id: {}. Total channels: {}", request_id, channels.len());
         }
+        info!("Channel registration complete, proceeding to create request");
 
+        info!("Creating request for getMetadata with request_id: {} for path: {}", request_id, param_str);
+        
         let request = Request {
             op: Opcode::GetMetadata as i32,
             pubkey: Vec::new(),
@@ -2552,6 +2556,7 @@ impl JsonRpcRequestProcessor {
                 let mut data = Vec::new();
                 data.extend_from_slice(&request_id.to_be_bytes());
                 data.extend_from_slice(param_str.as_bytes());
+                info!("Request data length: {} bytes", data.len());
                 data
             },
             signature: String::new(),
@@ -2578,7 +2583,7 @@ impl JsonRpcRequestProcessor {
             
             match send_result {
                 Ok(()) => {
-                    log::debug!("Request {} sent successfully (attempt {})", request_id, attempt + 1);
+                    info!("Request {} sent successfully (attempt {})", request_id, attempt + 1);
                     sent = true;
                     break;
                 }
@@ -2589,11 +2594,13 @@ impl JsonRpcRequestProcessor {
                     }
                 }
                 Err(e) => {
-                    log::error!("Failed to send to dock: {:?}", e);
+                    error!("Failed to send to dock: {:?}", e);
                     break;
                 }
             }
         }
+        
+        info!("Send loop completed for request_id: {}, sent: {}", request_id, sent);
         
         if !sent {
             self.response_channels.lock().unwrap().remove(&request_id);
@@ -2605,14 +2612,26 @@ impl JsonRpcRequestProcessor {
         }
 
         // Wait for response with timeout
+        info!("About to wait for response with timeout for request_id: {} (get_metadata)", request_id);
         match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(response)) => {
-                info!("Received response for request id: {}", request_id);
+                let elapsed = start_time.elapsed();
+                info!("Received response for request id: {} in {:?}", request_id, elapsed);
+                self.metrics.record_success(elapsed);
+                
+                // Check if connection is still alive
+                if tokio::task::spawn(async { tokio::time::sleep(Duration::from_micros(1)).await }).await.is_err() {
+                    error!("Connection closed after receiving response - client disconnected");
+                }
+                
+                info!("Successfully received response, returning it");
                 Ok(response)
             }
             Ok(Err(_)) => {
                 // Channel closed without sending
+                error!("Response channel closed for request_id {}", request_id);
                 self.response_channels.lock().unwrap().remove(&request_id);
+                self.metrics.record_timeout();
                 Err(Error {
                     code: ErrorCode::InternalError,
                     message: "Response channel closed unexpectedly".to_string(),
@@ -2626,10 +2645,12 @@ impl JsonRpcRequestProcessor {
                 // Check if response arrived after timeout
                 if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
                     warn!("Found response after timeout for request_id: {}", request_id);
+                    self.metrics.record_success(start_time.elapsed());
                     return Ok(response);
                 }
                 
-                error!("Timeout for request_id: {}", request_id);
+                error!("Timeout for request_id: {}. {}", request_id, self.metrics.get_stats());
+                self.metrics.record_timeout();
                 Err(Error {
                     code: ErrorCode::InternalError,
                     message: format!("Timeout waiting for dock response (id: {})", request_id),
@@ -3406,7 +3427,15 @@ pub mod rpc_minimal {
         }
 
         fn get_metadata(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
-            Box::pin(async move { meta.get_metadata(params).await })
+            Box::pin(async move { 
+                info!("MinimalImpl::get_metadata called with params: {}", params);
+                let result = meta.get_metadata(params).await;
+                match &result {
+                    Ok(_) => info!("MinimalImpl::get_metadata returning Ok"),
+                    Err(e) => error!("MinimalImpl::get_metadata returning error: {:?}", e),
+                }
+                result
+            })
         }
 
         fn is_exist(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {

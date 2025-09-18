@@ -661,7 +661,7 @@ impl JsonRpcService {
                                     | Some(response::Response::Exists(_))
                                     | Some(response::Response::ListDir(_)) => {
             
-                                        debug!(" Received Response for Request-id = {}", wrapper.id);
+                                        info!(" Received Response for Request-id = {}", wrapper.id);
                                         let request_id = wrapper.id;
                                         
                                         // First try to deliver via oneshot channel for immediate delivery
@@ -670,15 +670,17 @@ impl JsonRpcService {
                                                 if let Some(sender) = channels.remove(&request_id) {
                                                     match sender.send(wrapper.clone()) {
                                                         Ok(()) => {
-                                                            debug!("Response delivered via channel for request_id: {}", request_id);
+                                                            info!("Response delivered via channel for request_id: {}", request_id);
                                                             true
                                                         }
-                                                        Err(_) => {
-                                                            debug!("Failed to deliver response via channel (receiver dropped) for request_id: {}", request_id);
+                                                        Err(wrapper) => {
+                                                            error!("Failed to deliver response via channel (receiver dropped) for request_id: {}. Response type: {:?}", 
+                                                                   request_id, wrapper.response);
                                                             false
                                                         }
                                                     }
                                                 } else {
+                                                    debug!("No channel found for request_id: {} - likely already timed out", request_id);
                                                     false
                                                 }
                                             } else {
