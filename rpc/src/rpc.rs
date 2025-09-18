@@ -2539,7 +2539,7 @@ impl JsonRpcRequestProcessor {
         info!("Generated request_id: {} (as u64) for get_metadata", request_id);
         
         // Create oneshot channel for this specific request
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let (tx,mut  rx) = tokio::sync::oneshot::channel();
         
         // Test the channel immediately
         let (test_tx, mut test_rx) = tokio::sync::oneshot::channel::<String>();
@@ -2651,34 +2651,43 @@ impl JsonRpcRequestProcessor {
         
         info!("Starting to await on receiver");
         
-        // First try without timeout to see if that works
-        let response_future = rx;
+        // Simple await with timeout
+        info!("About to call tokio::time::timeout");
+        let timeout_result = tokio::time::timeout(Duration::from_secs(30), rx).await;
+        info!("tokio::time::timeout completed with result: {:?}", timeout_result.is_ok());
         
-        // Use select to manually implement timeout
-        tokio::select! {
-            response_result = response_future => {
-                match response_result {
-                    Ok(response) => {
-                        let elapsed = start_time.elapsed();
-                        info!("Received response for request id: {} in {:?}", request_id, elapsed);
-                        self.metrics.record_success(elapsed);
-                        
-                        info!("Successfully received response, returning it");
-                        Ok(response)
-                    }
-                    Err(e) => {
-                        error!("Receiver error: {:?}", e);
-                        Err(Error {
-                            code: ErrorCode::InternalError,
-                            message: "Failed to receive response".to_string(),
-                            data: None,
-                        })
-                    }
-                }
+        match timeout_result {
+            Ok(Ok(response)) => {
+                let elapsed = start_time.elapsed();
+                info!("Received response for request id: {} in {:?}", request_id, elapsed);
+                self.metrics.record_success(elapsed);
+                
+                info!("Successfully received response, about to return Ok");
+                // info!("Response type: {:?}", response.response.as_ref().map(|r| std::mem::discriminant(r)));
+                let final_response = Ok(response);
+                info!("get_metadata function about to return final response");
+                final_response
             }
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            Ok(Err(e)) => {
+                error!("Receiver error: {:?}", e);
+                self.response_channels.lock().unwrap().remove(&request_id);
+                Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: "Failed to receive response".to_string(),
+                    data: None,
+                })
+            }
+            Err(_) => {
                 error!("Timeout waiting for response");
                 self.response_channels.lock().unwrap().remove(&request_id);
+                
+                // Check if response arrived after timeout
+                if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+                    warn!("Found response after timeout for request_id: {}", request_id);
+                    self.metrics.record_success(start_time.elapsed());
+                    return Ok(response);
+                }
+                
                 self.metrics.record_timeout();
                 Err(Error {
                     code: ErrorCode::InternalError,
