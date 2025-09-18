@@ -665,47 +665,18 @@ impl JsonRpcService {
                                         let request_id = wrapper.id;
                                         info!("Using request_id: {} for channel lookup", request_id);
                                         
-                                        // First try to deliver via oneshot channel for immediate delivery
-                                        let delivered = {
-                                            if let Ok(mut channels) = request_processor.response_channels.lock() {
-                                                info!("Acquired lock, looking for channel for request_id: {}", request_id);
-                                                info!("Available channels: {:?}", channels.keys().collect::<Vec<_>>());
-                                                
-                                                if let Some(sender) = channels.remove(&request_id) {
-                                                    info!("Found channel for request_id: {}, attempting to send", request_id);
-                                                    match sender.send(wrapper.clone()) {
-                                                        Ok(()) => {
-                                                            info!("Response delivered via channel for request_id: {}", request_id);
-                                                            true
-                                                        }
-                                                        Err(wrapper) => {
-                                                            error!("Failed to deliver response via channel (receiver dropped) for request_id: {}. Response type: {:?}", 
-                                                                   request_id, wrapper.response);
-                                                            false
-                                                        }
-                                                    }
-                                                } else {
-                                                    error!("No channel found for request_id: {} - available ids: {:?}", request_id, channels.keys().collect::<Vec<_>>());
-                                                    false
-                                                }
-                                            } else {
-                                                error!("Failed to acquire lock on response_channels");
-                                                false
-                                            }
-                                        };
+                                        // Skip channel delivery due to async issues, directly insert into HashMap
+                                        info!("Received response for request_id: {}, storing in HashMap", request_id);
                                         
-                                        // Also store in HashMap as fallback (for late arrivals after timeout)
-                                        if !delivered {
-                                            match responses.lock() {
-                                                Ok(mut map) => {
-                                                    match map.insert(request_id, wrapper) {
-                                                        Some(_) => debug!("Overwrote existing ResponseWrapper"),
-                                                        None => debug!("Inserted new ResponseWrapper as fallback"),
-                                                    }
+                                        match responses.lock() {
+                                            Ok(mut map) => {
+                                                match map.insert(request_id, wrapper) {
+                                                    Some(_) => debug!("Overwrote existing ResponseWrapper"),
+                                                    None => info!("Inserted ResponseWrapper for request_id: {}", request_id),
                                                 }
-                                                Err(e) => {
-                                                    error!("Failed to acquire lock on responses: {:?}", e);
-                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to acquire lock on responses: {:?}", e);
                                             }
                                         }
                                     }

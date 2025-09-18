@@ -266,7 +266,7 @@ pub struct JsonRpcRequestProcessor {
     transaction_results: Arc<Mutex<HashMap<String, TxResponse>>>,
     responses: Arc<Mutex<HashMap<u64, ResponseWrapper>>>,
     request_id_counter: Arc<AtomicU64>,
-    // Use oneshot channels for precise response delivery
+    // Use oneshot channels for precise response delivery (keeping for compatibility)
     pub response_channels: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<ResponseWrapper>>>>,
     // Performance metrics
     pub metrics: Arc<RpcMetrics>,
@@ -2487,6 +2487,49 @@ impl JsonRpcRequestProcessor {
             .collect())
     }
 
+    // Helper function for polling responses
+    async fn poll_for_response(
+        &self,
+        request_id: u64,
+        start_time: Instant,
+        timeout_secs: u64,
+    ) -> Result<ResponseWrapper> {
+        let timeout = Instant::now() + Duration::from_secs(timeout_secs);
+        const POLL_INTERVAL: Duration = Duration::from_millis(10);
+        let mut poll_count = 0;
+        
+        loop {
+            poll_count += 1;
+            
+            // Check if response has arrived
+            if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
+                let elapsed = start_time.elapsed();
+                info!("Found response for request_id: {} in {:?} after {} polls", request_id, elapsed, poll_count);
+                self.metrics.record_success(elapsed);
+                return Ok(response);
+            }
+            
+            // Check timeout
+            if Instant::now() > timeout {
+                error!("Timeout waiting for response for request_id: {} after {} polls", request_id, poll_count);
+                self.metrics.record_timeout();
+                return Err(Error {
+                    code: ErrorCode::InternalError,
+                    message: format!("Timeout waiting for dock response (id: {})", request_id),
+                    data: None,
+                });
+            }
+            
+            // Log every 100 polls
+            if poll_count % 100 == 0 {
+                debug!("Still polling for request_id: {}, poll count: {}", request_id, poll_count);
+            }
+            
+            // Sleep briefly before next poll
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     pub fn get_xandeum_result(&self, signature: String) -> Result<TxResponse> {
         info!("Processing getXandeumResult for signature: {}", signature);
         
@@ -2527,6 +2570,11 @@ impl JsonRpcRequestProcessor {
 
     pub async fn get_metadata(&self, param_str: String) -> Result<ResponseWrapper> {
         info!("Processing getMetadata for path: {}", param_str);
+        
+        // Check if we're in async context
+        let in_runtime = tokio::runtime::Handle::try_current().is_ok();
+        info!("In tokio runtime: {}", in_runtime);
+        
         let start_time = Instant::now();
         self.metrics.record_request();
         
@@ -2538,31 +2586,6 @@ impl JsonRpcRequestProcessor {
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
         info!("Generated request_id: {} (as u64) for get_metadata", request_id);
         
-        // Create oneshot channel for this specific request
-        let (tx,mut  rx) = tokio::sync::oneshot::channel();
-        
-        // Test the channel immediately
-        let (test_tx, mut test_rx) = tokio::sync::oneshot::channel::<String>();
-        if test_tx.send("test".to_string()).is_ok() {
-            match test_rx.try_recv() {
-                Ok(msg) => info!("Channel test successful: {}", msg),
-                Err(e) => error!("Channel test failed: {:?}", e),
-            }
-        }
-        
-        // Check runtime handle
-        match tokio::runtime::Handle::try_current() {
-            Ok(_) => info!("Runtime handle available"),
-            Err(e) => error!("No runtime handle: {:?}", e),
-        }
-        
-        {
-            let mut channels = self.response_channels.lock().unwrap();
-            channels.insert(request_id, tx);
-            info!("Registered channel for request_id: {}. Total channels: {}", request_id, channels.len());
-        }
-        info!("Channel registration complete, proceeding to create request");
-
         info!("Creating request for getMetadata with request_id: {} for path: {}", request_id, param_str);
         
         let request = Request {
@@ -2581,7 +2604,6 @@ impl JsonRpcRequestProcessor {
         let request_bytes = match bincode::serialize(&request) {
             Ok(bytes) => bytes,
             Err(_) => {
-                self.response_channels.lock().unwrap().remove(&request_id);
                 return Err(Error::internal_error());
             }
         };
@@ -2619,7 +2641,7 @@ impl JsonRpcRequestProcessor {
         info!("Send loop completed for request_id: {}, sent: {}", request_id, sent);
         
         if !sent {
-            self.response_channels.lock().unwrap().remove(&request_id);
+            self.metrics.record_send_failure();
             return Err(Error {
                 code: ErrorCode::InternalError,
                 message: "Failed to send request to dock".to_string(),
@@ -2627,89 +2649,18 @@ impl JsonRpcRequestProcessor {
             });
         }
 
-        // Wait for response with timeout
-        info!("About to wait for response with timeout for request_id: {} (get_metadata)", request_id);
-        
-        // Try to poll the receiver first
-        match rx.try_recv() {
-            Ok(response) => {
-                info!("Response already available in channel!");
-                return Ok(response);
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                info!("Channel empty, proceeding with timeout wait");
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                error!("Channel already closed!");
-                return Err(Error {
-                    code: ErrorCode::InternalError,
-                    message: "Response channel closed before receiving".to_string(),
-                    data: None,
-                });
-            }
-        }
-        
-        info!("Starting to await on receiver");
-        
-        // Simple await with timeout
-        info!("About to call tokio::time::timeout");
-        let timeout_result = tokio::time::timeout(Duration::from_secs(30), rx).await;
-        info!("tokio::time::timeout completed with result: {:?}", timeout_result.is_ok());
-        
-        match timeout_result {
-            Ok(Ok(response)) => {
-                let elapsed = start_time.elapsed();
-                info!("Received response for request id: {} in {:?}", request_id, elapsed);
-                self.metrics.record_success(elapsed);
-                
-                info!("Successfully received response, about to return Ok");
-                // info!("Response type: {:?}", response.response.as_ref().map(|r| std::mem::discriminant(r)));
-                let final_response = Ok(response);
-                info!("get_metadata function about to return final response");
-                final_response
-            }
-            Ok(Err(e)) => {
-                error!("Receiver error: {:?}", e);
-                self.response_channels.lock().unwrap().remove(&request_id);
-                Err(Error {
-                    code: ErrorCode::InternalError,
-                    message: "Failed to receive response".to_string(),
-                    data: None,
-                })
-            }
-            Err(_) => {
-                error!("Timeout waiting for response");
-                self.response_channels.lock().unwrap().remove(&request_id);
-                
-                // Check if response arrived after timeout
-                if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
-                    warn!("Found response after timeout for request_id: {}", request_id);
-                    self.metrics.record_success(start_time.elapsed());
-                    return Ok(response);
-                }
-                
-                self.metrics.record_timeout();
-                Err(Error {
-                    code: ErrorCode::InternalError,
-                    message: format!("Timeout waiting for dock response (id: {})", request_id),
-                    data: None,
-                })
-            }
-        }
+        // Use simple polling instead of channels
+        info!("Starting to poll for response for request_id: {}", request_id);
+        self.poll_for_response(request_id, start_time, 30).await
     }
 
     pub async fn is_exist(&self, param_str: String) -> Result<ResponseWrapper> {
         info!("Processing isExist for path: {}", param_str);
+        let start_time = Instant::now();
+        self.metrics.record_request();
+        
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
-        
-        // Create oneshot channel for this specific request
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        
-        // Register channel BEFORE sending request to avoid race condition
-        {
-            let mut channels = self.response_channels.lock().unwrap();
-            channels.insert(request_id, tx);
-        }
+        info!("Generated request_id: {} for is_exist", request_id);
 
         let request = Request {
             op: Opcode::Exists as i32,
@@ -2726,7 +2677,6 @@ impl JsonRpcRequestProcessor {
         let request_bytes = match bincode::serialize(&request) {
             Ok(bytes) => bytes,
             Err(_) => {
-                self.response_channels.lock().unwrap().remove(&request_id);
                 return Err(Error::internal_error());
             }
         };
@@ -2762,7 +2712,7 @@ impl JsonRpcRequestProcessor {
         }
         
         if !sent {
-            self.response_channels.lock().unwrap().remove(&request_id);
+            self.metrics.record_send_failure();
             return Err(Error {
                 code: ErrorCode::InternalError,
                 message: "Failed to send request to dock".to_string(),
@@ -2770,54 +2720,19 @@ impl JsonRpcRequestProcessor {
             });
         }
 
-        // Wait for response with timeout
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
-            Ok(Ok(response)) => {
-                info!("Received response for request id: {}", request_id);
-                Ok(response)
-            }
-            Ok(Err(_)) => {
-                // Channel closed without sending
-                self.response_channels.lock().unwrap().remove(&request_id);
-                Err(Error {
-                    code: ErrorCode::InternalError,
-                    message: "Response channel closed unexpectedly".to_string(),
-                    data: None,
-                })
-            }
-            Err(_) => {
-                // Timeout
-                self.response_channels.lock().unwrap().remove(&request_id);
-                
-                // Check if response arrived after timeout
-                if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
-                    warn!("Found response after timeout for request_id: {}", request_id);
-                    return Ok(response);
-                }
-                
-                error!("Timeout for request_id: {}", request_id);
-                Err(Error {
-                    code: ErrorCode::InternalError,
-                    message: format!("Timeout waiting for dock response (id: {})", request_id),
-                    data: None,
-                })
-            }
-        }
+        // Use polling instead of channels
+        info!("Starting to poll for response for request_id: {}", request_id);
+        self.poll_for_response(request_id, start_time, 30).await
     }
 
     pub async fn list_dirs(&self, param_str: String) -> Result<ResponseWrapper> {
         info!("Processing listDirs for path: {}", param_str);
+        let start_time = Instant::now();
+        self.metrics.record_request();
+        
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
+        info!("Generated request_id: {} for list_dirs", request_id);
         
-        // Create oneshot channel for this specific request
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        
-        // Register channel BEFORE sending request to avoid race condition
-        {
-            let mut channels = self.response_channels.lock().unwrap();
-            channels.insert(request_id, tx);
-        }
-
         let request = Request {
             op: Opcode::ListDirs as i32,
             pubkey: Vec::new(),
@@ -2833,7 +2748,6 @@ impl JsonRpcRequestProcessor {
         let request_bytes = match bincode::serialize(&request) {
             Ok(bytes) => bytes,
             Err(_) => {
-                self.response_channels.lock().unwrap().remove(&request_id);
                 return Err(Error::internal_error());
             }
         };
@@ -2869,7 +2783,7 @@ impl JsonRpcRequestProcessor {
         }
         
         if !sent {
-            self.response_channels.lock().unwrap().remove(&request_id);
+            self.metrics.record_send_failure();
             return Err(Error {
                 code: ErrorCode::InternalError,
                 message: "Failed to send request to dock".to_string(),
@@ -2877,39 +2791,9 @@ impl JsonRpcRequestProcessor {
             });
         }
 
-        // Wait for response with timeout
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
-            Ok(Ok(response)) => {
-                info!("Received response for request id: {}", request_id);
-                Ok(response)
-            }
-            Ok(Err(_)) => {
-                // Channel closed without sending
-                self.response_channels.lock().unwrap().remove(&request_id);
-                Err(Error {
-                    code: ErrorCode::InternalError,
-                    message: "Response channel closed unexpectedly".to_string(),
-                    data: None,
-                })
-            }
-            Err(_) => {
-                // Timeout
-                self.response_channels.lock().unwrap().remove(&request_id);
-                
-                // Check if response arrived after timeout
-                if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
-                    warn!("Found response after timeout for request_id: {}", request_id);
-                    return Ok(response);
-                }
-                
-                error!("Timeout for request_id: {}", request_id);
-                Err(Error {
-                    code: ErrorCode::InternalError,
-                    message: format!("Timeout waiting for dock response (id: {})", request_id),
-                    data: None,
-                })
-            }
-        }
+        // Use polling instead of channels
+        info!("Starting to poll for response for request_id: {}", request_id);
+        self.poll_for_response(request_id, start_time, 30).await
     }
 }
 
