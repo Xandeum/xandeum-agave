@@ -16,7 +16,7 @@ fn main() {
 
     config
         .compile_protos(
-            &["xandeum-protos/response.proto", "xandeum-protos/types.proto"], // Check if these paths exist
+            &["xandeum-protos/response.proto", "xandeum-protos/types.proto"], 
             &["xandeum-protos"],
         )
         .expect("Failed to compile Protobuf files");

@@ -34,6 +34,7 @@ use {
             Arc, Mutex, RwLock,
         },
         thread::{self, Builder, JoinHandle},
+        time::Duration,
     }, tokio_util::codec::{BytesCodec, FramedRead}, xandeum_protos::response::{response::{self}, ResponseWrapper, TxResponse}
 };
 
@@ -502,6 +503,9 @@ impl JsonRpcService {
 
         #[cfg(test)]
         let test_request_processor = request_processor.clone();
+        
+        // Clone for the response handler before moving into server
+        let request_processor_for_responses = request_processor.clone();
 
         let ledger_path = ledger_path.to_path_buf();
 
@@ -570,6 +574,7 @@ impl JsonRpcService {
         let rpc_sub_clone1 = rpc_subscriptions.clone();
 
         runtime_clone1.spawn(async move {
+            let request_processor = request_processor_for_responses;
             let socket = context_clone.socket(zmq::PULL).unwrap();
 
             if let Err(e) = socket.bind("ipc:///var/run/xandeum/fromdock.sock") {
@@ -578,10 +583,12 @@ impl JsonRpcService {
             }
             info!("First PULL socket listener started on ipc:///var/run/xandeum/fromdock.sock");
 
+            // Use blocking receive for better performance
             loop {
+                // Blocking receive - will wait until a message arrives
                 match socket.recv_bytes(0) {
                     Ok(msg) => {
-                        debug!("Received message from dock: {:?}", msg);
+                        debug!("Received message from dock");
                         match ResponseWrapper::decode(&msg[..]) {
                             Ok(wrapper) => {
                                 let response = match wrapper.response {
@@ -654,12 +661,18 @@ impl JsonRpcService {
                                     | Some(response::Response::Exists(_))
                                     | Some(response::Response::ListDir(_)) => {
             
-                                        debug!(" Received Response for Request-id = {}", wrapper.id);
+                                        info!(" Received Response for Request-id = {} (as u64)", wrapper.id);
+                                        let request_id = wrapper.id;
+                                        info!("Using request_id: {} for channel lookup", request_id);
+                                        
+                                        // Skip channel delivery due to async issues, directly insert into HashMap
+                                        info!("Received response for request_id: {}, storing in HashMap", request_id);
+                                        
                                         match responses.lock() {
                                             Ok(mut map) => {
-                                                match map.insert(wrapper.id, wrapper) {
+                                                match map.insert(request_id, wrapper) {
                                                     Some(_) => debug!("Overwrote existing ResponseWrapper"),
-                                                    None => debug!("Inserted new ResponseWrapper"),
+                                                    None => info!("Inserted ResponseWrapper for request_id: {}", request_id),
                                                 }
                                             }
                                             Err(e) => {
@@ -680,9 +693,11 @@ impl JsonRpcService {
                     }
                     Err(e) => {
                         error!("Receive error: {:?}", e);
+                        // For errors, add a small delay to avoid busy loop
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
-                tokio::task::yield_now().await;
+                // No yield needed with blocking receive
             }
         });
 
@@ -795,6 +810,11 @@ mod tests {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
+        let exit_for_test = Arc::new(AtomicBool::new(false));
+        let rpc_subscriptions = Arc::new(RpcSubscriptions::new_for_tests_with_blockstore(
+            exit_for_test,
+            blockstore.clone(),
+        ));
         let mut rpc_service = JsonRpcService::new(
             rpc_addr,
             JsonRpcConfig::default(),
@@ -822,6 +842,8 @@ mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
+            Arc::new(Mutex::new(HashMap::new())),
+            &rpc_subscriptions,
         )
         .expect("assume successful JsonRpcService start");
         let thread = rpc_service.thread_hdl.thread();
