@@ -2795,6 +2795,77 @@ impl JsonRpcRequestProcessor {
         info!("Starting to poll for response for request_id: {}", request_id);
         self.poll_for_response(request_id, start_time, 30).await
     }
+
+    pub async fn list_dirs_owner(&self, param_str: String) -> Result<ResponseWrapper> {
+        info!("Processing listDirsOwner for path: {}", param_str);
+        let start_time = Instant::now();
+        self.metrics.record_request();
+        
+        let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
+        info!("Generated request_id: {} for list_dirs_owner", request_id);
+        
+        let request = Request {
+            op: Opcode::ListDirsOwner as i32,
+            pubkey: Vec::new(),
+            data: {
+                let mut data = Vec::new();
+                data.extend_from_slice(&request_id.to_be_bytes());
+                data.extend_from_slice(param_str.as_bytes());
+                data
+            },
+            signature: String::new(),
+        };
+
+        let request_bytes = match bincode::serialize(&request) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Err(Error::internal_error());
+            }
+        };
+
+        // Send request with retries
+        const MAX_SEND_ATTEMPTS: u32 = 3;
+        let mut sent = false;
+        
+        for attempt in 0..MAX_SEND_ATTEMPTS {
+            let send_result = {
+                // Acquire lock, send, and immediately drop the lock before await
+                let socket = self.to_dock_push_socket.lock().unwrap();
+                socket.send(&request_bytes, zmq::DONTWAIT)
+            };
+            
+            match send_result {
+                Ok(()) => {
+                    log::debug!("Request {} sent successfully (attempt {})", request_id, attempt + 1);
+                    sent = true;
+                    break;
+                }
+                Err(zmq::Error::EAGAIN) => {
+                    if attempt < MAX_SEND_ATTEMPTS - 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to send to dock: {:?}", e);
+                    break;
+                }
+            }
+        }
+        
+        if !sent {
+            self.metrics.record_send_failure();
+            return Err(Error {
+                code: ErrorCode::InternalError,
+                message: "Failed to send request to dock".to_string(),
+                data: None,
+            });
+        }
+
+        // Use polling instead of channels
+        info!("Starting to poll for response for request_id: {}", request_id);
+        self.poll_for_response(request_id, start_time, 30).await
+    }
 }
 
 fn optimize_filters(filters: &mut [RpcFilterType]) {
@@ -3179,6 +3250,8 @@ pub mod rpc_minimal {
         fn is_exist(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
         #[rpc(meta, name = "listDirs")]
         fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        #[rpc(meta, name = "listDirsOwner")]
+        fn list_dirs_owner(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
     }
 
     pub struct MinimalImpl;
@@ -3366,6 +3439,10 @@ pub mod rpc_minimal {
 
         fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
             Box::pin(async move { meta.list_dirs(params).await })
+        }
+
+        fn list_dirs_owner(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+            Box::pin(async move { meta.list_dirs_owner(params).await })
         }
     }
 }
@@ -4069,6 +4146,8 @@ pub mod rpc_full {
         fn is_exist(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
         #[rpc(meta, name = "listDirs")]
         fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        #[rpc(meta, name = "listDirsOwner")]
+        fn list_dirs_owner(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
     }
 
     pub struct FullImpl;
@@ -4914,7 +4993,10 @@ pub mod rpc_full {
 
         fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
             Box::pin(async move { meta.list_dirs(params).await })
+        }
 
+        fn list_dirs_owner(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+            Box::pin(async move { meta.list_dirs_owner(params).await })
         }
     }
 }
