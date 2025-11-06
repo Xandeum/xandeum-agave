@@ -7,20 +7,21 @@ use {
     crate::bank::Bank,
     error::CoreBpfMigrationError,
     num_traits::{CheckedAdd, CheckedSub},
+    solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_builtins::core_bpf_migration::CoreBpfMigrationConfig,
+    solana_compute_budget::compute_budget::ComputeBudget,
+    solana_hash::Hash,
+    solana_instruction::error::InstructionError,
+    solana_loader_v3_interface::state::UpgradeableLoaderState,
     solana_program_runtime::{
         invoke_context::{EnvironmentConfig, InvokeContext},
         loaded_programs::ProgramCacheForTxBatch,
         sysvar_cache::SysvarCache,
     },
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount, WritableAccount},
-        bpf_loader_upgradeable::{self, UpgradeableLoaderState},
-        hash::Hash,
-        instruction::InstructionError,
-        pubkey::Pubkey,
-        transaction_context::TransactionContext,
-    },
+    solana_pubkey::Pubkey,
+    solana_sdk_ids::bpf_loader_upgradeable,
+    solana_svm_callback::InvokeContextCallback,
+    solana_transaction_context::TransactionContext,
     source_buffer::SourceBuffer,
     std::{cmp::Ordering, sync::atomic::Ordering::Relaxed},
     target_builtin::TargetBuiltin,
@@ -136,14 +137,22 @@ impl Bank {
         let mut program_cache_for_tx_batch = ProgramCacheForTxBatch::new_from_cache(
             self.slot,
             self.epoch,
-            &self.transaction_processor.program_cache.read().unwrap(),
+            &self
+                .transaction_processor
+                .global_program_cache
+                .read()
+                .unwrap(),
         );
 
         // Configure a dummy `InvokeContext` from the runtime's current
         // environment, as well as the two `ProgramCacheForTxBatch`
         // instances configured above, then invoke the loader.
         {
-            let compute_budget = self.compute_budget().unwrap_or_default();
+            let compute_budget = self
+                .compute_budget()
+                .unwrap_or(ComputeBudget::new_with_defaults(
+                    /* simd_0296_active */ false,
+                ));
             let mut sysvar_cache = SysvarCache::default();
             sysvar_cache.fill_missing_entries(|pubkey, set_sysvar| {
                 if let Some(account) = self.get_account(pubkey) {
@@ -158,19 +167,22 @@ impl Bank {
                 compute_budget.max_instruction_trace_length,
             );
 
+            struct MockCallback {}
+            impl InvokeContextCallback for MockCallback {}
+            let feature_set = self.feature_set.runtime_features();
             let mut dummy_invoke_context = InvokeContext::new(
                 &mut dummy_transaction_context,
                 &mut program_cache_for_tx_batch,
                 EnvironmentConfig::new(
                     Hash::default(),
                     0,
-                    0,
-                    &|_| 0,
-                    self.feature_set.clone(),
+                    &MockCallback {},
+                    &feature_set,
                     &sysvar_cache,
                 ),
                 None,
-                compute_budget,
+                compute_budget.to_budget(),
+                compute_budget.to_cost(),
             );
 
             let environments = dummy_invoke_context
@@ -198,7 +210,7 @@ impl Bank {
         // Update the program cache by merging with `programs_modified`, which
         // should have been updated by the deploy function.
         self.transaction_processor
-            .program_cache
+            .global_program_cache
             .write()
             .unwrap()
             .merge(&program_cache_for_tx_batch.drain_modified_entries());
@@ -215,7 +227,15 @@ impl Bank {
 
         let target =
             TargetBuiltin::new_checked(self, builtin_program_id, &config.migration_target)?;
-        let source = SourceBuffer::new_checked(self, &config.source_buffer_address)?;
+        let source = if let Some(expected_hash) = config.verified_build_hash {
+            SourceBuffer::new_checked_with_verified_build_hash(
+                self,
+                &config.source_buffer_address,
+                expected_hash,
+            )?
+        } else {
+            SourceBuffer::new_checked(self, &config.source_buffer_address)?
+        };
 
         // Attempt serialization first before modifying the bank.
         let new_target_program_account = self.new_target_program_account(&target)?;
@@ -256,19 +276,7 @@ impl Bank {
             new_target_program_account.lamports(),
             new_target_program_data_account.lamports(),
         )?;
-
-        // Update the bank's capitalization.
-        match lamports_to_burn.cmp(&lamports_to_fund) {
-            Ordering::Greater => {
-                self.capitalization
-                    .fetch_sub(checked_sub(lamports_to_burn, lamports_to_fund)?, Relaxed);
-            }
-            Ordering::Less => {
-                self.capitalization
-                    .fetch_add(checked_sub(lamports_to_fund, lamports_to_burn)?, Relaxed);
-            }
-            Ordering::Equal => (),
-        }
+        self.update_captalization(lamports_to_burn, lamports_to_fund)?;
 
         // Store the new program accounts and clear the source buffer account.
         self.store_account(&target.program_address, &new_target_program_account);
@@ -296,7 +304,7 @@ impl Bank {
     /// `apply_feature_activations` function, similar to below.
     ///
     /// ```ignore
-    /// if new_feature_activations.contains(&solana_feature_set::test_upgrade_program::id()) {
+    /// if new_feature_activations.contains(&agave_feature_set::test_upgrade_program::id()) {
     ///     self.upgrade_core_bpf_program(
     ///        &core_bpf_program_address,
     ///        &source_buffer_address,
@@ -350,19 +358,7 @@ impl Bank {
             source.buffer_account.lamports(),
         )?;
         let lamports_to_fund = new_target_program_data_account.lamports();
-
-        // Update the bank's capitalization.
-        match lamports_to_burn.cmp(&lamports_to_fund) {
-            Ordering::Greater => {
-                self.capitalization
-                    .fetch_sub(checked_sub(lamports_to_burn, lamports_to_fund)?, Relaxed);
-            }
-            Ordering::Less => {
-                self.capitalization
-                    .fetch_add(checked_sub(lamports_to_fund, lamports_to_burn)?, Relaxed);
-            }
-            Ordering::Equal => (),
-        }
+        self.update_captalization(lamports_to_burn, lamports_to_fund)?;
 
         // Store the new program data account and clear the source buffer account.
         self.store_account(
@@ -376,6 +372,26 @@ impl Bank {
 
         Ok(())
     }
+
+    fn update_captalization(
+        &mut self,
+        lamports_to_burn: u64,
+        lamports_to_fund: u64,
+    ) -> Result<(), CoreBpfMigrationError> {
+        match lamports_to_burn.cmp(&lamports_to_fund) {
+            Ordering::Greater => {
+                self.capitalization
+                    .fetch_sub(checked_sub(lamports_to_burn, lamports_to_fund)?, Relaxed);
+            }
+            Ordering::Less => {
+                self.capitalization
+                    .fetch_add(checked_sub(lamports_to_fund, lamports_to_burn)?, Relaxed);
+            }
+            Ordering::Equal => (),
+        };
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -384,14 +400,12 @@ pub(crate) mod tests {
         super::*,
         crate::bank::tests::create_simple_test_bank,
         assert_matches::assert_matches,
+        solana_account::state_traits::StateMut,
         solana_builtins::core_bpf_migration::CoreBpfMigrationTargetType,
+        solana_clock::Slot,
+        solana_loader_v3_interface::get_program_data_address,
         solana_program_runtime::loaded_programs::{ProgramCacheEntry, ProgramCacheEntryType},
-        solana_sdk::{
-            account_utils::StateMut,
-            bpf_loader_upgradeable::{self, get_program_data_address},
-            clock::Slot,
-            native_loader,
-        },
+        solana_sdk_ids::{bpf_loader_upgradeable, native_loader},
         std::{fs::File, io::Read},
         test_case::test_case,
     };
@@ -582,7 +596,11 @@ pub(crate) mod tests {
                 .contains(&self.target_program_address));
 
             // The cache should contain the target program.
-            let program_cache = bank.transaction_processor.program_cache.read().unwrap();
+            let program_cache = bank
+                .transaction_processor
+                .global_program_cache
+                .read()
+                .unwrap();
             let entries = program_cache.get_flattened_entries(true, true);
             let target_entry = entries
                 .iter()
@@ -648,6 +666,7 @@ pub(crate) mod tests {
             upgrade_authority_address,
             feature_id: Pubkey::new_unique(),
             migration_target: CoreBpfMigrationTargetType::Builtin,
+            verified_build_hash: None,
             datapoint_name: "test_migrate_builtin",
         };
 
@@ -702,10 +721,16 @@ pub(crate) mod tests {
         ) = test_context
             .calculate_post_migration_capitalization_and_accounts_data_size_delta_off_chain(&bank);
 
+        let expected_hash = {
+            let data = test_elf();
+            let end_offset = data.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
+            solana_sha256_hasher::hash(&data[..end_offset])
+        };
         let core_bpf_migration_config = CoreBpfMigrationConfig {
             source_buffer_address,
             upgrade_authority_address,
             feature_id: Pubkey::new_unique(),
+            verified_build_hash: Some(expected_hash),
             migration_target: CoreBpfMigrationTargetType::Stateless,
             datapoint_name: "test_migrate_stateless_builtin",
         };
@@ -771,6 +796,7 @@ pub(crate) mod tests {
             upgrade_authority_address: Some(Pubkey::new_unique()), // Mismatch.
             feature_id: Pubkey::new_unique(),
             migration_target: CoreBpfMigrationTargetType::Builtin,
+            verified_build_hash: None,
             datapoint_name: "test_migrate_builtin",
         };
 
@@ -778,6 +804,57 @@ pub(crate) mod tests {
             bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config)
                 .unwrap_err(),
             CoreBpfMigrationError::UpgradeAuthorityMismatch(_, _)
+        )
+    }
+
+    #[test]
+    fn test_migrate_fail_verified_build_mismatch() {
+        let mut bank = create_simple_test_bank(0);
+
+        let builtin_id = Pubkey::new_unique();
+        let source_buffer_address = Pubkey::new_unique();
+
+        let upgrade_authority_address = Some(Pubkey::new_unique());
+
+        {
+            let builtin_name = String::from("test_builtin");
+            let account =
+                AccountSharedData::new_data(1, &builtin_name, &native_loader::id()).unwrap();
+            bank.store_account_and_update_capitalization(&builtin_id, &account);
+            bank.transaction_processor.add_builtin(
+                &bank,
+                builtin_id,
+                builtin_name.as_str(),
+                ProgramCacheEntry::default(),
+            );
+            account
+        };
+
+        let test_context = TestContext::new(
+            &bank,
+            &builtin_id,
+            &source_buffer_address,
+            upgrade_authority_address,
+        );
+        let TestContext {
+            target_program_address: builtin_id,
+            source_buffer_address,
+            ..
+        } = test_context;
+
+        let core_bpf_migration_config = CoreBpfMigrationConfig {
+            source_buffer_address,
+            upgrade_authority_address: None,
+            feature_id: Pubkey::new_unique(),
+            migration_target: CoreBpfMigrationTargetType::Builtin,
+            verified_build_hash: Some(Hash::default()),
+            datapoint_name: "test_migrate_builtin",
+        };
+
+        assert_matches!(
+            bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config)
+                .unwrap_err(),
+            CoreBpfMigrationError::BuildHashMismatch(_, _)
         )
     }
 
@@ -830,6 +907,7 @@ pub(crate) mod tests {
             upgrade_authority_address: None, // None.
             feature_id: Pubkey::new_unique(),
             migration_target: CoreBpfMigrationTargetType::Builtin,
+            verified_build_hash: None,
             datapoint_name: "test_migrate_builtin",
         };
 

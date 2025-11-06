@@ -2,24 +2,22 @@
 pub(crate) mod tests {
     use {
         rand::Rng,
+        solana_account::AccountSharedData,
+        solana_clock::Clock,
+        solana_instruction::Instruction,
+        solana_keypair::Keypair,
+        solana_pubkey::Pubkey,
         solana_runtime::bank::Bank,
-        solana_sdk::{
-            account::AccountSharedData,
-            clock::Clock,
-            instruction::Instruction,
-            pubkey::Pubkey,
-            signature::{Keypair, Signer},
-            signers::Signers,
-            stake::{
-                instruction as stake_instruction,
-                state::{Authorized, Lockup},
-            },
-            transaction::Transaction,
+        solana_signer::{signers::Signers, Signer},
+        solana_stake_interface::{
+            instruction as stake_instruction,
+            state::{Authorized, Lockup},
         },
+        solana_transaction::Transaction,
         solana_vote::vote_account::{VoteAccount, VoteAccounts},
         solana_vote_program::{
             vote_instruction,
-            vote_state::{VoteInit, VoteState, VoteStateVersions},
+            vote_state::{VoteInit, VoteStateV3, VoteStateVersions},
         },
     };
 
@@ -87,7 +85,7 @@ pub(crate) mod tests {
         for i in 0..3 {
             stakes.push((
                 i,
-                VoteState::new(
+                VoteStateV3::new(
                     &VoteInit {
                         node_pubkey: node1,
                         ..VoteInit::default()
@@ -102,7 +100,7 @@ pub(crate) mod tests {
 
         stakes.push((
             5,
-            VoteState::new(
+            VoteStateV3::new(
                 &VoteInit {
                     node_pubkey: node2,
                     ..VoteInit::default()
@@ -114,7 +112,7 @@ pub(crate) mod tests {
         let vote_accounts = stakes.into_iter().map(|(stake, vote_state)| {
             let account = AccountSharedData::new_data(
                 rng.gen(), // lamports
-                &VoteStateVersions::new_current(vote_state),
+                &VoteStateVersions::new_v3(vote_state),
                 &solana_vote_program::id(), // owner
             )
             .unwrap();

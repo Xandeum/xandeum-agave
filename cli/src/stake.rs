@@ -37,12 +37,6 @@ use {
     solana_epoch_schedule::EpochSchedule,
     solana_message::Message,
     solana_native_token::Sol,
-    solana_program::stake::{
-        self,
-        instruction::{self as stake_instruction, LockupArgs, StakeError},
-        state::{Authorized, Lockup, Meta, StakeActivationStatus, StakeAuthorize, StakeStateV2},
-        tools::{acceptable_reference_epoch_credits, eligible_for_deactivate_delinquent},
-    },
     solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
@@ -56,8 +50,15 @@ use {
         system_program,
         sysvar::{clock, stake_history},
     },
+    solana_stake_interface::{
+        self as stake,
+        error::StakeError,
+        instruction::{self as stake_instruction, LockupArgs},
+        stake_history::StakeHistory,
+        state::{Authorized, Lockup, Meta, StakeActivationStatus, StakeAuthorize, StakeStateV2},
+        tools::{acceptable_reference_epoch_credits, eligible_for_deactivate_delinquent},
+    },
     solana_system_interface::{error::SystemError, instruction as system_instruction},
-    solana_sysvar::stake_history::StakeHistory,
     solana_transaction::Transaction,
     std::{ops::Deref, rc::Rc},
 };
@@ -513,10 +514,9 @@ impl StakeSubCommands for App<'_, '_> {
                         .value_name("AMOUNT")
                         .takes_value(true)
                         .validator(is_amount)
-                        .requires("sign_only")
                         .help(
-                            "Offline signing only: the rent-exempt amount to move into the new \
-                             stake account, in SOL",
+                            "The rent-exempt amount to move into the new \
+                             stake account, in SOL. Required for offline signing.",
                         ),
                 ),
         )
@@ -568,11 +568,11 @@ impl StakeSubCommands for App<'_, '_> {
                         .index(3)
                         .value_name("AMOUNT")
                         .takes_value(true)
-                        .validator(is_amount_or_all)
+                        .validator(is_amount_or_all_or_available)
                         .required(true)
                         .help(
                             "The amount to withdraw from the stake account, in SOL; accepts \
-                             keyword ALL",
+                             keywords ALL or AVAILABLE",
                         ),
                 )
                 .arg(
@@ -1709,8 +1709,12 @@ pub fn process_deactivate_stake_account(
         *stake_account_pubkey
     };
 
+    // DeactivateDelinquent parses a VoteState, which may change between simulation and execution
     let compute_unit_limit = match blockhash_query {
         BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
+        BlockhashQuery::All(_) if deactivate_delinquent => {
+            ComputeUnitLimit::SimulatedWithExtraPercentage(5)
+        }
         BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
     };
     let ixs = vec![if deactivate_delinquent {
@@ -1997,7 +2001,9 @@ pub fn process_split_stake(
         split_stake_account.pubkey()
     };
 
-    let rent_exempt_reserve = if !sign_only {
+    let rent_exempt_reserve = if let Some(rent_exempt_reserve) = rent_exempt_reserve {
+        *rent_exempt_reserve
+    } else {
         let stake_minimum_delegation = rpc_client.get_stake_minimum_delegation()?;
         if lamports < stake_minimum_delegation {
             let lamports = Sol(lamports);
@@ -2041,10 +2047,6 @@ pub fn process_split_stake(
             rpc_client.get_minimum_balance_for_rent_exemption(StakeStateV2::size_of())?;
 
         rent_exempt_reserve.saturating_sub(current_balance)
-    } else {
-        rent_exempt_reserve
-            .cloned()
-            .expect("rent_exempt_reserve_sol is required with sign_only")
     };
 
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
@@ -2624,11 +2626,31 @@ pub fn process_show_stake_account(
     starting_epoch: Option<u64>,
 ) -> ProcessResult {
     let stake_account = rpc_client.get_account(stake_account_address)?;
+    let state = get_account_stake_state(
+        rpc_client,
+        stake_account_address,
+        stake_account,
+        use_lamports_unit,
+        with_rewards,
+        use_csv,
+        starting_epoch,
+    )?;
+    Ok(config.output_format.formatted_string(&state))
+}
+
+pub fn get_account_stake_state(
+    rpc_client: &RpcClient,
+    stake_account_address: &Pubkey,
+    stake_account: solana_account::Account,
+    use_lamports_unit: bool,
+    with_rewards: Option<usize>,
+    use_csv: bool,
+    starting_epoch: Option<u64>,
+) -> Result<CliStakeState, CliError> {
     if stake_account.owner != stake::program::id() {
         return Err(CliError::RpcRequestError(format!(
             "{stake_account_address:?} is not a stake account",
-        ))
-        .into());
+        )));
     }
     match stake_account.state() {
         Ok(stake_state) => {
@@ -2642,7 +2664,7 @@ pub fn process_show_stake_account(
             })?;
             let new_rate_activation_epoch = get_feature_activation_epoch(
                 rpc_client,
-                &solana_feature_set::reduce_stake_warmup_cooldown::id(),
+                &agave_feature_set::reduce_stake_warmup_cooldown::id(),
             )?;
 
             let mut state = build_stake_state(
@@ -2672,12 +2694,11 @@ pub fn process_show_stake_account(
                 });
                 state.epoch_rewards = epoch_rewards;
             }
-            Ok(config.output_format.formatted_string(&state))
+            Ok(state)
         }
         Err(err) => Err(CliError::RpcRequestError(format!(
             "Account data could not be deserialized to stake state: {err}"
-        ))
-        .into()),
+        ))),
     }
 }
 
@@ -2788,9 +2809,10 @@ pub fn process_delegate_stake(
 
     let recent_blockhash = blockhash_query.get_blockhash(rpc_client, config.commitment)?;
 
+    // DelegateStake parses a VoteState, which may change between simulation and execution
     let compute_unit_limit = match blockhash_query {
         BlockhashQuery::None(_) | BlockhashQuery::FeeCalculator(_, _) => ComputeUnitLimit::Default,
-        BlockhashQuery::All(_) => ComputeUnitLimit::Simulated,
+        BlockhashQuery::All(_) => ComputeUnitLimit::SimulatedWithExtraPercentage(5),
     };
     let ixs = vec![stake_instruction::delegate_stake(
         stake_account_pubkey,
@@ -4481,6 +4503,38 @@ mod tests {
                     stake_account_pubkey,
                     destination_account_pubkey: stake_account_pubkey,
                     amount: SpendAmount::Some(42_000_000_000),
+                    withdraw_authority: 0,
+                    custodian: None,
+                    sign_only: false,
+                    dump_transaction_message: false,
+                    blockhash_query: BlockhashQuery::All(blockhash_query::Source::Cluster),
+                    nonce_account: None,
+                    nonce_authority: 0,
+                    memo: None,
+                    seed: None,
+                    fee_payer: 0,
+                    compute_unit_price: None,
+                },
+                signers: vec![Box::new(read_keypair_file(&default_keypair_file).unwrap())],
+            }
+        );
+
+        // Test WithdrawStake Subcommand w/ AVAILABLE amount
+        let test_withdraw_stake = test_commands.clone().get_matches_from(vec![
+            "test",
+            "withdraw-stake",
+            &stake_account_string,
+            &stake_account_string,
+            "AVAILABLE",
+        ]);
+
+        assert_eq!(
+            parse_command(&test_withdraw_stake, &default_signer, &mut None).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::WithdrawStake {
+                    stake_account_pubkey,
+                    destination_account_pubkey: stake_account_pubkey,
+                    amount: SpendAmount::Available,
                     withdraw_authority: 0,
                     custodian: None,
                     sign_only: false,

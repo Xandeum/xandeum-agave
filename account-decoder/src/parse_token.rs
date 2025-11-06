@@ -1,54 +1,25 @@
-pub use solana_account_decoder_client_types::token::{
-    real_number_string, real_number_string_trimmed, TokenAccountType, UiAccountState, UiMint,
-    UiMultisig, UiTokenAccount, UiTokenAmount,
-};
 use {
     crate::{
-        parse_account_data::{
-            ParsableAccount, ParseAccountError, SplTokenAdditionalData, SplTokenAdditionalDataV2,
-        },
+        parse_account_data::{ParsableAccount, ParseAccountError, SplTokenAdditionalDataV2},
         parse_token_extension::parse_extension,
     },
+    solana_program_option::COption,
+    solana_program_pack::Pack,
     solana_pubkey::Pubkey,
-    spl_token_2022::{
+    spl_token_2022_interface::{
         extension::{BaseStateWithExtensions, StateWithExtensions},
         generic_token_account::GenericTokenAccount,
-        solana_program::{
-            program_option::COption, program_pack::Pack, pubkey::Pubkey as SplTokenPubkey,
-        },
         state::{Account, AccountState, Mint, Multisig},
     },
     std::str::FromStr,
 };
-
-// Returns all known SPL Token program ids
-pub fn spl_token_ids() -> Vec<Pubkey> {
-    vec![spl_token::id(), spl_token_2022::id()]
-}
-
-// Check if the provided program id as a known SPL Token program id
-pub fn is_known_spl_token_id(program_id: &Pubkey) -> bool {
-    *program_id == spl_token::id() || *program_id == spl_token_2022::id()
-}
-
-#[deprecated(since = "2.0.0", note = "Use `parse_token_v3` instead")]
-#[allow(deprecated)]
-pub fn parse_token(
-    data: &[u8],
-    decimals: Option<u8>,
-) -> Result<TokenAccountType, ParseAccountError> {
-    let additional_data = decimals.map(SplTokenAdditionalData::with_decimals);
-    parse_token_v2(data, additional_data.as_ref())
-}
-
-#[deprecated(since = "2.2.0", note = "Use `parse_token_v3` instead")]
-pub fn parse_token_v2(
-    data: &[u8],
-    additional_data: Option<&SplTokenAdditionalData>,
-) -> Result<TokenAccountType, ParseAccountError> {
-    let additional_data = additional_data.map(|v| (*v).into());
-    parse_token_v3(data, additional_data.as_ref())
-}
+pub use {
+    solana_account_decoder_client_types::token::{
+        real_number_string, real_number_string_trimmed, TokenAccountType, UiAccountState, UiMint,
+        UiMultisig, UiTokenAccount, UiTokenAmount,
+    },
+    spl_generic_token::{is_known_spl_token_id, spl_token_ids},
+};
 
 pub fn parse_token_v3(
     data: &[u8],
@@ -128,7 +99,7 @@ pub fn parse_token_v3(
                 .signers
                 .iter()
                 .filter_map(|pubkey| {
-                    if pubkey != &SplTokenPubkey::default() {
+                    if pubkey != &Pubkey::default() {
                         Some(pubkey.to_string())
                     } else {
                         None
@@ -149,20 +120,6 @@ pub fn convert_account_state(state: AccountState) -> UiAccountState {
         AccountState::Initialized => UiAccountState::Initialized,
         AccountState::Frozen => UiAccountState::Frozen,
     }
-}
-
-#[deprecated(since = "2.0.0", note = "Use `token_amount_to_ui_amount_v3` instead")]
-#[allow(deprecated)]
-pub fn token_amount_to_ui_amount(amount: u64, decimals: u8) -> UiTokenAmount {
-    token_amount_to_ui_amount_v2(amount, &SplTokenAdditionalData::with_decimals(decimals))
-}
-
-#[deprecated(since = "2.2.0", note = "Use `token_amount_to_ui_amount_v3` instead")]
-pub fn token_amount_to_ui_amount_v2(
-    amount: u64,
-    additional_data: &SplTokenAdditionalData,
-) -> UiTokenAmount {
-    token_amount_to_ui_amount_v3(amount, &(*additional_data).into())
 }
 
 pub fn token_amount_to_ui_amount_v3(
@@ -219,7 +176,7 @@ mod test {
         crate::parse_token_extension::{UiMemoTransfer, UiMintCloseAuthority},
         solana_account_decoder_client_types::token::UiExtension,
         spl_pod::optional_keys::OptionalNonZeroPubkey,
-        spl_token_2022::extension::{
+        spl_token_2022_interface::extension::{
             immutable_owner::ImmutableOwner, interest_bearing_mint::InterestBearingConfig,
             memo_transfer::MemoTransfer, mint_close_authority::MintCloseAuthority,
             scaled_ui_amount::ScaledUiAmountConfig, BaseStateWithExtensionsMut, ExtensionType,
@@ -231,8 +188,8 @@ mod test {
 
     #[test]
     fn test_parse_token() {
-        let mint_pubkey = SplTokenPubkey::new_from_array([2; 32]);
-        let owner_pubkey = SplTokenPubkey::new_from_array([3; 32]);
+        let mint_pubkey = Pubkey::new_from_array([2; 32]);
+        let owner_pubkey = Pubkey::new_from_array([3; 32]);
         let mut account_data = vec![0; Account::get_packed_len()];
         let mut account = Account::unpack_unchecked(&account_data).unwrap();
         account.mint = mint_pubkey;
@@ -290,11 +247,11 @@ mod test {
             }),
         );
 
-        let signer1 = SplTokenPubkey::new_from_array([1; 32]);
-        let signer2 = SplTokenPubkey::new_from_array([2; 32]);
-        let signer3 = SplTokenPubkey::new_from_array([3; 32]);
+        let signer1 = Pubkey::new_from_array([1; 32]);
+        let signer2 = Pubkey::new_from_array([2; 32]);
+        let signer3 = Pubkey::new_from_array([3; 32]);
         let mut multisig_data = vec![0; Multisig::get_packed_len()];
-        let mut signers = [SplTokenPubkey::default(); 11];
+        let mut signers = [Pubkey::default(); 11];
         signers[0] = signer1;
         signers[1] = signer2;
         signers[2] = signer3;
@@ -325,7 +282,7 @@ mod test {
 
     #[test]
     fn test_get_token_account_mint() {
-        let mint_pubkey = SplTokenPubkey::new_from_array([2; 32]);
+        let mint_pubkey = Pubkey::new_from_array([2; 32]);
         let mut account_data = vec![0; Account::get_packed_len()];
         let mut account = Account::unpack_unchecked(&account_data).unwrap();
         account.mint = mint_pubkey;
@@ -525,8 +482,8 @@ mod test {
 
     #[test]
     fn test_parse_token_account_with_extensions() {
-        let mint_pubkey = SplTokenPubkey::new_from_array([2; 32]);
-        let owner_pubkey = SplTokenPubkey::new_from_array([3; 32]);
+        let mint_pubkey = Pubkey::new_from_array([2; 32]);
+        let owner_pubkey = Pubkey::new_from_array([3; 32]);
 
         let account_base = Account {
             mint: mint_pubkey,
@@ -625,7 +582,7 @@ mod test {
 
     #[test]
     fn test_parse_token_mint_with_extensions() {
-        let owner_pubkey = SplTokenPubkey::new_from_array([3; 32]);
+        let owner_pubkey = Pubkey::new_from_array([3; 32]);
         let mint_size =
             ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::MintCloseAuthority])
                 .unwrap();

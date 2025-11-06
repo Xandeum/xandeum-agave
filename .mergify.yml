@@ -2,7 +2,7 @@
 pull_request_rules:
   - name: label changes from community
     conditions:
-      - author≠@core-contributors
+      - author≠@anza
       - author≠@monorepo-maintainers
       - author≠@monorepo-write
       - author≠@monorepo-triage
@@ -16,7 +16,7 @@ pull_request_rules:
           - need:merge-assist
   - name: request review for community changes
     conditions:
-      - author≠@core-contributors
+      - author≠@anza
       - author≠@monorepo-maintainers
       - author≠@monorepo-write
       - author≠@monorepo-triage
@@ -36,7 +36,7 @@ pull_request_rules:
           - "@anza-xyz/community-pr-subscribers"
   - name: label changes from monorepo-triage
     conditions:
-      - author≠@core-contributors
+      - author≠@anza
       - author≠mergify[bot]
       - author≠dependabot[bot]
       - author≠github-actions[bot]
@@ -104,9 +104,9 @@ pull_request_rules:
           - automerge
       comment:
         message: automerge label removed due to a CI failure
-  - name: v2.0 feature-gate backport
+  - name: v2.2 feature-gate backport
     conditions:
-      - label=v2.0
+      - label=v2.2
       - label=feature-gate
     actions:
       backport:
@@ -117,10 +117,10 @@ pull_request_rules:
         labels:
           - feature-gate
         branches:
-          - v2.0
-  - name: v2.0 non-feature-gate backport
+          - v2.2
+  - name: v2.2 non-feature-gate backport
     conditions:
-      - label=v2.0
+      - label=v2.2
       - label!=feature-gate
     actions:
       backport:
@@ -128,10 +128,10 @@ pull_request_rules:
         title: "{{ destination_branch }}: {{ title }} (backport of #{{ number }})"
         ignore_conflicts: true
         branches:
-          - v2.0
-  - name: v2.0 backport warning comment
+          - v2.2
+  - name: v2.2 backport warning comment
     conditions:
-      - label=v2.0
+      - label=v2.2
     actions:
       comment:
         message: >
@@ -142,9 +142,9 @@ pull_request_rules:
           refactoring, plumbing, cleanup, etc that are not strictly
           necessary to achieve the goal. Any of the latter should go only
           into master and ride the normal stabilization schedule.
-  - name: v2.1 feature-gate backport
+  - name: v2.3 feature-gate backport
     conditions:
-      - label=v2.1
+      - label=v2.3
       - label=feature-gate
     actions:
       backport:
@@ -154,10 +154,10 @@ pull_request_rules:
         labels:
           - feature-gate
         branches:
-          - v2.1
-  - name: v2.1 non-feature-gate backport
+          - v2.3
+  - name: v2.3 non-feature-gate backport
     conditions:
-      - label=v2.1
+      - label=v2.3
       - label!=feature-gate
     actions:
       backport:
@@ -165,10 +165,10 @@ pull_request_rules:
         title: "{{ destination_branch }}: {{ title }} (backport of #{{ number }})"
         ignore_conflicts: true
         branches:
-          - v2.1
-  - name: v2.1 backport warning comment
+          - v2.3
+  - name: v2.3 backport warning comment
     conditions:
-      - label=v2.1
+      - label=v2.3
     actions:
       comment:
         message: >
@@ -193,7 +193,7 @@ pull_request_rules:
           If this PR represents a change to the public RPC API:
 
           1. Make sure it includes a complementary update to `rpc-client/` ([example](https://github.com/solana-labs/solana/pull/29558/files))
-          2. Open a follow-up PR to update the JavaScript client `@solana/web3.js` ([example](https://github.com/solana-labs/solana-web3.js/pull/2868/files))
+          2. Open a follow-up PR to update the JavaScript client `@solana/kit` ([example](https://github.com/solana-labs/solana-web3.js/pull/2868/files))
 
           Thank you for keeping the RPC clients in sync with the server API @{{author}}.
   - name: Reminder to add Firedancer team to changes in `programs/`
@@ -217,10 +217,24 @@ pull_request_rules:
           If this PR represents a change to a native program implementation (not
           tests), please include a reviewer from the Firedancer team. And please
           keep refactors to a minimum.
+  - name: Notify about future move of zk-keygen, zk-sdk, and zk-token-sdk
+    conditions:
+      - or:
+        - files~=^zk-keygen/
+        - files~=^zk-sdk/
+        - files~=^zk-token-sdk/
+    actions:
+      comment:
+        message: |
+          For your information, the `zk-keygen` and `zk-sdk` directories are
+          scheduled to be relocated to `solana-program/zk-elgamal-proof` in a
+          separate repository. Additionally, the `zk-token-sdk` directory will
+          be removed. Please take these upcoming changes into account when
+          making modifications.
 
 commands_restrictions:
   # The author of copied PRs is the Mergify user.
   # Restrict `copy` access to Core Contributors
   copy:
     conditions:
-    - author=@core-contributors
+    - author=@anza

@@ -1,10 +1,8 @@
 use {
+    solana_clock::NUM_CONSECUTIVE_LEADER_SLOTS,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol},
     solana_poh::poh_recorder::PohRecorder,
-    solana_sdk::{
-        clock::{Slot, NUM_CONSECUTIVE_LEADER_SLOTS},
-        pubkey::Pubkey,
-    },
+    solana_pubkey::Pubkey,
     solana_send_transaction_service::tpu_info::TpuInfo,
     std::{
         collections::HashMap,
@@ -85,39 +83,6 @@ impl TpuInfo for ClusterTpuInfo {
             })
             .collect()
     }
-
-    fn get_leader_tpus_with_slots(
-        &self,
-        max_count: u64,
-        protocol: Protocol,
-    ) -> Vec<(&SocketAddr, Slot)> {
-        let recorder = self.poh_recorder.read().unwrap();
-        let leaders: Vec<_> = (0..max_count)
-            .rev()
-            .filter_map(|future_slot| {
-                NUM_CONSECUTIVE_LEADER_SLOTS
-                    .checked_mul(future_slot)
-                    .and_then(|slots_in_the_future| {
-                        recorder.leader_and_slot_after_n_slots(slots_in_the_future)
-                    })
-            })
-            .collect();
-        drop(recorder);
-        let addrs_to_slots = leaders
-            .into_iter()
-            .filter_map(|(leader_id, leader_slot)| {
-                self.recent_peers
-                    .get(&leader_id)
-                    .map(|(udp_tpu, quic_tpu)| match protocol {
-                        Protocol::UDP => (udp_tpu, leader_slot),
-                        Protocol::QUIC => (quic_tpu, leader_slot),
-                    })
-            })
-            .collect::<HashMap<_, _>>();
-        let mut unique_leaders = Vec::from_iter(addrs_to_slots);
-        unique_leaders.sort_by_key(|(_addr, slot)| *slot);
-        unique_leaders
-    }
 }
 
 #[cfg(test)]
@@ -125,23 +90,22 @@ mod test {
     use {
         super::*,
         solana_gossip::contact_info::ContactInfo,
+        solana_keypair::Keypair,
         solana_ledger::{
             blockstore::Blockstore, get_tmp_ledger_path_auto_delete,
             leader_schedule_cache::LeaderScheduleCache,
         },
+        solana_poh_config::PohConfig,
+        solana_quic_definitions::QUIC_PORT_OFFSET,
         solana_runtime::{
             bank::Bank,
             genesis_utils::{
                 create_genesis_config_with_vote_accounts, GenesisConfigInfo, ValidatorVoteKeypairs,
             },
         },
-        solana_sdk::{
-            poh_config::PohConfig,
-            quic::QUIC_PORT_OFFSET,
-            signature::{Keypair, Signer},
-            timing::timestamp,
-        },
+        solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
+        solana_time_utils::timestamp,
         std::{net::Ipv4Addr, sync::atomic::AtomicBool},
     };
 
@@ -171,7 +135,7 @@ mod test {
         );
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
 
-        let (poh_recorder, _entry_receiver, _record_receiver) = PohRecorder::new(
+        let (poh_recorder, _entry_receiver) = PohRecorder::new(
             0,
             bank.last_blockhash(),
             bank.clone(),
@@ -233,7 +197,7 @@ mod test {
         );
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
 
-        let (poh_recorder, _entry_receiver, _record_receiver) = PohRecorder::new(
+        let (poh_recorder, _entry_receiver) = PohRecorder::new(
             0,
             bank.last_blockhash(),
             bank.clone(),

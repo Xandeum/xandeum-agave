@@ -17,12 +17,11 @@ use {
     solana_packet::Meta,
     solana_perf::{
         cuda_runtime::PinnedVec,
-        packet::{Packet, PacketBatch, PacketBatchRecycler, PACKETS_PER_BATCH},
+        packet::{Packet, PacketBatch, PacketBatchRecycler, PinnedPacketBatch, PACKETS_PER_BATCH},
         perf_libs,
         recycler::Recycler,
         sigverify,
     },
-    solana_rayon_threadlimit::get_max_thread_count,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_transaction::{
         versioned::VersionedTransaction, Transaction, TransactionVerificationMode,
@@ -112,10 +111,10 @@ pub struct Api<'a> {
 /// * For TPU: `solana_core::banking_stage::BankingStage::process_and_record_transactions()`
 /// * For TVU: `solana_core::replay_stage::ReplayStage::replay_blockstore_into_bank()`
 ///
+/// Until SIMD83 is activated:
 /// All transactions in the `transactions` field have to follow the read/write locking restrictions
 /// with regard to the accounts they reference. A single account can be either written by a single
 /// transaction, or read by one or more transactions, but not both.
-///
 /// This enforcement is done via a call to `solana_runtime::accounts::Accounts::lock_accounts()`
 /// with the `txs` argument holding all the `transactions` in the `Entry`.
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone)]
@@ -490,10 +489,7 @@ fn start_verify_transactions_gpu<Tx: TransactionWithMeta + Send + Sync + 'static
 ) -> Result<EntrySigVerificationState<Tx>> {
     let verify_func = {
         move |versioned_tx: VersionedTransaction| -> Result<Tx> {
-            verify(
-                versioned_tx,
-                TransactionVerificationMode::HashAndVerifyPrecompiles,
-            )
+            verify(versioned_tx, TransactionVerificationMode::HashOnly)
         }
     };
 
@@ -522,7 +518,7 @@ fn start_verify_transactions_gpu<Tx: TransactionWithMeta + Send + Sync + 'static
             .par_chunks(PACKETS_PER_BATCH)
             .map(|transaction_chunk| {
                 let num_transactions = transaction_chunk.len();
-                let mut packet_batch = PacketBatch::new_with_recycler(
+                let mut packet_batch = PinnedPacketBatch::new_with_recycler(
                     &verify_recyclers.packet_recycler,
                     num_transactions,
                     "entry-sig-verify",
@@ -547,7 +543,7 @@ fn start_verify_transactions_gpu<Tx: TransactionWithMeta + Send + Sync + 'static
                         Packet::populate_packet(packet, None, &tx).is_ok()
                     });
                 if res {
-                    Ok(packet_batch)
+                    Ok(PacketBatch::from(packet_batch))
                 } else {
                     Err(TransactionError::SanitizeFailure)
                 }
@@ -962,9 +958,10 @@ pub fn thread_pool_for_tests() -> ThreadPool {
         .expect("new rayon threadpool")
 }
 
+#[cfg(feature = "dev-context-only-utils")]
 pub fn thread_pool_for_benches() -> ThreadPool {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(get_max_thread_count())
+        .num_threads(num_cpus::get())
         .thread_name(|i| format!("solEntryBnch{i:02}"))
         .build()
         .expect("new rayon threadpool")
@@ -974,12 +971,12 @@ pub fn thread_pool_for_benches() -> ThreadPool {
 mod tests {
     use {
         super::*,
+        agave_reserved_account_keys::ReservedAccountKeys,
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_message::SimpleAddressLoader,
         solana_perf::test_tx::{test_invalid_tx, test_tx},
         solana_pubkey::Pubkey,
-        solana_reserved_account_keys::ReservedAccountKeys,
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_sha256_hasher::hash,
         solana_signer::Signer,

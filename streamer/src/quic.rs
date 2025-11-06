@@ -19,6 +19,7 @@ use {
     solana_tls_utils::{new_dummy_x509_certificate, tls_server_config_builder},
     std::{
         net::UdpSocket,
+        num::NonZeroUsize,
         sync::{
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc, Mutex, RwLock,
@@ -32,24 +33,12 @@ use {
 // allow multiple connections for NAT and any open/close overlap
 pub const DEFAULT_MAX_QUIC_CONNECTIONS_PER_PEER: usize = 8;
 
-#[deprecated(
-    since = "2.2.0",
-    note = "Use solana_streamer::quic::DEFAULT_MAX_STAKED_CONNECTIONS"
-)]
-pub const MAX_STAKED_CONNECTIONS: usize = 2000;
-
 pub const DEFAULT_MAX_STAKED_CONNECTIONS: usize = 2000;
-
-#[deprecated(
-    since = "2.2.0",
-    note = "Use solana_streamer::quic::DEFAULT_MAX_UNSTAKED_CONNECTIONS"
-)]
-pub const MAX_UNSTAKED_CONNECTIONS: usize = 500;
 
 pub const DEFAULT_MAX_UNSTAKED_CONNECTIONS: usize = 500;
 
-/// Limit to 250K PPS
-pub const DEFAULT_MAX_STREAMS_PER_MS: u64 = 250;
+/// Limit to 500K PPS
+pub const DEFAULT_MAX_STREAMS_PER_MS: u64 = 500;
 
 /// The new connections per minute from a particular IP address.
 /// Heuristically set to the default maximum concurrent connections
@@ -58,8 +47,20 @@ pub const DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE: u64 = 8;
 
 // This will be adjusted and parameterized in follow-on PRs.
 pub const DEFAULT_QUIC_ENDPOINTS: usize = 1;
-// inlined to avoid solana-sdk dep
-pub(crate) const DEFAULT_TPU_COALESCE: Duration = Duration::from_millis(5);
+
+pub const DEFAULT_TPU_COALESCE: Duration = Duration::from_millis(5);
+
+pub fn default_num_tpu_transaction_forward_receive_threads() -> usize {
+    num_cpus::get().min(16)
+}
+
+pub fn default_num_tpu_transaction_receive_threads() -> usize {
+    num_cpus::get().min(8)
+}
+
+pub fn default_num_tpu_vote_transaction_receive_threads() -> usize {
+    num_cpus::get().min(8)
+}
 
 pub struct SpawnServerResult {
     pub endpoints: Vec<Endpoint>,
@@ -68,7 +69,7 @@ pub struct SpawnServerResult {
 }
 
 /// Controls the the channel size for the PacketBatch coalesce
-pub(crate) const DEFAULT_MAX_COALESCE_CHANNEL_SIZE: usize = 1_000_000;
+pub(crate) const DEFAULT_MAX_COALESCE_CHANNEL_SIZE: usize = 250_000;
 
 /// Returns default server configuration along with its PEM certificate chain.
 #[allow(clippy::field_reassign_with_default)] // https://github.com/rust-lang/rust-clippy/issues/6527
@@ -114,9 +115,10 @@ pub(crate) fn configure_server(
     Ok((server_config, cert_chain_pem))
 }
 
-pub fn rt(name: String) -> Runtime {
+fn rt(name: String, num_threads: NonZeroUsize) -> Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .thread_name(name)
+        .worker_threads(num_threads.get())
         .enable_all()
         .build()
         .unwrap()
@@ -160,6 +162,8 @@ pub struct StreamerStats {
     pub(crate) total_unstaked_chunks_received: AtomicUsize,
     pub(crate) total_packet_batch_send_err: AtomicUsize,
     pub(crate) total_handle_chunk_to_packet_batcher_send_err: AtomicUsize,
+    pub(crate) total_handle_chunk_to_packet_batcher_send_full_err: AtomicUsize,
+    pub(crate) total_handle_chunk_to_packet_batcher_send_disconnected_err: AtomicUsize,
     pub(crate) total_packet_batches_sent: AtomicUsize,
     pub(crate) total_packet_batches_none: AtomicUsize,
     pub(crate) total_packets_sent_for_batching: AtomicUsize,
@@ -448,6 +452,18 @@ impl StreamerStats {
                 i64
             ),
             (
+                "handle_chunk_to_packet_batcher_send_full_err",
+                self.total_handle_chunk_to_packet_batcher_send_full_err
+                    .swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
+                "handle_chunk_to_packet_batcher_send_disconnected_err",
+                self.total_handle_chunk_to_packet_batcher_send_disconnected_err
+                    .swap(0, Ordering::Relaxed),
+                i64
+            ),
+            (
                 "packet_batches_sent",
                 self.total_packet_batches_sent.swap(0, Ordering::Relaxed),
                 i64
@@ -566,20 +582,21 @@ impl StreamerStats {
     }
 }
 
-pub fn spawn_server(
+#[deprecated(since = "3.0.0", note = "Use spawn_server instead")]
+pub fn spawn_server_multi(
     thread_name: &'static str,
     metrics_name: &'static str,
-    socket: UdpSocket,
+    sockets: Vec<UdpSocket>,
     keypair: &Keypair,
     packet_sender: Sender<PacketBatch>,
     exit: Arc<AtomicBool>,
     staked_nodes: Arc<RwLock<StakedNodes>>,
     quic_server_params: QuicServerParams,
 ) -> Result<SpawnServerResult, QuicServerError> {
-    spawn_server_multi(
+    spawn_server(
         thread_name,
         metrics_name,
-        vec![socket],
+        sockets,
         keypair,
         packet_sender,
         exit,
@@ -598,6 +615,7 @@ pub struct QuicServerParams {
     pub wait_for_chunk_timeout: Duration,
     pub coalesce: Duration,
     pub coalesce_channel_size: usize,
+    pub num_threads: NonZeroUsize,
 }
 
 impl Default for QuicServerParams {
@@ -611,24 +629,40 @@ impl Default for QuicServerParams {
             wait_for_chunk_timeout: DEFAULT_WAIT_FOR_CHUNK_TIMEOUT,
             coalesce: DEFAULT_TPU_COALESCE,
             coalesce_channel_size: DEFAULT_MAX_COALESCE_CHANNEL_SIZE,
+            num_threads: NonZeroUsize::new(num_cpus::get().min(1)).expect("1 is non-zero"),
         }
     }
 }
 
-pub fn spawn_server_multi(
+#[cfg(feature = "dev-context-only-utils")]
+impl QuicServerParams {
+    pub const DEFAULT_NUM_SERVER_THREADS_FOR_TEST: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+
+    pub fn default_for_tests() -> Self {
+        // Shrink the channel size to avoid a massive allocation for tests
+        Self {
+            coalesce_channel_size: 100_000,
+            num_threads: Self::DEFAULT_NUM_SERVER_THREADS_FOR_TEST,
+            ..Self::default()
+        }
+    }
+}
+
+/// Spawns a tokio runtime and a streamer instance inside it.
+pub fn spawn_server(
     thread_name: &'static str,
     metrics_name: &'static str,
-    sockets: Vec<UdpSocket>,
+    sockets: impl IntoIterator<Item = UdpSocket>,
     keypair: &Keypair,
     packet_sender: Sender<PacketBatch>,
     exit: Arc<AtomicBool>,
     staked_nodes: Arc<RwLock<StakedNodes>>,
     quic_server_params: QuicServerParams,
 ) -> Result<SpawnServerResult, QuicServerError> {
-    let runtime = rt(format!("{thread_name}Rt"));
+    let runtime = rt(format!("{thread_name}Rt"), quic_server_params.num_threads);
     let result = {
         let _guard = runtime.enter();
-        crate::nonblocking::quic::spawn_server_multi(
+        crate::nonblocking::quic::spawn_server(
             metrics_name,
             sockets,
             keypair,
@@ -642,7 +676,7 @@ pub fn spawn_server_multi(
         .name(thread_name.into())
         .spawn(move || {
             if let Err(e) = runtime.block_on(result.thread) {
-                warn!("error from runtime.block_on: {:?}", e);
+                warn!("error from runtime.block_on: {e:?}");
             }
         })
         .unwrap();
@@ -662,9 +696,16 @@ mod test {
         super::*,
         crate::nonblocking::{quic::test::*, testing_utilities::check_multiple_streams},
         crossbeam_channel::unbounded,
-        solana_net_utils::bind_to_localhost,
+        solana_net_utils::sockets::bind_to_localhost_unique,
         std::net::SocketAddr,
     };
+
+    fn rt_for_test() -> Runtime {
+        rt(
+            "solQuicTestRt".to_string(),
+            QuicServerParams::DEFAULT_NUM_SERVER_THREADS_FOR_TEST,
+        )
+    }
 
     fn setup_quic_server() -> (
         std::thread::JoinHandle<()>,
@@ -672,7 +713,7 @@ mod test {
         crossbeam_channel::Receiver<PacketBatch>,
         SocketAddr,
     ) {
-        let s = bind_to_localhost().unwrap();
+        let s = bind_to_localhost_unique().expect("should bind");
         let exit = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = unbounded();
         let keypair = Keypair::new();
@@ -685,15 +726,12 @@ mod test {
         } = spawn_server(
             "solQuicTest",
             "quic_streamer_test",
-            s,
+            [s],
             &keypair,
             sender,
             exit.clone(),
             staked_nodes,
-            QuicServerParams {
-                coalesce_channel_size: 100_000, // smaller channel size for faster test
-                ..Default::default()
-            },
+            QuicServerParams::default_for_tests(),
         )
         .unwrap();
         (t, exit, receiver, server_address)
@@ -710,7 +748,7 @@ mod test {
     fn test_quic_timeout() {
         solana_logger::setup();
         let (t, exit, receiver, server_address) = setup_quic_server();
-        let runtime = rt("solQuicTestRt".to_string());
+        let runtime = rt_for_test();
         runtime.block_on(check_timeout(receiver, server_address));
         exit.store(true, Ordering::Relaxed);
         t.join().unwrap();
@@ -721,7 +759,7 @@ mod test {
         solana_logger::setup();
         let (t, exit, _receiver, server_address) = setup_quic_server();
 
-        let runtime = rt("solQuicTestRt".to_string());
+        let runtime = rt_for_test();
         runtime.block_on(check_block_multiple_connections(server_address));
         exit.store(true, Ordering::Relaxed);
         t.join().unwrap();
@@ -730,7 +768,7 @@ mod test {
     #[test]
     fn test_quic_server_multiple_streams() {
         solana_logger::setup();
-        let s = bind_to_localhost().unwrap();
+        let s = bind_to_localhost_unique().expect("should bind");
         let exit = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = unbounded();
         let keypair = Keypair::new();
@@ -743,20 +781,19 @@ mod test {
         } = spawn_server(
             "solQuicTest",
             "quic_streamer_test",
-            s,
+            [s],
             &keypair,
             sender,
             exit.clone(),
             staked_nodes,
             QuicServerParams {
                 max_connections_per_peer: 2,
-                coalesce_channel_size: 100_000, // smaller channel size for faster test
-                ..QuicServerParams::default()
+                ..QuicServerParams::default_for_tests()
             },
         )
         .unwrap();
 
-        let runtime = rt("solQuicTestRt".to_string());
+        let runtime = rt_for_test();
         runtime.block_on(check_multiple_streams(receiver, server_address, None));
         exit.store(true, Ordering::Relaxed);
         t.join().unwrap();
@@ -767,7 +804,7 @@ mod test {
         solana_logger::setup();
         let (t, exit, receiver, server_address) = setup_quic_server();
 
-        let runtime = rt("solQuicTestRt".to_string());
+        let runtime = rt_for_test();
         runtime.block_on(check_multiple_writes(receiver, server_address, None));
         exit.store(true, Ordering::Relaxed);
         t.join().unwrap();
@@ -776,7 +813,7 @@ mod test {
     #[test]
     fn test_quic_server_unstaked_node_connect_failure() {
         solana_logger::setup();
-        let s = bind_to_localhost().unwrap();
+        let s = bind_to_localhost_unique().expect("should bind");
         let exit = Arc::new(AtomicBool::new(false));
         let (sender, _) = unbounded();
         let keypair = Keypair::new();
@@ -789,27 +826,21 @@ mod test {
         } = spawn_server(
             "solQuicTest",
             "quic_streamer_test",
-            s,
+            [s],
             &keypair,
             sender,
             exit.clone(),
             staked_nodes,
             QuicServerParams {
                 max_unstaked_connections: 0,
-                coalesce_channel_size: 100_000, // smaller channel size for faster test
-                ..QuicServerParams::default()
+                ..QuicServerParams::default_for_tests()
             },
         )
         .unwrap();
 
-        let runtime = rt("solQuicTestRt".to_string());
+        let runtime = rt_for_test();
         runtime.block_on(check_unstaked_node_connect_failure(server_address));
         exit.store(true, Ordering::Relaxed);
         t.join().unwrap();
-    }
-
-    #[test]
-    fn test_inline_tpu_coalesce() {
-        assert_eq!(DEFAULT_TPU_COALESCE, solana_sdk::net::DEFAULT_TPU_COALESCE);
     }
 }

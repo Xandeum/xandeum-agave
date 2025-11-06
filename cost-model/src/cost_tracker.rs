@@ -4,7 +4,10 @@
 //! - add_transaction_cost(&tx_cost), mutable function to accumulate tx_cost to tracker.
 //!
 use {
-    crate::{block_cost_limits::*, transaction_cost::TransactionCost},
+    crate::{
+        block_cost_limits::*, cost_tracker_post_analysis::CostTrackerPostAnalysis,
+        transaction_cost::TransactionCost,
+    },
     solana_metrics::datapoint_info,
     solana_pubkey::Pubkey,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
@@ -131,9 +134,19 @@ impl CostTracker {
         self.in_flight_transaction_count = Saturating(0);
     }
 
+    /// Get the overall account limit.
+    pub fn get_account_limit(&self) -> u64 {
+        self.account_cost_limit
+    }
+
     /// Get the overall block limit.
     pub fn get_block_limit(&self) -> u64 {
         self.block_cost_limit
+    }
+
+    /// Get the overall vote limit.
+    pub fn get_vote_limit(&self) -> u64 {
+        self.vote_cost_limit
     }
 
     /// allows to adjust limits initiated during construction
@@ -216,7 +229,13 @@ impl CostTracker {
         self.transaction_count.0
     }
 
-    pub fn report_stats(&self, bank_slot: solana_clock::Slot) {
+    pub fn report_stats(
+        &self,
+        bank_slot: solana_clock::Slot,
+        is_leader: bool,
+        total_transaction_fee: u64,
+        total_priority_fee: u64,
+    ) {
         // skip reporting if block is empty
         if self.transaction_count.0 == 0 {
             return;
@@ -226,13 +245,14 @@ impl CostTracker {
 
         datapoint_info!(
             "cost_tracker_stats",
-            ("bank_slot", bank_slot as i64, i64),
-            ("block_cost", self.block_cost as i64, i64),
-            ("vote_cost", self.vote_cost as i64, i64),
-            ("transaction_count", self.transaction_count.0 as i64, i64),
-            ("number_of_accounts", self.number_of_accounts() as i64, i64),
+            "is_leader" => is_leader.to_string(),
+            ("bank_slot", bank_slot, i64),
+            ("block_cost", self.block_cost, i64),
+            ("vote_cost", self.vote_cost, i64),
+            ("transaction_count", self.transaction_count.0, i64),
+            ("number_of_accounts", self.number_of_accounts(), i64),
             ("costliest_account", costliest_account.to_string(), String),
-            ("costliest_account_cost", costliest_account_cost as i64, i64),
+            ("costliest_account_cost", costliest_account_cost, i64),
             (
                 "allocated_accounts_data_size",
                 self.allocated_accounts_data_size.0,
@@ -262,7 +282,9 @@ impl CostTracker {
                 "secp256r1_instruction_signature_count",
                 self.secp256r1_instruction_signature_count.0,
                 i64
-            )
+            ),
+            ("total_transaction_fee", total_transaction_fee, i64),
+            ("total_priority_fee", total_priority_fee, i64),
         );
     }
 
@@ -396,6 +418,15 @@ impl CostTracker {
             .values()
             .filter(|units| **units > 0)
             .count()
+    }
+}
+
+/// Implement the trait for the cost tracker
+/// This is only used for post-analysis to avoid lock contention
+/// Do not use in the hot path
+impl CostTrackerPostAnalysis for CostTracker {
+    fn get_cost_by_writable_accounts(&self) -> &HashMap<Pubkey, u64, ahash::RandomState> {
+        &self.cost_by_writable_accounts
     }
 }
 
@@ -963,5 +994,21 @@ mod tests {
         assert_eq!(0, cost_tracker.block_cost);
         assert_eq!(0, cost_tracker.vote_cost);
         assert_eq!(0, cost_tracker.allocated_accounts_data_size.0);
+    }
+
+    #[test]
+    fn test_get_cost_by_writable_accounts_post_analysis() {
+        let mut cost_tracker = CostTracker::default();
+        let cost = 100u64;
+        let transaction = WritableKeysTransaction(vec![Pubkey::new_unique()]);
+        let tx_cost = simple_transaction_cost(&transaction, cost);
+        cost_tracker.add_transaction_cost(&tx_cost);
+        let cost_by_writable_accounts = cost_tracker.get_cost_by_writable_accounts();
+        assert_eq!(1, cost_by_writable_accounts.len());
+        assert_eq!(cost, *cost_by_writable_accounts.values().next().unwrap());
+        assert_eq!(
+            *cost_by_writable_accounts,
+            cost_tracker.cost_by_writable_accounts
+        );
     }
 }

@@ -8,16 +8,15 @@ use {
         send_batch::{generate_durable_nonce_accounts, generate_keypairs},
     },
     solana_client::connection_cache::ConnectionCache,
+    solana_commitment_config::CommitmentConfig,
+    solana_fee_calculator::FeeRateGovernor,
     solana_genesis::Base64Account,
+    solana_keypair::Keypair,
+    solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        fee_calculator::FeeRateGovernor,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        system_program,
-    },
+    solana_signer::Signer,
     solana_streamer::streamer::StakedNodes,
+    solana_system_interface::program as system_program,
     solana_tps_client::TpsClient,
     solana_tpu_client::tpu_client::{TpuClient, TpuClientConfig},
     std::{
@@ -30,6 +29,10 @@ use {
         sync::{Arc, RwLock},
     },
 };
+
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 /// Number of signatures for all transactions in ~1 week at ~100K TPS
 pub const NUM_SIGNATURES_FOR_TXS: u64 = 100_000 * 60 * 60 * 24 * 7;
@@ -44,7 +47,7 @@ fn find_node_activated_stake(
 ) -> Result<(u64, u64), ()> {
     let vote_accounts = rpc_client.get_vote_accounts();
     if let Err(error) = vote_accounts {
-        error!("Failed to get vote accounts, error: {}", error);
+        error!("Failed to get vote accounts, error: {error}");
         return Err(());
     }
 
@@ -204,7 +207,7 @@ fn main() {
 
     let keypair_count = *tx_count * keypair_multiplier;
     if *write_to_client_file {
-        info!("Generating {} keypairs", keypair_count);
+        info!("Generating {keypair_count} keypairs");
         let (keypairs, _) = generate_keypairs(id, keypair_count as u64);
         let num_accounts = keypairs.len() as u64;
         let max_fee = FeeRateGovernor::new(*target_lamports_per_signature, 0)
@@ -225,7 +228,7 @@ fn main() {
             );
         });
 
-        info!("Writing {}", client_ids_and_stake_file);
+        info!("Writing {client_ids_and_stake_file}");
         let serialized = serde_yaml::to_string(&accounts).unwrap();
         let path = Path::new(&client_ids_and_stake_file);
         let mut file = File::create(path).unwrap();
@@ -256,7 +259,12 @@ fn main() {
         );
         client
             .get_account(&instruction_padding_config.program_id)
-            .expect("Instruction padding program must be deployed to this cluster. Deploy the program using `solana program deploy ./bench-tps/tests/fixtures/spl_instruction_padding.so` and pass the resulting program id with `--instruction-padding-program-id`");
+            .expect(
+                "Instruction padding program must be deployed to this cluster. Deploy the program \
+                 using `solana program deploy \
+                 ./bench-tps/tests/fixtures/spl_instruction_padding.so` and pass the resulting \
+                 program id with `--instruction-padding-program-id`",
+            );
     }
     let keypairs = get_keypairs(
         client.clone(),

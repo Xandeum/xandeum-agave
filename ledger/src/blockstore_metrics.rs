@@ -5,7 +5,7 @@ use {
         PerfContext,
     },
     solana_metrics::datapoint_info,
-    solana_sdk::timing::timestamp,
+    solana_time_utils::timestamp,
     std::{
         cell::RefCell,
         fmt::Debug,
@@ -318,7 +318,7 @@ pub struct BlockstoreRocksDbColumnFamilyMetrics {
 
     // FIFO Compaction related
 
-    // returns an estimation of the oldest key timestamp in the DB. Only vailable
+    // returns an estimation of the oldest key timestamp in the DB. Only available
     // for FIFO compaction with compaction_options_fifo.allow_compaction = false.
     // RocksDB's internal property key: "rocksdb.estimate-oldest-key-time"
     pub estimate_oldest_key_time: i64,

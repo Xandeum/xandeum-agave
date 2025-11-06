@@ -22,16 +22,17 @@ use {
         parse_accounts::{parse_legacy_message_accounts, parse_v0_message_accounts},
         parse_instruction::parse,
     },
+    agave_reserved_account_keys::ReservedAccountKeys,
     base64::{prelude::BASE64_STANDARD, Engine},
     solana_clock::{Slot, UnixTimestamp},
     solana_hash::Hash,
+    solana_instruction::TRANSACTION_LEVEL_STACK_HEIGHT,
     solana_message::{
         compiled_instruction::CompiledInstruction,
         v0::{self, LoadedAddresses, LoadedMessage},
         AccountKeys, Message, VersionedMessage,
     },
     solana_pubkey::Pubkey,
-    solana_reserved_account_keys::ReservedAccountKeys,
     solana_signature::Signature,
     solana_transaction::{
         versioned::{TransactionVersion, VersionedTransaction},
@@ -42,8 +43,6 @@ use {
     thiserror::Error,
 };
 
-#[macro_use]
-extern crate lazy_static;
 #[macro_use]
 extern crate serde_derive;
 
@@ -164,8 +163,8 @@ fn build_simple_ui_transaction_status_meta(
     show_rewards: bool,
 ) -> UiTransactionStatusMeta {
     UiTransactionStatusMeta {
-        err: meta.status.clone().err(),
-        status: meta.status,
+        err: meta.status.clone().map_err(Into::into).err(),
+        status: meta.status.map_err(Into::into),
         fee: meta.fee,
         pre_balances: meta.pre_balances,
         post_balances: meta.post_balances,
@@ -187,6 +186,7 @@ fn build_simple_ui_transaction_status_meta(
         loaded_addresses: OptionSerializer::Skip,
         return_data: OptionSerializer::Skip,
         compute_units_consumed: OptionSerializer::Skip,
+        cost_units: OptionSerializer::Skip,
     }
 }
 
@@ -197,8 +197,8 @@ fn parse_ui_transaction_status_meta(
 ) -> UiTransactionStatusMeta {
     let account_keys = AccountKeys::new(static_keys, Some(&meta.loaded_addresses));
     UiTransactionStatusMeta {
-        err: meta.status.clone().err(),
-        status: meta.status,
+        err: meta.status.clone().map_err(Into::into).err(),
+        status: meta.status.map_err(Into::into),
         fee: meta.fee,
         pre_balances: meta.pre_balances,
         post_balances: meta.post_balances,
@@ -225,6 +225,7 @@ fn parse_ui_transaction_status_meta(
             meta.return_data.map(|return_data| return_data.into()),
         ),
         compute_units_consumed: OptionSerializer::or_skip(meta.compute_units_consumed),
+        cost_units: OptionSerializer::or_skip(meta.cost_units),
     }
 }
 
@@ -741,7 +742,13 @@ impl Encodable for Message {
                 instructions: self
                     .instructions
                     .iter()
-                    .map(|instruction| parse_ui_instruction(instruction, &account_keys, None))
+                    .map(|instruction| {
+                        parse_ui_instruction(
+                            instruction,
+                            &account_keys,
+                            Some(TRANSACTION_LEVEL_STACK_HEIGHT as u32),
+                        )
+                    })
                     .collect(),
                 address_table_lookups: None,
             })
@@ -753,7 +760,9 @@ impl Encodable for Message {
                 instructions: self
                     .instructions
                     .iter()
-                    .map(|ix| UiCompiledInstruction::from(ix, None))
+                    .map(|ix| {
+                        UiCompiledInstruction::from(ix, Some(TRANSACTION_LEVEL_STACK_HEIGHT as u32))
+                    })
                     .collect(),
                 address_table_lookups: None,
             })
@@ -775,7 +784,13 @@ impl Encodable for v0::Message {
                 instructions: self
                     .instructions
                     .iter()
-                    .map(|instruction| parse_ui_instruction(instruction, &account_keys, None))
+                    .map(|instruction| {
+                        parse_ui_instruction(
+                            instruction,
+                            &account_keys,
+                            Some(TRANSACTION_LEVEL_STACK_HEIGHT as u32),
+                        )
+                    })
                     .collect(),
                 address_table_lookups: None,
             })
@@ -787,7 +802,9 @@ impl Encodable for v0::Message {
                 instructions: self
                     .instructions
                     .iter()
-                    .map(|ix| UiCompiledInstruction::from(ix, None))
+                    .map(|ix| {
+                        UiCompiledInstruction::from(ix, Some(TRANSACTION_LEVEL_STACK_HEIGHT as u32))
+                    })
                     .collect(),
                 address_table_lookups: None,
             })
@@ -816,7 +833,13 @@ impl EncodableWithMeta for v0::Message {
                 instructions: self
                     .instructions
                     .iter()
-                    .map(|instruction| parse_ui_instruction(instruction, &account_keys, None))
+                    .map(|instruction| {
+                        parse_ui_instruction(
+                            instruction,
+                            &account_keys,
+                            Some(TRANSACTION_LEVEL_STACK_HEIGHT as u32),
+                        )
+                    })
                     .collect(),
                 address_table_lookups: Some(
                     self.address_table_lookups.iter().map(Into::into).collect(),
@@ -834,7 +857,9 @@ impl EncodableWithMeta for v0::Message {
             instructions: self
                 .instructions
                 .iter()
-                .map(|ix| UiCompiledInstruction::from(ix, None))
+                .map(|ix| {
+                    UiCompiledInstruction::from(ix, Some(TRANSACTION_LEVEL_STACK_HEIGHT as u32))
+                })
                 .collect(),
             address_table_lookups: Some(
                 self.address_table_lookups.iter().map(Into::into).collect(),
@@ -876,24 +901,26 @@ mod test {
             },
             return_data: None,
             compute_units_consumed: None,
+            cost_units: None,
         };
+        #[rustfmt::skip]
         let expected_json_output_value: serde_json::Value = serde_json::from_str(
             "{\
-            \"err\":null,\
-            \"status\":{\"Ok\":null},\
-            \"fee\":1234,\
-            \"preBalances\":[1,2,3],\
-            \"postBalances\":[4,5,6],\
-            \"innerInstructions\":null,\
-            \"logMessages\":null,\
-            \"preTokenBalances\":null,\
-            \"postTokenBalances\":null,\
-            \"rewards\":null,\
-            \"loadedAddresses\":{\
-                \"readonly\": [],\
-                \"writable\": []\
-            }\
-        }",
+             \"err\":null,\
+             \"status\":{\"Ok\":null},\
+             \"fee\":1234,\
+             \"preBalances\":[1,2,3],\
+             \"postBalances\":[4,5,6],\
+             \"innerInstructions\":null,\
+             \"logMessages\":null,\
+             \"preTokenBalances\":null,\
+             \"postTokenBalances\":null,\
+             \"rewards\":null,\
+             \"loadedAddresses\":{\
+                 \"readonly\": [],\
+                 \"writable\": []\
+             }\
+             }",
         )
         .unwrap();
         let ui_meta_from: UiTransactionStatusMeta = meta.clone().into();
@@ -902,19 +929,20 @@ mod test {
             expected_json_output_value
         );
 
+        #[rustfmt::skip]
         let expected_json_output_value: serde_json::Value = serde_json::from_str(
             "{\
-            \"err\":null,\
-            \"status\":{\"Ok\":null},\
-            \"fee\":1234,\
-            \"preBalances\":[1,2,3],\
-            \"postBalances\":[4,5,6],\
-            \"innerInstructions\":null,\
-            \"logMessages\":null,\
-            \"preTokenBalances\":null,\
-            \"postTokenBalances\":null,\
-            \"rewards\":null\
-        }",
+             \"err\":null,\
+             \"status\":{\"Ok\":null},\
+             \"fee\":1234,\
+             \"preBalances\":[1,2,3],\
+             \"postBalances\":[4,5,6],\
+             \"innerInstructions\":null,\
+             \"logMessages\":null,\
+             \"preTokenBalances\":null,\
+             \"postTokenBalances\":null,\
+             \"rewards\":null\
+             }",
         )
         .unwrap();
         let ui_meta_parse_with_rewards = parse_ui_transaction_status_meta(meta.clone(), &[], true);

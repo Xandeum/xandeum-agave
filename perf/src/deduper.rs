@@ -91,8 +91,8 @@ pub fn dedup_packets_and_count_discards<const K: usize>(
 ) -> u64 {
     batches
         .iter_mut()
-        .flat_map(PacketBatch::iter_mut)
-        .map(|packet| {
+        .flat_map(|batch| batch.iter_mut())
+        .map(|mut packet| {
             if !packet.meta().discard()
                 && packet
                     .data(..)
@@ -127,7 +127,7 @@ mod tests {
         let tx = test_tx();
 
         let mut batches =
-            to_packet_batches(&std::iter::repeat(tx).take(1024).collect::<Vec<_>>(), 128);
+            to_packet_batches(&std::iter::repeat_n(tx, 1024).collect::<Vec<_>>(), 128);
         let packet_count = sigverify::count_packets_in_batches(&batches);
         let mut rng = rand::thread_rng();
         let filter = Deduper::<2, [u8]>::new(&mut rng, /*num_bits:*/ 63_999_979);
@@ -171,7 +171,7 @@ mod tests {
             let mut batches =
                 to_packet_batches(&(0..1000).map(|_| test_tx()).collect::<Vec<_>>(), 128);
             discard += dedup_packets_and_count_discards(&filter, &mut batches) as usize;
-            trace!("{} {}", i, discard);
+            trace!("{i} {discard}");
             if filter.popcount.load(Ordering::Relaxed) > capacity {
                 break;
             }

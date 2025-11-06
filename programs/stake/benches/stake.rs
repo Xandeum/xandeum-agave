@@ -1,11 +1,11 @@
 use {
+    agave_feature_set::FeatureSet,
     bincode::serialize,
     criterion::{black_box, criterion_group, criterion_main, Criterion},
     solana_account::{create_account_shared_data_for_test, AccountSharedData, WritableAccount},
     solana_clock::{Clock, Epoch},
-    solana_feature_set::FeatureSet,
     solana_instruction::AccountMeta,
-    solana_program_runtime::invoke_context::mock_process_instruction,
+    solana_program_runtime::invoke_context::mock_process_instruction_with_feature_set,
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_sdk_ids::sysvar::{clock, rent, stake_history},
@@ -15,14 +15,14 @@ use {
             LockupCheckedArgs, StakeInstruction,
         },
         stake_flags::StakeFlags,
+        stake_history::StakeHistory,
         state::{Authorized, Lockup, StakeAuthorize, StakeStateV2},
     },
     solana_stake_program::{
         stake_instruction,
         stake_state::{Delegation, Meta, Stake},
     },
-    solana_sysvar::stake_history::StakeHistory,
-    solana_vote_interface::state::{VoteState, VoteStateVersions},
+    solana_vote_interface::state::{VoteStateV3, VoteStateVersions},
     solana_vote_program::vote_state,
     std::sync::Arc,
 };
@@ -124,18 +124,17 @@ impl TestSetup {
             (withdraw_authority_address, AccountSharedData::default()),
         ];
 
-        let accounts = mock_process_instruction(
+        let accounts = mock_process_instruction_with_feature_set(
             &solana_stake_program::id(),
-            Vec::new(),
+            None,
             &instruction.data,
             transaction_accounts,
             instruction.accounts.clone(),
             Ok(()),
             stake_instruction::Entrypoint::vm,
-            |invoke_context| {
-                invoke_context.mock_set_feature_set(Arc::clone(&self.feature_set));
-            },
             |_invoke_context| {},
+            |_invoke_context| {},
+            &self.feature_set.runtime_features(),
         );
         // update stake account
         self.transaction_accounts[0] = (self.stake_address, accounts[0].clone());
@@ -165,18 +164,17 @@ impl TestSetup {
             ),
         ];
 
-        let accounts = mock_process_instruction(
+        let accounts = mock_process_instruction_with_feature_set(
             &solana_stake_program::id(),
-            Vec::new(),
+            None,
             &instruction.data,
             transaction_accounts,
             instruction.accounts.clone(),
             Ok(()),
             stake_instruction::Entrypoint::vm,
-            |invoke_context| {
-                invoke_context.mock_set_feature_set(Arc::clone(&self.feature_set));
-            },
             |_invoke_context| {},
+            |_invoke_context| {},
+            &self.feature_set.runtime_features(),
         );
         self.stake_account = accounts[0].clone();
         self.stake_account.set_lamports(ACCOUNT_BALANCE * 2);
@@ -184,18 +182,17 @@ impl TestSetup {
     }
 
     fn run(&self, instruction_data: &[u8]) {
-        mock_process_instruction(
+        mock_process_instruction_with_feature_set(
             &solana_stake_program::id(),
-            Vec::new(),
+            None,
             instruction_data,
             self.transaction_accounts.clone(),
             self.instruction_accounts.clone(),
             Ok(()), //expected_result,
             stake_instruction::Entrypoint::vm,
-            |invoke_context| {
-                invoke_context.mock_set_feature_set(Arc::clone(&self.feature_set));
-            },
             |_invoke_context| {},
+            |_invoke_context| {},
+            &self.feature_set.runtime_features(),
         );
     }
 }
@@ -621,15 +618,15 @@ fn bench_deactivate_delinquent(c: &mut Criterion) {
     let mut test_setup = TestSetup::new();
 
     // reference vote account has been consistently voting
-    let mut vote_state = VoteState::default();
+    let mut vote_state = VoteStateV3::default();
     for epoch in 0..=solana_stake_interface::MINIMUM_DELINQUENT_EPOCHS_FOR_DEACTIVATION {
         vote_state.increment_credits(epoch as Epoch, 1);
     }
     let reference_vote_address = Pubkey::new_unique();
     let reference_vote_account = AccountSharedData::new_data_with_space(
         1,
-        &VoteStateVersions::new_current(vote_state),
-        VoteState::size_of(),
+        &VoteStateVersions::new_v3(vote_state),
+        VoteStateV3::size_of(),
         &solana_sdk_ids::vote::id(),
     )
     .unwrap();
@@ -642,7 +639,7 @@ fn bench_deactivate_delinquent(c: &mut Criterion) {
             Meta::default(),
             Stake {
                 delegation: Delegation::new(&vote_address, 1, 1),
-                credits_observed: VoteState::default().credits(),
+                credits_observed: VoteStateV3::default().credits(),
             },
             StakeFlags::empty(),
         ),

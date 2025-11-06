@@ -52,7 +52,7 @@ impl Default for Config<'_> {
             verbose: false,
             workspace: false,
             jobs: None,
-            arch: "sbfv1",
+            arch: "v0",
         }
     }
 }
@@ -67,7 +67,7 @@ where
         .iter()
         .map(|arg| arg.as_ref().to_str().unwrap_or("?"))
         .join(" ");
-    info!("spawn: {}", msg);
+    info!("spawn: {msg}");
 
     let mut child = Command::new(program)
         .args(args)
@@ -93,12 +93,9 @@ where
             writeln!(out, "{key}=\"{value}\" \\").unwrap();
         }
         write!(out, "{}", program.display()).unwrap();
-        writeln!(out, "{}", msg).unwrap();
+        writeln!(out, "{msg}").unwrap();
         out.flush().unwrap();
-        error!(
-            "To rerun the failed command for debugging use {}",
-            script_name,
-        );
+        error!("To rerun the failed command for debugging use {script_name}");
         exit(1);
     }
 }
@@ -108,7 +105,11 @@ pub fn is_version_string(arg: &str) -> Result<(), String> {
     if semver_re.is_match(arg) {
         return Ok(());
     }
-    Err("a version string may start with 'v' and contains major and minor version numbers separated by a dot, e.g. v1.32 or 1.32".to_string())
+    Err(
+        "a version string may start with 'v' and contains major and minor version numbers \
+         separated by a dot, e.g. v1.32 or 1.32"
+            .to_string(),
+    )
 }
 
 fn test_solana_package(
@@ -219,7 +220,7 @@ fn test_solana(config: Config, manifest_path: Option<PathBuf>) {
     }
 
     let metadata = metadata_command.exec().unwrap_or_else(|err| {
-        error!("Failed to obtain package metadata: {}", err);
+        error!("Failed to obtain package metadata: {err}");
         exit(1);
     });
 
@@ -376,8 +377,8 @@ fn main() {
         .arg(
             Arg::new("arch")
                 .long("arch")
-                .possible_values(["sbfv1", "sbfv2"])
-                .default_value("sbfv1")
+                .possible_values(["v0", "v1", "v2", "v3"])
+                .default_value("v0")
                 .help("Build for the given target architecture"),
         )
         .arg(

@@ -10,9 +10,9 @@ use {
     crate::parse_token::convert_account_state,
     solana_clock::UnixTimestamp,
     solana_program_pack::Pack,
-    spl_token_2022::{
+    solana_pubkey::Pubkey,
+    spl_token_2022_interface::{
         extension::{self, BaseState, BaseStateWithExtensions, ExtensionType, StateWithExtensions},
-        solana_program::pubkey::Pubkey,
         solana_zk_sdk::encryption::pod::elgamal::PodElGamalPubkey,
     },
     spl_token_group_interface::state::{TokenGroup, TokenGroupMember},
@@ -202,8 +202,9 @@ fn convert_mint_close_authority(
 fn convert_default_account_state(
     default_account_state: extension::default_account_state::DefaultAccountState,
 ) -> UiDefaultAccountState {
-    let account_state = spl_token_2022::state::AccountState::try_from(default_account_state.state)
-        .unwrap_or_default();
+    let account_state =
+        spl_token_2022_interface::state::AccountState::try_from(default_account_state.state)
+            .unwrap_or_default();
     UiDefaultAccountState {
         account_state: convert_account_state(account_state),
     }
@@ -405,6 +406,7 @@ fn convert_confidential_mint_burn(
         confidential_supply: confidential_mint_burn.confidential_supply.to_string(),
         decryptable_supply: confidential_mint_burn.decryptable_supply.to_string(),
         supply_elgamal_pubkey: confidential_mint_burn.supply_elgamal_pubkey.to_string(),
+        pending_burn: confidential_mint_burn.pending_burn.to_string(),
     }
 }
 

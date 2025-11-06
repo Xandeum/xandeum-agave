@@ -7,13 +7,14 @@ use {
     log::*,
     rand::{thread_rng, Rng},
     rayon::prelude::*,
-    solana_client::connection_cache::ConnectionCache,
+    solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_core::{
         banking_stage::{update_bank_forks_and_poh_recorder_for_new_tpu_bank, BankingStage},
         banking_trace::{BankingTracer, Channels, BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT},
         validator::{BlockProductionMethod, TransactionStructure},
     },
-    solana_gossip::cluster_info::{ClusterInfo, Node},
+    solana_hash::Hash,
+    solana_keypair::Keypair,
     solana_ledger::{
         blockstore::Blockstore,
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
@@ -21,24 +22,21 @@ use {
         leader_schedule_cache::LeaderScheduleCache,
     },
     solana_measure::measure::Measure,
+    solana_message::Message,
     solana_perf::packet::{to_packet_batches, PacketBatch},
     solana_poh::poh_recorder::{create_test_recorder, PohRecorder, WorkingBankEntry},
+    solana_pubkey::{self as pubkey, Pubkey},
     solana_runtime::{
         bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
     },
-    solana_sdk::{
-        compute_budget::ComputeBudgetInstruction,
-        hash::Hash,
-        message::Message,
-        pubkey::{self, Pubkey},
-        signature::{Keypair, Signature, Signer},
-        system_instruction, system_transaction,
-        timing::timestamp,
-        transaction::Transaction,
-    },
-    solana_streamer::socket::SocketAddrSpace,
-    solana_tpu_client::tpu_client::DEFAULT_TPU_CONNECTION_POOL_SIZE,
+    solana_signature::Signature,
+    solana_signer::Signer,
+    solana_system_interface::instruction as system_instruction,
+    solana_system_transaction as system_transaction,
+    solana_time_utils::timestamp,
+    solana_transaction::Transaction,
     std::{
+        num::NonZeroUsize,
         sync::{atomic::Ordering, Arc, RwLock},
         thread::sleep,
         time::{Duration, Instant},
@@ -291,24 +289,19 @@ fn main() {
                 .help(BlockProductionMethod::cli_message()),
         )
         .arg(
+            Arg::with_name("block_production_num_workers")
+                .long("block-production-num-workers")
+                .takes_value(true)
+                .value_name("NUMBER")
+                .help("Number of worker threads to use for block production"),
+        )
+        .arg(
             Arg::with_name("transaction_struct")
                 .long("transaction-structure")
                 .value_name("STRUCT")
                 .takes_value(true)
                 .possible_values(TransactionStructure::cli_names())
                 .help(TransactionStructure::cli_message()),
-        )
-        .arg(
-            Arg::new("num_banking_threads")
-                .long("num-banking-threads")
-                .takes_value(true)
-                .help("Number of threads to use in the banking stage"),
-        )
-        .arg(
-            Arg::new("tpu_disable_quic")
-                .long("tpu-disable-quic")
-                .takes_value(false)
-                .help("Disable forwarding messages to TPU using QUIC"),
         )
         .arg(
             Arg::new("simulate_mint")
@@ -328,12 +321,12 @@ fn main() {
     let block_production_method = matches
         .value_of_t::<BlockProductionMethod>("block_production_method")
         .unwrap_or_default();
+    let block_production_num_workers = matches
+        .value_of_t::<NonZeroUsize>("block_production_num_workers")
+        .unwrap_or_else(|_| BankingStage::default_num_workers());
     let transaction_struct = matches
         .value_of_t::<TransactionStructure>("transaction_struct")
         .unwrap_or_default();
-    let num_banking_threads = matches
-        .value_of_t::<u32>("num_banking_threads")
-        .unwrap_or_else(|_| BankingStage::num_threads());
     //   a multiple of packet chunk duplicates to avoid races
     let num_chunks = matches.value_of_t::<usize>("num_chunks").unwrap_or(16);
     let packets_per_batch = matches
@@ -342,7 +335,7 @@ fn main() {
     let iterations = matches.value_of_t::<usize>("iterations").unwrap_or(1000);
     let batches_per_iteration = matches
         .value_of_t::<usize>("batches_per_iteration")
-        .unwrap_or(BankingStage::num_threads() as usize);
+        .unwrap_or(BankingStage::default_num_workers().get());
     let write_lock_contention = matches
         .value_of_t::<WriteLockContention>("write_lock_contention")
         .unwrap_or(WriteLockContention::None);
@@ -385,8 +378,8 @@ fn main() {
         .map(|packets_for_single_iteration| packets_for_single_iteration.transactions.len() as u64)
         .sum();
     info!(
-        "threads: {} txs: {}",
-        num_banking_threads, total_num_transactions
+        "worker threads: {} txs: {}",
+        block_production_num_workers, total_num_transactions
     );
 
     // fund all the accounts
@@ -440,12 +433,13 @@ fn main() {
         Blockstore::open(ledger_path.path()).expect("Expected to be able to open database ledger"),
     );
     let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-    let (exit, poh_recorder, poh_service, signal_receiver) = create_test_recorder(
-        bank.clone(),
-        blockstore.clone(),
-        None,
-        Some(leader_schedule_cache),
-    );
+    let (exit, poh_recorder, transaction_recorder, poh_service, signal_receiver) =
+        create_test_recorder(
+            bank.clone(),
+            blockstore.clone(),
+            None,
+            Some(leader_schedule_cache),
+        );
     let (banking_tracer, tracer_thread) =
         BankingTracer::new(matches.is_present("trace_banking").then_some((
             &blockstore.banking_trace_path(),
@@ -454,12 +448,6 @@ fn main() {
         )))
         .unwrap();
     let prioritization_fee_cache = Arc::new(PrioritizationFeeCache::new(0u64));
-    let cluster_info = {
-        let keypair = Arc::new(Keypair::new());
-        let node = Node::new_localhost_with_pubkey(&keypair.pubkey());
-        ClusterInfo::new(node.info, keypair, SocketAddrSpace::Unspecified)
-    };
-    let cluster_info = Arc::new(cluster_info);
     let Channels {
         non_vote_sender,
         non_vote_receiver,
@@ -468,34 +456,20 @@ fn main() {
         gossip_vote_sender,
         gossip_vote_receiver,
     } = banking_tracer.create_channels(false);
-    let tpu_disable_quic = matches.is_present("tpu_disable_quic");
-    let connection_cache = if tpu_disable_quic {
-        ConnectionCache::with_udp(
-            "connection_cache_banking_bench_udp",
-            DEFAULT_TPU_CONNECTION_POOL_SIZE,
-        )
-    } else {
-        ConnectionCache::new_quic(
-            "connection_cache_banking_bench_quic",
-            DEFAULT_TPU_CONNECTION_POOL_SIZE,
-        )
-    };
     let banking_stage = BankingStage::new_num_threads(
         block_production_method,
         transaction_struct,
-        &cluster_info,
-        &poh_recorder,
+        poh_recorder.clone(),
+        transaction_recorder,
         non_vote_receiver,
         tpu_vote_receiver,
         gossip_vote_receiver,
-        num_banking_threads,
+        block_production_num_workers,
         None,
         replay_vote_sender,
         None,
-        Arc::new(connection_cache),
         bank_forks.clone(),
-        &prioritization_fee_cache,
-        false,
+        prioritization_fee_cache,
     );
 
     // This is so that the signal_receiver does not go out of scope after the closure.
@@ -506,7 +480,7 @@ fn main() {
     let mut tx_total_us = 0;
     let base_tx_count = bank.transaction_count();
     let mut txs_processed = 0;
-    let collector = solana_sdk::pubkey::new_rand();
+    let collector = solana_pubkey::new_rand();
     let mut total_sent = 0;
     for current_iteration_index in 0..iterations {
         trace!("RUNNING ITERATION {}", current_iteration_index);
@@ -578,7 +552,6 @@ fn main() {
                 &bank_forks,
                 &poh_recorder,
                 new_bank,
-                false,
             );
             bank = bank_forks.read().unwrap().working_bank_with_scheduler();
             assert_matches!(poh_recorder.read().unwrap().bank(), Some(_));

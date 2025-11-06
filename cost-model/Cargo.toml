@@ -9,9 +9,32 @@ homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
 
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[lib]
+crate-type = ["lib"]
+name = "solana_cost_model"
+
+[features]
+dev-context-only-utils = [
+    "dep:solana-hash",
+    "dep:solana-message",
+    "dep:solana-signature",
+    "dep:solana-transaction",
+    "solana-compute-budget-interface/dev-context-only-utils",
+]
+frozen-abi = [
+    "dep:solana-frozen-abi",
+    "dep:solana-frozen-abi-macro",
+    "solana-compute-budget/frozen-abi",
+    "solana-pubkey/frozen-abi",
+    "solana-vote-program/frozen-abi",
+]
+
 [dependencies]
+agave-feature-set = { workspace = true }
 ahash = { workspace = true }
-lazy_static = { workspace = true }
 log = { workspace = true }
 solana-bincode = { workspace = true }
 solana-borsh = { workspace = true }
@@ -20,7 +43,6 @@ solana-clock = { workspace = true }
 solana-compute-budget = { workspace = true }
 solana-compute-budget-instruction = { workspace = true }
 solana-compute-budget-interface = { workspace = true }
-solana-feature-set = { workspace = true }
 solana-fee-structure = { workspace = true }
 solana-frozen-abi = { workspace = true, optional = true, features = [
     "frozen-abi",
@@ -42,11 +64,8 @@ solana-transaction = { workspace = true, optional = true }
 solana-transaction-error = { workspace = true }
 solana-vote-program = { workspace = true }
 
-[lib]
-crate-type = ["lib"]
-name = "solana_cost_model"
-
 [dev-dependencies]
+agave-reserved-account-keys = { workspace = true }
 itertools = { workspace = true }
 rand = "0.8.5"
 # See order-crates-for-publishing.py for using this unusual `path = "."`
@@ -60,34 +79,15 @@ solana-instruction = { workspace = true }
 solana-keypair = { workspace = true }
 solana-logger = { workspace = true }
 solana-pubkey = { workspace = true, features = ["rand"] }
-solana-reserved-account-keys = { workspace = true }
 solana-runtime-transaction = { workspace = true, features = [
     "dev-context-only-utils",
 ] }
 solana-signer = { workspace = true }
 solana-system-program = { workspace = true }
 solana-system-transaction = { workspace = true }
+solana-vote = { workspace = true }
 static_assertions = { workspace = true }
 test-case = { workspace = true }
-
-[package.metadata.docs.rs]
-targets = ["x86_64-unknown-linux-gnu"]
-
-[features]
-dev-context-only-utils = [
-    "dep:solana-hash",
-    "dep:solana-message",
-    "dep:solana-signature",
-    "dep:solana-transaction",
-    "solana-compute-budget-interface/dev-context-only-utils"
-]
-frozen-abi = [
-    "dep:solana-frozen-abi",
-    "dep:solana-frozen-abi-macro",
-    "solana-compute-budget/frozen-abi",
-    "solana-pubkey/frozen-abi",
-    "solana-vote-program/frozen-abi"
-]
 
 [[bench]]
 name = "cost_tracker"

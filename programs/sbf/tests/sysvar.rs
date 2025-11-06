@@ -1,7 +1,11 @@
 #![cfg(feature = "sbf_rust")]
 
 use {
-    solana_feature_set::disable_fees_sysvar,
+    agave_feature_set::disable_fees_sysvar,
+    solana_instruction::{AccountMeta, Instruction},
+    solana_keypair::Keypair,
+    solana_message::Message,
+    solana_pubkey::Pubkey,
     solana_runtime::{
         bank::Bank,
         bank_client::BankClient,
@@ -9,18 +13,14 @@ use {
         loader_utils::load_program_of_loader_v4,
     },
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
-    solana_sdk::{
-        instruction::{AccountMeta, Instruction},
-        message::Message,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        stake_history::{StakeHistory, StakeHistoryEntry},
-        sysvar::{
-            clock, epoch_rewards, epoch_schedule, instructions, recent_blockhashes, rent,
-            slot_hashes, slot_history, stake_history,
-        },
-        transaction::Transaction,
+    solana_sdk_ids::sysvar::{
+        clock, epoch_schedule, instructions, recent_blockhashes, rent, slot_hashes, slot_history,
+        stake_history,
     },
+    solana_signer::Signer,
+    solana_stake_interface::stake_history::{StakeHistory, StakeHistoryEntry},
+    solana_sysvar::epoch_rewards,
+    solana_transaction::Transaction,
 };
 
 #[test]
@@ -69,7 +69,13 @@ fn test_sysvar_syscalls() {
         &authority_keypair,
         "solana_sbf_rust_sysvar",
     );
+    let dummy_account_key = Pubkey::new_unique();
+    bank.store_account(
+        &dummy_account_key,
+        &solana_account::AccountSharedData::new(1, 32, &program_id),
+    );
     bank.freeze();
+    let blockhash = bank.last_blockhash();
 
     for ix_discriminator in 0..4 {
         let instruction = Instruction::new_with_bincode(
@@ -77,7 +83,7 @@ fn test_sysvar_syscalls() {
             &[ix_discriminator],
             vec![
                 AccountMeta::new(mint_keypair.pubkey(), true),
-                AccountMeta::new(Pubkey::new_unique(), false),
+                AccountMeta::new(dummy_account_key, false),
                 AccountMeta::new_readonly(clock::id(), false),
                 AccountMeta::new_readonly(epoch_schedule::id(), false),
                 AccountMeta::new_readonly(instructions::id(), false),
@@ -90,11 +96,27 @@ fn test_sysvar_syscalls() {
                 AccountMeta::new_readonly(epoch_rewards::id(), false),
             ],
         );
-        let blockhash = bank.last_blockhash();
         let message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
         let transaction = Transaction::new(&[&mint_keypair], message, blockhash);
         let sanitized_tx = RuntimeTransaction::from_transaction_for_tests(transaction);
         let result = bank.simulate_transaction(&sanitized_tx, false);
         assert!(result.result.is_ok());
     }
+
+    // Storing the result of get_sysvar() in the input region is not allowed
+    // because of the 16 byte alignment requirement of the EpochRewards sysvar.
+    let instruction = Instruction::new_with_bincode(
+        program_id,
+        &[4],
+        vec![
+            AccountMeta::new(mint_keypair.pubkey(), true),
+            AccountMeta::new_readonly(epoch_rewards::id(), false),
+            AccountMeta::new(dummy_account_key, false),
+        ],
+    );
+    let message = Message::new(&[instruction], Some(&mint_keypair.pubkey()));
+    let transaction = Transaction::new(&[&mint_keypair], message, blockhash);
+    let sanitized_tx = RuntimeTransaction::from_transaction_for_tests(transaction);
+    let result = bank.simulate_transaction(&sanitized_tx, false);
+    assert!(result.result.is_err());
 }

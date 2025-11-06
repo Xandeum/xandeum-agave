@@ -1,8 +1,10 @@
 use {
-    crate::{crds_gossip::CrdsGossip, protocol::Protocol},
+    crate::{crds_gossip::CrdsGossip, crds_value::CrdsValue, protocol::Protocol},
     itertools::Itertools,
+    solana_clock::Slot,
     solana_measure::measure::Measure,
-    solana_sdk::{clock::Slot, pubkey::Pubkey},
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
     std::{
         cmp::Reverse,
         collections::HashMap,
@@ -40,9 +42,6 @@ pub(crate) struct ScopedTimer<'a> {
 }
 
 impl<'a> From<&'a Counter> for ScopedTimer<'a> {
-    // Output should be assigned to a *named* variable, otherwise it is
-    // immediately dropped.
-    #[must_use]
     fn from(counter: &'a Counter) -> Self {
         Self {
             clock: Instant::now(),
@@ -89,7 +88,6 @@ impl<T> Drop for TimedGuard<'_, T> {
 
 #[derive(Default)]
 pub struct GossipStats {
-    pub(crate) all_tvu_peers: Counter,
     pub(crate) bad_prune_destination: Counter,
     pub(crate) entrypoint2: Counter,
     pub(crate) entrypoint: Counter,
@@ -110,6 +108,7 @@ pub struct GossipStats {
     pub(crate) gossip_pull_request_sent_bytes: Counter,
     pub(crate) gossip_transmit_loop_iterations_since_last_report: Counter,
     pub(crate) gossip_transmit_loop_time: Counter,
+    pub(crate) gossip_transmit_packets_dropped_count: Counter,
     pub(crate) handle_batch_ping_messages_time: Counter,
     pub(crate) handle_batch_pong_messages_time: Counter,
     pub(crate) handle_batch_prune_messages_time: Counter,
@@ -202,29 +201,6 @@ impl GossipStats {
         .add_relaxed(1);
         Some(protocol)
     }
-
-    // Updates metrics from count of dropped packets.
-    pub(crate) fn record_dropped_packets(&self, counts: &[u64; 7]) -> u64 {
-        let num_packets_dropped = counts.iter().sum::<u64>();
-        if num_packets_dropped > 0u64 {
-            self.gossip_packets_dropped_count
-                .add_relaxed(num_packets_dropped);
-            self.packets_received_pull_requests_count
-                .add_relaxed(counts[0]);
-            self.packets_received_pull_responses_count
-                .add_relaxed(counts[1]);
-            self.packets_received_push_messages_count
-                .add_relaxed(counts[2]);
-            self.packets_received_prune_messages_count
-                .add_relaxed(counts[3]);
-            self.packets_received_ping_messages_count
-                .add_relaxed(counts[4]);
-            self.packets_received_pong_messages_count
-                .add_relaxed(counts[5]);
-            self.packets_received_unknown_count.add_relaxed(counts[6]);
-        }
-        num_packets_dropped
-    }
 }
 
 pub(crate) fn submit_gossip_stats(
@@ -262,7 +238,6 @@ pub(crate) fn submit_gossip_stats(
         ("push_vote_read", stats.push_vote_read.clear(), i64),
         ("get_votes", stats.get_votes.clear(), i64),
         ("get_votes_count", stats.get_votes_count.clear(), i64),
-        ("all_tvu_peers", stats.all_tvu_peers.clear(), i64),
         ("tvu_peers", stats.tvu_peers.clear(), i64),
         ("table_size", table_size as i64, i64),
         ("purged_values_size", purged_values_size as i64, i64),
@@ -428,6 +403,11 @@ pub(crate) fn submit_gossip_stats(
         (
             "gossip_transmit_loop_time",
             stats.gossip_transmit_loop_time.clear(),
+            i64
+        ),
+        (
+            "gossip_transmit_packets_dropped_count",
+            stats.gossip_transmit_packets_dropped_count.clear(),
             i64
         ),
         (
@@ -722,4 +702,39 @@ where
     for (slot, num_votes) in votes.into_iter().take(NUM_SLOTS) {
         datapoint_trace!(name, ("slot", slot, i64), ("num_votes", num_votes, i64));
     }
+}
+
+/// check if first leading_zeros bits of signature are 0
+#[inline]
+pub(crate) fn should_report_message_signature(signature: &Signature, leading_zeros: u32) -> bool {
+    let Some(Ok(bytes)) = signature.as_ref().get(..8).map(<[u8; 8]>::try_from) else {
+        return false;
+    };
+    u64::from_le_bytes(bytes).trailing_zeros() >= leading_zeros
+}
+
+#[inline]
+pub(crate) fn last_four_chars(s: &str) -> Option<&str> {
+    s.get(s.len().saturating_sub(4)..)
+}
+
+pub(crate) fn log_gossip_crds_sample_egress(value: &CrdsValue, peer: &Pubkey) {
+    datapoint_info!(
+        "gossip_crds_sample_egress",
+        (
+            "origin",
+            last_four_chars(&value.pubkey().to_string()),
+            Option<String>
+        ),
+        (
+            "signature",
+            last_four_chars(&value.signature().to_string()),
+            Option<String>
+        ),
+        (
+            "peer",
+            last_four_chars(&peer.to_string()),
+            Option<String>
+        ),
+    );
 }

@@ -13,7 +13,7 @@ pub use crate::mock_sender::Mocks;
 use {
     crate::{
         http_sender::HttpSender,
-        mock_sender::{mock_encoded_account, MockSender},
+        mock_sender::{mock_encoded_account, MockSender, MocksMap},
         nonblocking::{self, rpc_client::get_rpc_request_str},
         rpc_sender::*,
     },
@@ -62,9 +62,19 @@ impl RpcClientConfig {
 
 /// Trait used to add support for versioned messages to RPC APIs while
 /// retaining backwards compatibility
-pub trait SerializableMessage: Serialize {}
-impl SerializableMessage for LegacyMessage {}
-impl SerializableMessage for v0::Message {}
+pub trait SerializableMessage {
+    fn serialize(&self) -> Vec<u8>;
+}
+impl SerializableMessage for LegacyMessage {
+    fn serialize(&self) -> Vec<u8> {
+        self.serialize()
+    }
+}
+impl SerializableMessage for v0::Message {
+    fn serialize(&self) -> Vec<u8> {
+        self.serialize()
+    }
+}
 
 /// Trait used to add support for versioned transactions to RPC APIs while
 /// retaining backwards compatibility
@@ -499,6 +509,102 @@ impl RpcClient {
     pub fn new_mock_with_mocks<U: ToString>(url: U, mocks: Mocks) -> Self {
         Self::new_sender(
             MockSender::new_with_mocks(url, mocks),
+            RpcClientConfig::with_commitment(CommitmentConfig::default()),
+        )
+    }
+
+    /// Create a mock `RpcClient`.
+    ///
+    /// A mock `RpcClient` contains an implementation of [`RpcSender`] that does
+    /// not use the network, and instead returns synthetic responses, for use in
+    /// tests.
+    ///
+    /// It is primarily for internal use, with limited customizability, and
+    /// behaviors determined by internal Solana test cases. New users should
+    /// consider implementing `RpcSender` themselves and constructing
+    /// `RpcClient` with [`RpcClient::new_sender`] to get mock behavior.
+    ///
+    /// Unless directed otherwise, a mock `RpcClient` will generally return a
+    /// reasonable default response to any request, at least for [`RpcRequest`]
+    /// values for which responses have been implemented.
+    ///
+    /// This mock can be customized in two ways:
+    ///
+    /// 1) By changing the `url` argument, which is not actually a URL, but a
+    ///    simple string directive that changes the mock behavior in specific
+    ///    scenarios.
+    ///
+    ///    It is customary to set the `url` to "succeeds" for mocks that should
+    ///    return successfully, though this value is not actually interpreted.
+    ///
+    ///    If `url` is "fails" then any call to `send` will return `Ok(Value::Null)`.
+    ///
+    ///    Other possible values of `url` are specific to different `RpcRequest`
+    ///    values. Read the implementation of `MockSender` (which is non-public)
+    ///    for details.
+    ///
+    /// 2) Custom responses can be configured by providing [`MocksMap`]. This type
+    ///    is a [`HashMap`] from [`RpcRequest`] to a [`Vec`] of JSON [`Value`] responses,
+    ///    Any entries in this map override the default behavior for the given
+    ///    request.
+    ///
+    /// The [`RpcClient::new_mock_with_mocks_map`] function offers further
+    /// customization options.
+    ///
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_rpc_client_api::{
+    /// #     request::RpcRequest,
+    /// #     response::{Response, RpcResponseContext},
+    /// # };
+    /// # use solana_rpc_client::{rpc_client::RpcClient, mock_sender::MocksMap};
+    /// # use serde_json::json;
+    /// // Create a mock with a custom response to the `GetBalance` request
+    /// let account_balance_x = 50;
+    /// let account_balance_y = 100;
+    /// let account_balance_z = 150;
+    /// let account_balance_req_responses = vec![
+    ///     (
+    ///         RpcRequest::GetBalance,
+    ///         json!(Response {
+    ///             context: RpcResponseContext {
+    ///                 slot: 1,
+    ///                 api_version: None,
+    ///             },
+    ///             value: json!(account_balance_x),
+    ///         })
+    ///     ),
+    ///     (
+    ///         RpcRequest::GetBalance,
+    ///         json!(Response {
+    ///             context: RpcResponseContext {
+    ///                 slot: 1,
+    ///                 api_version: None,
+    ///             },
+    ///             value: json!(account_balance_y),
+    ///         })
+    ///     ),
+    /// ];
+    ///
+    /// let mut mocks = MocksMap::from_iter(account_balance_req_responses);
+    /// mocks.insert(
+    ///     RpcRequest::GetBalance,
+    ///     json!(Response {
+    ///         context: RpcResponseContext {
+    ///             slot: 1,
+    ///             api_version: None,
+    ///         },
+    ///         value: json!(account_balance_z),
+    ///     }),
+    /// );
+    /// let url = "succeeds".to_string();
+    /// let client = RpcClient::new_mock_with_mocks_map(url, mocks);
+    /// ```
+    pub fn new_mock_with_mocks_map<U: ToString>(url: U, mocks: MocksMap) -> Self {
+        Self::new_sender(
+            MockSender::new_with_mocks_map(url, mocks),
             RpcClientConfig::with_commitment(CommitmentConfig::default()),
         )
     }
@@ -3691,9 +3797,7 @@ pub fn create_rpc_client_mocks() -> crate::mock_sender::Mocks {
         },
     })
     .unwrap();
-
     mocks.insert(get_account_request, get_account_response);
-
     mocks
 }
 
@@ -3703,19 +3807,23 @@ mod tests {
         super::*,
         crate::mock_sender::PUBKEY,
         assert_matches::assert_matches,
+        base64::{prelude::BASE64_STANDARD, Engine},
         crossbeam_channel::unbounded,
         jsonrpc_core::{futures::prelude::*, Error, IoHandler, Params},
         jsonrpc_http_server::{AccessControlAllowOrigin, DomainsValidation, ServerBuilder},
         serde_json::{json, Number},
         solana_account_decoder::encode_ui_account,
         solana_account_decoder_client_types::UiAccountEncoding,
+        solana_hash::Hash,
         solana_instruction::error::InstructionError,
         solana_keypair::Keypair,
+        solana_message::{compiled_instruction::CompiledInstruction, MessageHeader},
         solana_rpc_client_api::client_error::ErrorKind,
         solana_signer::Signer,
         solana_system_transaction as system_transaction,
         solana_transaction_error::TransactionError,
         std::{io, thread},
+        test_case::test_case,
     };
 
     #[test]
@@ -3948,7 +4056,7 @@ mod tests {
             pubkey: pubkey.to_string(),
             account: encode_ui_account(&pubkey, &account, UiAccountEncoding::Base64, None, None),
         };
-        let expected_result = vec![(pubkey, account)];
+        let expected_result = vec![(pubkey, account.clone())];
         // Test: without context
         {
             let mocks: Mocks = [(
@@ -3987,7 +4095,7 @@ mod tests {
                         slot: 1,
                         api_version: None,
                     },
-                    value: vec![keyed_account],
+                    value: vec![keyed_account.clone()],
                 }))
                 .unwrap(),
             )]
@@ -4012,5 +4120,233 @@ mod tests {
                 .unwrap();
             assert_eq!(expected_result, result);
         }
+
+        // Test: Mock with duplicate requests
+        {
+            let expected_result = vec![
+                (pubkey, account.clone()),
+                (pubkey, account.clone()),
+                (pubkey, account.clone()),
+                (pubkey, account.clone()),
+                (pubkey, account.clone()),
+            ];
+
+            let mut mocks: MocksMap = [
+                (
+                    RpcRequest::GetProgramAccounts,
+                    serde_json::to_value(OptionalContext::Context(Response {
+                        context: RpcResponseContext {
+                            slot: 1,
+                            api_version: None,
+                        },
+                        value: vec![keyed_account.clone()],
+                    }))
+                    .unwrap(),
+                ),
+                (
+                    RpcRequest::GetProgramAccounts,
+                    serde_json::to_value(OptionalContext::Context(Response {
+                        context: RpcResponseContext {
+                            slot: 1,
+                            api_version: None,
+                        },
+                        value: vec![keyed_account.clone()],
+                    }))
+                    .unwrap(),
+                ),
+            ]
+            .into_iter()
+            .collect();
+
+            mocks.insert(
+                RpcRequest::GetProgramAccounts,
+                serde_json::to_value(OptionalContext::Context(Response {
+                    context: RpcResponseContext {
+                        slot: 1,
+                        api_version: None,
+                    },
+                    value: vec![
+                        keyed_account.clone(),
+                        keyed_account.clone(),
+                        keyed_account.clone(),
+                    ],
+                }))
+                .unwrap(),
+            );
+
+            mocks.insert(
+                RpcRequest::GetProgramAccounts,
+                serde_json::to_value(OptionalContext::Context(Response {
+                    context: RpcResponseContext {
+                        slot: 1,
+                        api_version: None,
+                    },
+                    value: Vec::<RpcKeyedAccount>::new(),
+                }))
+                .unwrap(),
+            );
+
+            let rpc_client = RpcClient::new_mock_with_mocks_map("mock_client".to_string(), mocks);
+            let mut result1 = rpc_client
+                .get_program_accounts_with_config(
+                    &program_id,
+                    RpcProgramAccountsConfig {
+                        filters: None,
+                        account_config: RpcAccountInfoConfig {
+                            encoding: Some(UiAccountEncoding::Base64),
+                            data_slice: None,
+                            commitment: None,
+                            min_context_slot: None,
+                        },
+                        with_context: Some(true),
+                        sort_results: None,
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(result1.len(), 1);
+
+            let result2 = rpc_client
+                .get_program_accounts_with_config(
+                    &program_id,
+                    RpcProgramAccountsConfig {
+                        filters: None,
+                        account_config: RpcAccountInfoConfig {
+                            encoding: Some(UiAccountEncoding::Base64),
+                            data_slice: None,
+                            commitment: None,
+                            min_context_slot: None,
+                        },
+                        with_context: Some(true),
+                        sort_results: None,
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(result2.len(), 1);
+
+            let result_3 = rpc_client
+                .get_program_accounts_with_config(
+                    &program_id,
+                    RpcProgramAccountsConfig {
+                        filters: None,
+                        account_config: RpcAccountInfoConfig {
+                            encoding: Some(UiAccountEncoding::Base64),
+                            data_slice: None,
+                            commitment: None,
+                            min_context_slot: None,
+                        },
+                        with_context: Some(true),
+                        sort_results: None,
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(result_3.len(), 3);
+
+            let result_4 = rpc_client
+                .get_program_accounts_with_config(
+                    &program_id,
+                    RpcProgramAccountsConfig {
+                        filters: None,
+                        account_config: RpcAccountInfoConfig {
+                            encoding: Some(UiAccountEncoding::Base64),
+                            data_slice: None,
+                            commitment: None,
+                            min_context_slot: None,
+                        },
+                        with_context: Some(true),
+                        sort_results: None,
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(result_4.len(), 0);
+
+            result1.extend(result2);
+            result1.extend(result_3);
+            assert_eq!(expected_result, result1);
+        }
+    }
+
+    #[test_case(LegacyMessage {
+        header: MessageHeader {
+            num_required_signatures: 1,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts: 1,
+        },
+        account_keys: vec![Pubkey::new_unique()],
+        recent_blockhash: Hash::new_unique(),
+        instructions: vec![CompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![0],
+            data: vec![],
+        }],
+    }; "legacy message")]
+    #[test_case(v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            account_keys: vec![Pubkey::new_unique()],
+            recent_blockhash: Hash::new_unique(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 0,
+                accounts: vec![],
+                data: vec![],
+            }],
+            address_table_lookups: vec![],
+        }; "v0 message")]
+    fn test_get_fee_for_message_sends_properly_serialized_v0_transaction<M>(message: M)
+    where
+        M: SerializableMessage,
+    {
+        let serialized_message = message.serialize();
+        let serialized_message_base64 = BASE64_STANDARD.encode(serialized_message);
+
+        let (sender, receiver) = unbounded();
+        thread::spawn(move || {
+            let rpc_addr = "0.0.0.0:0".parse().unwrap();
+            let mut io = IoHandler::default();
+            // Successful request
+            io.add_method("getFeeForMessage", move |params: Params| match params {
+                Params::Array(p) => {
+                    let first_element = p.first().unwrap();
+                    if let Value::String(actual_serialized_message) = first_element {
+                        assert_eq!(actual_serialized_message, &serialized_message_base64);
+                        return future::ok(json!(Response {
+                            context: RpcResponseContext {
+                                api_version: None,
+                                slot: 1,
+                            },
+                            value: json!(42),
+                        }));
+                    }
+                    future::err(Error::invalid_params(
+                        "Expected the serialized message to be the first element of the params",
+                    ))
+                }
+                _ => {
+                    panic!("Expected an array of params to be forwarded to `getFeeForMessage");
+                }
+            });
+
+            let server = ServerBuilder::new(io)
+                .threads(1)
+                .cors(DomainsValidation::AllowOnly(vec![
+                    AccessControlAllowOrigin::Any,
+                ]))
+                .start_http(&rpc_addr)
+                .expect("Unable to start RPC server");
+            sender.send(*server.address()).unwrap();
+            server.wait();
+        });
+
+        let rpc_addr = receiver.recv().unwrap();
+        let rpc_client = RpcClient::new_socket(rpc_addr);
+
+        let fee: u64 = rpc_client.get_fee_for_message(&message).unwrap();
+        assert_eq!(fee, 42);
     }
 }

@@ -32,7 +32,6 @@ update_solana_dependencies() {
     solana-lattice-hash
     solana-ledger
     solana-log-collector
-    solana-logger
     solana-measure
     solana-merkle-tree
     solana-metrics
@@ -41,10 +40,8 @@ update_solana_dependencies() {
     solana-poh
     solana-program-runtime
     solana-program-test
-    solana-address-lookup-table-program
     solana-bpf-loader-program
     solana-compute-budget-program
-    solana-config-program
     solana-stake-program
     solana-system-program
     solana-vote-program
@@ -64,17 +61,15 @@ update_solana_dependencies() {
     solana-storage-bigtable
     solana-storage-proto
     solana-streamer
-    solana-svm-rent-collector
+    solana-svm-rent-calculator
     solana-svm-transaction
     solana-test-validator
-    solana-thin-client
     solana-tpu-client
     solana-transaction-status
     solana-transaction-status-client-types
     solana-udp-client
     solana-version
     solana-zk-token-sdk
-    solana-zk-sdk
     solana-curve25519
   )
 
@@ -132,10 +127,8 @@ patch_crates_io_solana_no_header() {
   crates_map+=("solana-poh poh")
   crates_map+=("solana-program-runtime program-runtime")
   crates_map+=("solana-program-test program-test")
-  crates_map+=("solana-address-lookup-table-program programs/address-lookup-table")
   crates_map+=("solana-bpf-loader-program programs/bpf_loader")
   crates_map+=("solana-compute-budget-program programs/compute-budget")
-  crates_map+=("solana-config-program programs/config")
   crates_map+=("solana-stake-program programs/stake")
   crates_map+=("solana-system-program programs/system")
   crates_map+=("solana-vote-program programs/vote")
@@ -158,14 +151,12 @@ patch_crates_io_solana_no_header() {
   crates_map+=("solana-svm-rent-collector svm-rent-collector")
   crates_map+=("solana-svm-transaction svm-transaction")
   crates_map+=("solana-test-validator test-validator")
-  crates_map+=("solana-thin-client thin-client")
   crates_map+=("solana-tpu-client tpu-client")
   crates_map+=("solana-transaction-status transaction-status")
   crates_map+=("solana-transaction-status-client-types transaction-status-client-types")
   crates_map+=("solana-udp-client udp-client")
   crates_map+=("solana-version version")
   crates_map+=("solana-zk-token-sdk zk-token-sdk")
-  crates_map+=("solana-zk-sdk zk-sdk")
   crates_map+=("solana-bn254 curves/bn254")
   crates_map+=("solana-curve25519 curves/curve25519")
   crates_map+=("solana-secp256k1-recover curves/secp256k1-recover")

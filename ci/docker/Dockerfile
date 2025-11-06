@@ -41,6 +41,7 @@ RUN \
   gnupg \
   lld \
   cmake \
+  openssh-client \
   # docs
   mscgen \
   # solana compiling
@@ -54,6 +55,7 @@ RUN \
   make \
   libprotobuf-dev \
   protobuf-compiler \
+  libclang-dev \
   && \
   # buildkite
   curl -fsSL https://keys.openpgp.org/vks/v1/by-fingerprint/32A37959C2FA5C3C99EFBC32A79206696452D198 | gpg --dearmor -o /usr/share/keyrings/buildkite-agent-archive-keyring.gpg && \
@@ -80,7 +82,7 @@ RUN \
   # uncomment once the dcou-parition related patch is upstreamed...
   # cargo install cargo-hack && \
   cargo install --git https://github.com/anza-xyz/cargo-hack.git --rev 5e59c3ec6c661c02601487c0d4b2a2649fe06c9f cargo-hack && \
-  cargo install cargo-sort && \
+  cargo install cargo-sort@^2 && \
   cargo install mdbook && \
   cargo install mdbook-linkcheck && \
   cargo install svgbob_cli && \

@@ -8,8 +8,10 @@ use {
         Rng, SeedableRng,
     },
     rand_chacha::ChaChaRng,
+    solana_account::AccountSharedData,
+    solana_accounts_db::tiered_storage::hot::RENT_EXEMPT_RENT_EPOCH,
     solana_pubkey::Pubkey,
-    solana_sdk::{account::AccountSharedData, rent::Rent, rent_collector::RENT_EXEMPT_RENT_EPOCH},
+    solana_rent::Rent,
     std::iter,
 };
 

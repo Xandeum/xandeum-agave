@@ -1,19 +1,17 @@
 use {
     crate::rpc::account_resolver,
     jsonrpc_core::{Error, Result},
+    solana_account::{AccountSharedData, ReadableAccount},
     solana_account_decoder::{
         encode_ui_account,
         parse_account_data::{AccountAdditionalDataV3, SplTokenAdditionalDataV2},
         parse_token::get_token_account_mint,
         UiAccount, UiAccountData, UiAccountEncoding,
     },
+    solana_pubkey::Pubkey,
     solana_rpc_client_api::response::RpcKeyedAccount,
     solana_runtime::bank::Bank,
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount},
-        pubkey::Pubkey,
-    },
-    spl_token_2022::{
+    spl_token_2022_interface::{
         extension::{
             interest_bearing_mint::InterestBearingConfig, scaled_ui_amount::ScaledUiAmountConfig,
             BaseStateWithExtensions, StateWithExtensions,
@@ -96,10 +94,10 @@ pub(crate) fn get_mint_owner_and_additional_data(
     bank: &Bank,
     mint: &Pubkey,
 ) -> Result<(Pubkey, SplTokenAdditionalDataV2)> {
-    if mint == &spl_token::native_mint::id() {
+    if mint == &spl_token_interface::native_mint::id() {
         Ok((
-            spl_token::id(),
-            SplTokenAdditionalDataV2::with_decimals(spl_token::native_mint::DECIMALS),
+            spl_token_interface::id(),
+            SplTokenAdditionalDataV2::with_decimals(spl_token_interface::native_mint::DECIMALS),
         ))
     } else {
         let mint_account = bank.get_account(mint).ok_or_else(|| {

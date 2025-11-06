@@ -1,16 +1,19 @@
-//! This module defines `WorkersCache` along with aux struct `WorkerInfo`. These
+//! This module defines [`WorkersCache`] along with aux struct [`WorkerInfo`]. These
 //! structures provide mechanisms for caching workers, sending transaction
 //! batches, and gathering send transaction statistics.
 
 use {
-    crate::transaction_batch::TransactionBatch,
-    log::*,
+    crate::{
+        connection_worker::ConnectionWorker, logging::debug, transaction_batch::TransactionBatch,
+        SendTransactionStats,
+    },
     lru::LruCache,
-    std::net::SocketAddr,
+    quinn::Endpoint,
+    std::{net::SocketAddr, sync::Arc, time::Duration},
     thiserror::Error,
     tokio::{
         sync::mpsc::{self, error::TrySendError},
-        task::JoinHandle,
+        task::{JoinHandle, JoinSet},
     },
     tokio_util::sync::CancellationToken,
 };
@@ -67,6 +70,36 @@ impl WorkerInfo {
     }
 }
 
+/// Spawns a worker to handle communication with a given peer.
+pub(crate) fn spawn_worker(
+    endpoint: &Endpoint,
+    peer: &SocketAddr,
+    worker_channel_size: usize,
+    skip_check_transaction_age: bool,
+    max_reconnect_attempts: usize,
+    handshake_timeout: Duration,
+    stats: Arc<SendTransactionStats>,
+) -> WorkerInfo {
+    let (txs_sender, txs_receiver) = mpsc::channel(worker_channel_size);
+    let endpoint = endpoint.clone();
+    let peer = *peer;
+
+    let (mut worker, cancel) = ConnectionWorker::new(
+        endpoint,
+        peer,
+        txs_receiver,
+        skip_check_transaction_age,
+        max_reconnect_attempts,
+        stats,
+        handshake_timeout,
+    );
+    let handle = tokio::spawn(async move {
+        worker.run().await;
+    });
+
+    WorkerInfo::new(txs_sender, handle, cancel)
+}
+
 /// [`WorkersCache`] manages and caches workers. It uses an LRU cache to store and
 /// manage workers. It also tracks transaction statistics for each peer.
 pub struct WorkersCache {
@@ -101,6 +134,8 @@ impl WorkersCache {
         }
     }
 
+    /// Checks if the worker for a given peer exists and it hasn't been
+    /// cancelled.
     pub fn contains(&self, peer: &SocketAddr) -> bool {
         self.workers.contains(peer)
     }
@@ -151,8 +186,8 @@ impl WorkersCache {
         }
 
         let current_worker = workers.get(peer).expect(
-            "Failed to fetch worker for peer {peer}.\n\
-             Peer existence must be checked before this call using `contains` method.",
+            "Failed to fetch worker for peer {peer}. Peer existence must be checked before this \
+             call using `contains` method.",
         );
         let send_res = current_worker.try_send_transactions(txs_batch);
 
@@ -161,10 +196,12 @@ impl WorkersCache {
                 "Failed to deliver transaction batch for leader {}, drop batch.",
                 peer.ip()
             );
-            maybe_shutdown_worker(workers.pop(peer).map(|current_worker| ShutdownWorker {
-                leader: *peer,
-                worker: current_worker,
-            }));
+            if let Some(current_worker) = workers.pop(peer) {
+                shutdown_worker(ShutdownWorker {
+                    leader: *peer,
+                    worker: current_worker,
+                })
+            }
         }
 
         send_res
@@ -176,7 +213,8 @@ impl WorkersCache {
     /// is removed from the cache.
     #[allow(
         dead_code,
-        reason = "This method will be used in the upcoming changes to implement optional backpressure on the sender."
+        reason = "This method will be used in the upcoming changes to implement optional \
+                  backpressure on the sender."
     )]
     pub async fn send_transactions_to_address(
         &mut self,
@@ -189,16 +227,18 @@ impl WorkersCache {
 
         let body = async move {
             let current_worker = workers.get(peer).expect(
-                "Failed to fetch worker for peer {peer}.\n\
-                 Peer existence must be checked before this call using `contains` method.",
+                "Failed to fetch worker for peer {peer}. Peer existence must be checked before \
+                 this call using `contains` method.",
             );
             let send_res = current_worker.send_transactions(txs_batch).await;
             if let Err(WorkersCacheError::ReceiverDropped) = send_res {
                 // Remove the worker from the cache, if the peer has disconnected.
-                maybe_shutdown_worker(workers.pop(peer).map(|current_worker| ShutdownWorker {
-                    leader: *peer,
-                    worker: current_worker,
-                }));
+                if let Some(current_worker) = workers.pop(peer) {
+                    shutdown_worker(ShutdownWorker {
+                        leader: *peer,
+                        worker: current_worker,
+                    })
+                }
             }
 
             send_res
@@ -210,16 +250,37 @@ impl WorkersCache {
             .unwrap_or(Err(WorkersCacheError::ShutdownError))
     }
 
+    /// Flushes the cache and asynchronously shuts down all workers. This method
+    /// doesn't wait for the completion of all the shutdown tasks.
+    pub(crate) fn flush(&mut self) {
+        while let Some((peer, current_worker)) = self.workers.pop_lru() {
+            shutdown_worker(ShutdownWorker {
+                leader: peer,
+                worker: current_worker,
+            });
+        }
+    }
+
     /// Closes and removes all workers in the cache. This is typically done when
     /// shutting down the system.
+    ///
+    /// The method awaits the completion of all shutdown tasks, ensuring that
+    /// each worker is properly terminated.
     pub(crate) async fn shutdown(&mut self) {
         // Interrupt any outstanding `send_transactions()` calls.
         self.cancel.cancel();
 
-        while let Some((leader, worker)) = self.workers.pop_lru() {
-            let res = worker.shutdown().await;
+        let mut tasks = JoinSet::new();
+        while let Some((peer, current_worker)) = self.workers.pop_lru() {
+            let shutdown_worker = ShutdownWorker {
+                leader: peer,
+                worker: current_worker,
+            };
+            tasks.spawn(shutdown_worker.shutdown());
+        }
+        while let Some(res) = tasks.join_next().await {
             if let Err(err) = res {
-                debug!("Error while shutting down worker for {leader}: {err}");
+                debug!("A shutdown task failed: {err}");
             }
         }
     }
@@ -243,10 +304,7 @@ impl ShutdownWorker {
     }
 }
 
-pub fn maybe_shutdown_worker(worker: Option<ShutdownWorker>) {
-    let Some(worker) = worker else {
-        return;
-    };
+pub fn shutdown_worker(worker: ShutdownWorker) {
     tokio::spawn(async move {
         let leader = worker.leader();
         let res = worker.shutdown().await;
@@ -254,4 +312,159 @@ pub fn maybe_shutdown_worker(worker: Option<ShutdownWorker>) {
             debug!("Error while shutting down worker for {leader}: {err}");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        crate::{
+            connection_worker::DEFAULT_MAX_CONNECTION_HANDSHAKE_TIMEOUT,
+            connection_workers_scheduler::BindTarget,
+            quic_networking::{create_client_config, create_client_endpoint},
+            send_transaction_stats::SendTransactionStatsNonAtomic,
+            transaction_batch::TransactionBatch,
+            workers_cache::{spawn_worker, WorkersCache, WorkersCacheError},
+            SendTransactionStats,
+        },
+        quinn::Endpoint,
+        solana_net_utils::sockets::{bind_to_localhost_unique, unique_port_range_for_tests},
+        solana_tls_utils::QuicClientCertificate,
+        std::{
+            net::{Ipv4Addr, SocketAddr},
+            sync::Arc,
+            time::Duration,
+        },
+        tokio::time::{sleep, timeout, Instant},
+        tokio_util::sync::CancellationToken,
+    };
+
+    // Specify the pessimistic time to finish generation and result checks.
+    const TEST_MAX_TIME: Duration = Duration::from_secs(5);
+
+    fn create_test_endpoint() -> Endpoint {
+        let socket = bind_to_localhost_unique().unwrap();
+        let client_config = create_client_config(&QuicClientCertificate::new(None));
+        create_client_endpoint(BindTarget::Socket(socket), client_config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_worker_stopped_after_failed_connect() {
+        let endpoint = create_test_endpoint();
+
+        let port_range = unique_port_range_for_tests(2);
+        let peer: SocketAddr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port_range.start);
+
+        let worker_channel_size = 1;
+        let skip_check_transaction_age = true;
+        let max_reconnect_attempts = 0;
+        let stats = Arc::new(SendTransactionStats::default());
+        let worker_info = spawn_worker(
+            &endpoint,
+            &peer,
+            worker_channel_size,
+            skip_check_transaction_age,
+            max_reconnect_attempts,
+            DEFAULT_MAX_CONNECTION_HANDSHAKE_TIMEOUT,
+            stats.clone(),
+        );
+
+        timeout(TEST_MAX_TIME, worker_info.handle)
+            .await
+            .unwrap_or_else(|_| panic!("Should stop in less than {TEST_MAX_TIME:?}."))
+            .expect("Worker task should finish successfully.");
+        assert_eq!(
+            stats.read_and_reset(),
+            SendTransactionStatsNonAtomic {
+                connection_error_timed_out: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_worker_shutdown() {
+        let endpoint = create_test_endpoint();
+
+        let port_range = unique_port_range_for_tests(2);
+        let peer: SocketAddr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port_range.start);
+
+        let worker_channel_size = 1;
+        let skip_check_transaction_age = true;
+        let max_reconnect_attempts = 0;
+        let stats = Arc::new(SendTransactionStats::default());
+        let worker_info = spawn_worker(
+            &endpoint,
+            &peer,
+            worker_channel_size,
+            skip_check_transaction_age,
+            max_reconnect_attempts,
+            DEFAULT_MAX_CONNECTION_HANDSHAKE_TIMEOUT,
+            stats.clone(),
+        );
+
+        timeout(TEST_MAX_TIME, worker_info.shutdown())
+            .await
+            .unwrap_or_else(|_| panic!("Should stop in less than {TEST_MAX_TIME:?}."))
+            .expect("Worker task should finish successfully.");
+    }
+
+    // Verifies that a worker which terminates (e.g. due to connection failure)
+    // is properly detected, its sender is closed, and it is removed from the
+    // `WorkersCache`.
+    #[tokio::test]
+    async fn test_worker_removed_after_exit() {
+        let endpoint = create_test_endpoint();
+
+        let cancel = CancellationToken::new();
+        let mut cache = WorkersCache::new(10, cancel.clone());
+
+        let port_range = unique_port_range_for_tests(2);
+        let peer: SocketAddr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port_range.start);
+        let worker_channel_size = 1;
+        let skip_check_transaction_age = true;
+        let max_reconnect_attempts = 0;
+        let stats = Arc::new(SendTransactionStats::default());
+        let worker = spawn_worker(
+            &endpoint,
+            &peer,
+            worker_channel_size,
+            skip_check_transaction_age,
+            max_reconnect_attempts,
+            DEFAULT_MAX_CONNECTION_HANDSHAKE_TIMEOUT,
+            stats.clone(),
+        );
+        assert!(cache.push(peer, worker).is_none());
+
+        let worker_info = cache.workers.peek(&peer).unwrap();
+        // wait until sender is closed which happens when task has finished.
+        let start = Instant::now();
+        while !worker_info.sender.is_closed() {
+            if start.elapsed() > TEST_MAX_TIME {
+                panic!("Sender did not close in {TEST_MAX_TIME:?}");
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        // try to send to this worker — should fail and remove the worker
+        let result = cache
+            .try_send_transactions_to_address(&peer, TransactionBatch::new(vec![vec![0u8; 1]]));
+
+        assert_eq!(result, Err(WorkersCacheError::ReceiverDropped));
+        assert!(
+            !cache.contains(&peer),
+            "worker should be removed after failure"
+        );
+
+        // Cleanup
+        cancel.cancel();
+        cache.shutdown().await;
+
+        assert_eq!(
+            stats.read_and_reset(),
+            SendTransactionStatsNonAtomic {
+                connection_error_timed_out: 1,
+                ..Default::default()
+            }
+        );
+    }
 }

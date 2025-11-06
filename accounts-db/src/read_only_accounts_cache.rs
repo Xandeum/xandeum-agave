@@ -10,12 +10,10 @@ use {
         seq::{IteratorRandom, SliceRandom},
         thread_rng, Rng,
     },
+    solana_account::{AccountSharedData, ReadableAccount},
+    solana_clock::Slot,
     solana_measure::{measure::Measure, measure_us},
     solana_pubkey::Pubkey,
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount},
-        clock::Slot,
-    },
     std::{
         mem::ManuallyDrop,
         sync::{
@@ -29,7 +27,7 @@ use {
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 const CACHE_ENTRY_SIZE: usize =
-    std::mem::size_of::<ReadOnlyAccountCacheEntry>() + 2 * std::mem::size_of::<ReadOnlyCacheKey>();
+    size_of::<ReadOnlyAccountCacheEntry>() + size_of::<ReadOnlyCacheKey>();
 
 type ReadOnlyCacheKey = Pubkey;
 
@@ -213,15 +211,17 @@ impl ReadOnlyAccountsCache {
 
     /// remove entry if it exists.
     /// Assume the entry does not exist for performance.
-    pub(crate) fn remove_assume_not_present(&self, pubkey: Pubkey) -> Option<AccountSharedData> {
+    pub(crate) fn remove_assume_not_present(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
         // get read lock first to see if the entry exists
-        _ = self.cache.get(&pubkey)?;
-        self.remove(pubkey)
+        self.cache
+            .contains_key(pubkey)
+            .then(|| self.remove(pubkey))
+            .flatten()
     }
 
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-    pub(crate) fn remove(&self, pubkey: Pubkey) -> Option<AccountSharedData> {
-        Self::do_remove(&pubkey, &self.cache, &self.data_size).map(|entry| entry.account)
+    pub(crate) fn remove(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+        Self::do_remove(pubkey, &self.cache, &self.data_size).map(|entry| entry.account)
     }
 
     /// Removes `key` from the cache, if present, and returns the account entry.
@@ -346,7 +346,7 @@ impl ReadOnlyAccountsCache {
         rng: &mut R,
         #[cfg(feature = "dev-context-only-utils")] mut callback: impl FnMut(
             &Pubkey,
-            ReadOnlyAccountCacheEntry,
+            Option<ReadOnlyAccountCacheEntry>,
         ),
     ) -> u64
     where
@@ -382,12 +382,11 @@ impl ReadOnlyAccountsCache {
             }
 
             let key = key_to_evict.expect("eviction sample should not be empty");
-            #[cfg(not(feature = "dev-context-only-utils"))]
-            Self::do_remove(&key, cache, data_size);
+            let _entry = Self::do_remove(&key, cache, data_size);
             #[cfg(feature = "dev-context-only-utils")]
             {
-                let entry = Self::do_remove(&key, cache, data_size);
-                callback(&key, entry.unwrap());
+                #[allow(clippy::used_underscore_binding)]
+                callback(&key, _entry);
             }
             num_evicts = num_evicts.saturating_add(1);
         }
@@ -412,7 +411,7 @@ impl ReadOnlyAccountsCache {
     ) -> u64
     where
         R: Rng,
-        C: FnMut(&Pubkey, ReadOnlyAccountCacheEntry),
+        C: FnMut(&Pubkey, Option<ReadOnlyAccountCacheEntry>),
     {
         #[allow(clippy::used_underscore_binding)]
         let target_data_size = self._max_data_size_lo;
@@ -454,7 +453,7 @@ mod tests {
         super::*,
         rand::{Rng, SeedableRng},
         rand_chacha::ChaChaRng,
-        solana_sdk::account::Account,
+        solana_account::Account,
         std::{
             collections::HashMap,
             iter::repeat_with,
@@ -569,7 +568,7 @@ mod tests {
         let slot = MAX_ENTRIES as Slot;
         let pubkey = Pubkey::new_unique();
         let account = AccountSharedData::new(42, ACCOUNT_DATA_SIZE, &Pubkey::default());
-        cache.store(pubkey, slot, account.clone());
+        cache.store(pubkey, slot, account);
 
         // wait for the evictor to run...
         let timer = Instant::now();

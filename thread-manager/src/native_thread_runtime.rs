@@ -95,7 +95,10 @@ impl<T> JoinHandle<T> {
 impl<T> Drop for JoinHandle<T> {
     fn drop(&mut self) {
         if self.std_handle.is_some() {
-            warn!("Attempting to drop a Join Handle of a running thread will leak thread IDs, please join your  threads!");
+            warn!(
+                "Attempting to drop a Join Handle of a running thread will leak thread IDs, \
+                 please join your  threads!"
+            );
             self.join_inner().expect("Child thread panicked");
         }
     }
@@ -103,7 +106,7 @@ impl<T> Drop for JoinHandle<T> {
 
 impl NativeThreadRuntime {
     pub fn new(name: String, cfg: NativeConfig) -> Self {
-        debug_assert!(name.len() <= MAX_THREAD_NAME_CHARS, "Thread name too long");
+        debug_assert!(name.len() < MAX_THREAD_NAME_CHARS, "Thread name too long");
         Self {
             inner: Arc::new(NativeThreadRuntimeInner {
                 id_count: AtomicUsize::new(0),

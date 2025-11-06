@@ -1,7 +1,8 @@
 use {
     crate::{accounts_index::AccountsIndexRootsStats, append_vec::APPEND_VEC_STATS},
-    solana_sdk::timing::AtomicInterval,
+    solana_time_utils::AtomicInterval,
     std::{
+        iter::Sum,
         num::Saturating,
         sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     },
@@ -9,14 +10,8 @@ use {
 
 #[derive(Debug, Default)]
 pub struct AccountsStats {
-    pub delta_hash_scan_time_total_us: AtomicU64,
-    pub delta_hash_accumulate_time_total_us: AtomicU64,
-    pub delta_hash_num: AtomicU64,
-    pub skipped_rewrites_num: AtomicUsize,
-
     pub last_store_report: AtomicInterval,
     pub store_hash_accounts: AtomicU64,
-    pub calc_stored_meta: AtomicU64,
     pub store_accounts: AtomicU64,
     pub store_update_index: AtomicU64,
     pub store_handle_reclaims: AtomicU64,
@@ -31,6 +26,10 @@ pub struct AccountsStats {
     pub handle_dead_keys_us: AtomicU64,
     pub purge_exact_us: AtomicU64,
     pub purge_exact_count: AtomicU64,
+    pub num_obsolete_slots_removed: AtomicUsize,
+    pub num_obsolete_bytes_removed: AtomicU64,
+    pub add_zero_lamport_accounts_us: AtomicU64,
+    pub num_zero_lamport_accounts_added: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -143,18 +142,20 @@ impl StoreAccountsTiming {
 
 #[derive(Debug, Default)]
 pub struct FlushStats {
-    pub num_flushed: Saturating<usize>,
-    pub num_purged: Saturating<usize>,
-    pub total_size: Saturating<u64>,
+    pub num_accounts_flushed: Saturating<usize>,
+    pub num_bytes_flushed: Saturating<u64>,
+    pub num_accounts_purged: Saturating<usize>,
+    pub num_bytes_purged: Saturating<u64>,
     pub store_accounts_timing: StoreAccountsTiming,
     pub store_accounts_total_us: Saturating<u64>,
 }
 
 impl FlushStats {
     pub fn accumulate(&mut self, other: &Self) {
-        self.num_flushed += other.num_flushed;
-        self.num_purged += other.num_purged;
-        self.total_size += other.total_size;
+        self.num_accounts_flushed += other.num_accounts_flushed;
+        self.num_bytes_flushed += other.num_bytes_flushed;
+        self.num_accounts_purged += other.num_accounts_purged;
+        self.num_bytes_purged += other.num_bytes_purged;
         self.store_accounts_timing
             .accumulate(&other.store_accounts_timing);
         self.store_accounts_total_us += other.store_accounts_total_us;
@@ -237,12 +238,17 @@ impl LatestAccountsIndexRootsStats {
             ),
             (
                 "append_vecs_open",
-                APPEND_VEC_STATS.mmap_files_open.load(Ordering::Relaxed),
+                APPEND_VEC_STATS.files_open.load(Ordering::Relaxed),
                 i64
             ),
             (
                 "append_vecs_dirty",
-                APPEND_VEC_STATS.mmap_files_dirty.load(Ordering::Relaxed),
+                APPEND_VEC_STATS.files_dirty.load(Ordering::Relaxed),
+                i64
+            ),
+            (
+                "append_vecs_open_as_mmap",
+                APPEND_VEC_STATS.open_as_mmap.load(Ordering::Relaxed),
                 i64
             ),
             (
@@ -343,6 +349,7 @@ pub struct ShrinkStats {
     pub alive_accounts: AtomicU64,
     pub index_scan_returned_none: AtomicU64,
     pub index_scan_returned_some: AtomicU64,
+    pub obsolete_accounts_filtered: AtomicU64,
     pub accounts_loaded: AtomicU64,
     pub initial_candidates_count: AtomicU64,
     pub purged_zero_lamports: AtomicU64,
@@ -376,6 +383,11 @@ impl ShrinkStats {
                 (
                     "num_slots_shrunk",
                     self.num_slots_shrunk.swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "obsolete_accounts_filtered",
+                    self.obsolete_accounts_filtered.swap(0, Ordering::Relaxed),
                     i64
                 ),
                 (
@@ -750,5 +762,24 @@ impl ShrinkAncientStats {
                 i64
             ),
         );
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ObsoleteAccountsStats {
+    pub accounts_marked_obsolete: u64,
+    pub slots_removed: u64,
+}
+
+impl Sum<Self> for ObsoleteAccountsStats {
+    fn sum<I>(iter: I) -> Self
+    where
+        I: Iterator<Item = Self>,
+    {
+        iter.fold(Self::default(), |mut accumulated_stats, item| {
+            accumulated_stats.accounts_marked_obsolete += item.accounts_marked_obsolete;
+            accumulated_stats.slots_removed += item.slots_removed;
+            accumulated_stats
+        })
     }
 }

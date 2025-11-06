@@ -1,14 +1,15 @@
 use {
     crate::consensus::{tower_vote_state::TowerVoteState, Stake},
     crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
+    solana_clock::Slot,
     solana_measure::measure::Measure,
     solana_metrics::datapoint_info,
+    solana_pubkey::Pubkey,
     solana_rpc::rpc_subscriptions::RpcSubscriptions,
     solana_runtime::{
         bank::Bank,
         commitment::{BlockCommitment, BlockCommitmentCache, CommitmentSlots, VOTE_THRESHOLD_SIZE},
     },
-    solana_sdk::{clock::Slot, pubkey::Pubkey},
     std::{
         cmp::max,
         collections::HashMap,
@@ -66,7 +67,7 @@ impl AggregateCommitmentService {
     pub fn new(
         exit: Arc<AtomicBool>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
-        subscriptions: Arc<RpcSubscriptions>,
+        subscriptions: Option<Arc<RpcSubscriptions>>,
     ) -> (Sender<CommitmentAggregationData>, Self) {
         let (sender, receiver): (
             Sender<CommitmentAggregationData>,
@@ -82,9 +83,12 @@ impl AggregateCommitmentService {
                             break;
                         }
 
-                        if let Err(RecvTimeoutError::Disconnected) =
-                            Self::run(&receiver, &block_commitment_cache, &subscriptions, &exit)
-                        {
+                        if let Err(RecvTimeoutError::Disconnected) = Self::run(
+                            &receiver,
+                            &block_commitment_cache,
+                            subscriptions.as_deref(),
+                            &exit,
+                        ) {
                             break;
                         }
                     })
@@ -96,7 +100,7 @@ impl AggregateCommitmentService {
     fn run(
         receiver: &Receiver<CommitmentAggregationData>,
         block_commitment_cache: &RwLock<BlockCommitmentCache>,
-        subscriptions: &Arc<RpcSubscriptions>,
+        rpc_subscriptions: Option<&RpcSubscriptions>,
         exit: &AtomicBool,
     ) -> Result<(), RecvTimeoutError> {
         loop {
@@ -135,10 +139,12 @@ impl AggregateCommitmentService {
                 ),
             );
 
-            // Triggers rpc_subscription notifications as soon as new commitment data is available,
-            // sending just the commitment cache slot information that the notifications thread
-            // needs
-            subscriptions.notify_subscribers(update_commitment_slots);
+            if let Some(rpc_subscriptions) = rpc_subscriptions {
+                // Triggers rpc_subscription notifications as soon as new commitment data is
+                // available, sending just the commitment cache slot information that the
+                // notifications thread needs
+                rpc_subscriptions.notify_subscribers(update_commitment_slots);
+            }
         }
     }
 
@@ -203,7 +209,7 @@ impl AggregateCommitmentService {
                 // Override old vote_state in bank with latest one for my own vote pubkey
                 node_vote_state.clone()
             } else {
-                TowerVoteState::from(account.vote_state().clone())
+                TowerVoteState::from(account.vote_state_view())
             };
             Self::aggregate_commitment_for_vote_account(
                 &mut commitment,
@@ -265,20 +271,18 @@ impl AggregateCommitmentService {
 mod tests {
     use {
         super::*,
+        solana_account::Account,
         solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo},
+        solana_pubkey::Pubkey,
         solana_runtime::{
-            accounts_background_service::AbsRequestSender,
             bank_forks::BankForks,
             genesis_utils::{create_genesis_config_with_vote_accounts, ValidatorVoteKeypairs},
         },
-        solana_sdk::{account::Account, pubkey::Pubkey, signature::Signer},
+        solana_signer::Signer,
         solana_stake_program::stake_state,
-        solana_vote_program::{
-            vote_state::{
-                self, process_slot_vote_unchecked, TowerSync, VoteStateVersions,
-                MAX_LOCKOUT_HISTORY,
-            },
-            vote_transaction,
+        solana_vote::vote_transaction,
+        solana_vote_program::vote_state::{
+            self, process_slot_vote_unchecked, TowerSync, VoteStateVersions, MAX_LOCKOUT_HISTORY,
         },
     };
 
@@ -463,7 +467,7 @@ mod tests {
         process_slot_vote_unchecked(&mut vote_state1, 3);
         process_slot_vote_unchecked(&mut vote_state1, 5);
         if !with_node_vote_state {
-            let versioned = VoteStateVersions::new_current(vote_state1.clone());
+            let versioned = VoteStateVersions::new_v3(vote_state1.clone());
             vote_state::to(&versioned, &mut vote_account1).unwrap();
             bank.store_account(&pk1, &vote_account1);
         }
@@ -471,19 +475,19 @@ mod tests {
         let mut vote_state2 = vote_state::from(&vote_account2).unwrap();
         process_slot_vote_unchecked(&mut vote_state2, 9);
         process_slot_vote_unchecked(&mut vote_state2, 10);
-        let versioned = VoteStateVersions::new_current(vote_state2);
+        let versioned = VoteStateVersions::new_v3(vote_state2);
         vote_state::to(&versioned, &mut vote_account2).unwrap();
         bank.store_account(&pk2, &vote_account2);
 
         let mut vote_state3 = vote_state::from(&vote_account3).unwrap();
         vote_state3.root_slot = Some(1);
-        let versioned = VoteStateVersions::new_current(vote_state3);
+        let versioned = VoteStateVersions::new_v3(vote_state3);
         vote_state::to(&versioned, &mut vote_account3).unwrap();
         bank.store_account(&pk3, &vote_account3);
 
         let mut vote_state4 = vote_state::from(&vote_account4).unwrap();
         vote_state4.root_slot = Some(2);
-        let versioned = VoteStateVersions::new_current(vote_state4);
+        let versioned = VoteStateVersions::new_v3(vote_state4);
         vote_state::to(&versioned, &mut vote_account4).unwrap();
         bank.store_account(&pk4, &vote_account4);
 
@@ -540,7 +544,7 @@ mod tests {
     fn test_highest_super_majority_root_advance() {
         fn get_vote_state(vote_pubkey: Pubkey, bank: &Bank) -> TowerVoteState {
             let vote_account = bank.get_vote_account(&vote_pubkey).unwrap();
-            TowerVoteState::from(vote_account.vote_state().clone())
+            TowerVoteState::from(vote_account.vote_state_view())
         }
 
         let block_commitment_cache = RwLock::new(BlockCommitmentCache::new_for_tests());
@@ -583,11 +587,7 @@ mod tests {
             .root_slot
             .unwrap();
         for x in 0..root {
-            bank_forks
-                .write()
-                .unwrap()
-                .set_root(x, &AbsRequestSender::default(), None)
-                .unwrap();
+            bank_forks.write().unwrap().set_root(x, None, None).unwrap();
         }
 
         // Add an additional bank/vote that will root slot 2
@@ -630,11 +630,7 @@ mod tests {
         bank_forks
             .write()
             .unwrap()
-            .set_root(
-                root,
-                &AbsRequestSender::default(),
-                Some(highest_super_majority_root),
-            )
+            .set_root(root, None, Some(highest_super_majority_root))
             .unwrap();
         let highest_super_majority_root_bank =
             bank_forks.read().unwrap().get(highest_super_majority_root);
@@ -718,11 +714,7 @@ mod tests {
         bank_forks
             .write()
             .unwrap()
-            .set_root(
-                root,
-                &AbsRequestSender::default(),
-                Some(highest_super_majority_root),
-            )
+            .set_root(root, None, Some(highest_super_majority_root))
             .unwrap();
         let highest_super_majority_root_bank =
             bank_forks.read().unwrap().get(highest_super_majority_root);

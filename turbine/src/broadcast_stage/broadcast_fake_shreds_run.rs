@@ -2,13 +2,15 @@ use {
     super::*,
     solana_entry::entry::Entry,
     solana_gossip::contact_info::ContactInfo,
+    solana_hash::Hash,
+    solana_keypair::Keypair,
     solana_ledger::shred::{self, ProcessShredsStats, ReedSolomonCache, Shredder},
-    solana_sdk::{hash::Hash, signature::Keypair},
 };
 
 #[derive(Clone)]
 pub(super) struct BroadcastFakeShredsRun {
     last_blockhash: Hash,
+    carryover_entry: Option<WorkingBankEntry>,
     partition: usize,
     shred_version: u16,
     next_code_index: u32,
@@ -19,6 +21,7 @@ impl BroadcastFakeShredsRun {
     pub(super) fn new(partition: usize, shred_version: u16) -> Self {
         Self {
             last_blockhash: Hash::default(),
+            carryover_entry: None,
             partition,
             shred_version,
             next_code_index: 0,
@@ -37,7 +40,11 @@ impl BroadcastRun for BroadcastFakeShredsRun {
         blockstore_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
     ) -> Result<()> {
         // 1) Pull entries from banking stage
-        let receive_results = broadcast_utils::recv_slot_entries(receiver)?;
+        let receive_results = broadcast_utils::recv_slot_entries(
+            receiver,
+            &mut self.carryover_entry,
+            &mut ProcessShredsStats::default(),
+        )?;
         let bank = receive_results.bank;
         let last_tick_height = receive_results.last_tick_height;
 
@@ -72,14 +79,13 @@ impl BroadcastRun for BroadcastFakeShredsRun {
         )
         .expect("Expected to create a new shredder");
 
-        let (data_shreds, coding_shreds) = shredder.entries_to_shreds(
+        let (data_shreds, coding_shreds) = shredder.entries_to_merkle_shreds_for_tests(
             keypair,
             &receive_results.entries,
             last_tick_height == bank.max_tick_height(),
             Some(chained_merkle_root),
             next_shred_index,
             self.next_code_index,
-            true, // merkle_variant
             &self.reed_solomon_cache,
             &mut ProcessShredsStats::default(),
         );
@@ -94,14 +100,13 @@ impl BroadcastRun for BroadcastFakeShredsRun {
             .map(|_| Entry::new(&self.last_blockhash, 0, vec![]))
             .collect();
 
-        let (fake_data_shreds, fake_coding_shreds) = shredder.entries_to_shreds(
+        let (fake_data_shreds, fake_coding_shreds) = shredder.entries_to_merkle_shreds_for_tests(
             keypair,
             &fake_entries,
             last_tick_height == bank.max_tick_height(),
             Some(chained_merkle_root),
             next_shred_index,
             self.next_code_index,
-            true, // merkle_variant
             &self.reed_solomon_cache,
             &mut ProcessShredsStats::default(),
         );
@@ -148,10 +153,16 @@ impl BroadcastRun for BroadcastFakeShredsRun {
         &mut self,
         receiver: &TransmitReceiver,
         cluster_info: &ClusterInfo,
-        sock: &UdpSocket,
+        sock: BroadcastSocket,
         _bank_forks: &RwLock<BankForks>,
         _quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     ) -> Result<()> {
+        let sock = match sock {
+            BroadcastSocket::Udp(sock) => sock,
+            BroadcastSocket::Xdp(_) => {
+                panic!("Xdp not supported for fake shreds");
+            }
+        };
         for (data_shreds, batch_info) in receiver {
             let fake = batch_info.is_some();
             let peers = cluster_info.tvu_peers(ContactInfo::clone);
@@ -180,7 +191,7 @@ impl BroadcastRun for BroadcastFakeShredsRun {
 mod tests {
     use {
         super::*,
-        solana_sdk::signature::Signer,
+        solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
         std::net::{IpAddr, Ipv4Addr, SocketAddr},
     };
