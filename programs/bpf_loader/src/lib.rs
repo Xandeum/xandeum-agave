@@ -1229,9 +1229,6 @@ fn process_loader_upgradeable_instruction(
 
             ic_logger_msg!(log_collector, "Migrated program {:?}", &program_address);
         }
-        UpgradeableLoaderInstruction::Migrate => {
-            return Err(InstructionError::InvalidInstructionData);
-        }
     }
 
     Ok(())
