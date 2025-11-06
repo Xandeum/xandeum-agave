@@ -4,7 +4,6 @@ use jsonrpc_core::ErrorCode;
 #[cfg(feature = "dev-context-only-utils")]
 use solana_runtime::installed_scheduler_pool::BankWithScheduler;
 use std::sync::Mutex;
-use tokio::time::sleep;
 use xandeum_protos::{
     response::{ResponseWrapper, TxResponse},
     types::{Opcode, Request},
@@ -3965,10 +3964,7 @@ pub mod rpc_accounts_scan {
 // (rpc_minimal should also be provided by an API node)
 pub mod rpc_full {
     use {
-        super::*,
-        solana_sdk::message::{SanitizedVersionedMessage, VersionedMessage},
-        solana_transaction_status::parse_ui_inner_instructions,
-        xandeum_protos::types::{Opcode, Request},
+        super::*, solana_message::{SanitizedVersionedMessage, VersionedMessage}, solana_transaction_status::parse_ui_inner_instructions, xandeum_protos::types::{Opcode, Request}
     };
     #[rpc]
     pub trait Full {
@@ -4784,7 +4780,7 @@ pub mod rpc_full {
                     post_token_balances: post_token_balances.map(|balances| {
                         balances.into_iter().map(|balance| solana_ledger::transaction_balances::svm_token_info_to_token_balance(balance).into()).collect()
                     }),
-                    loaded_addresses: Some(UiLoadedAddresses::from(&transaction.get_loaded_addresses())),
+                    loaded_addresses: Some(solana_transaction_status::UiLoadedAddresses::from(&transaction.get_loaded_addresses())),
                 },
             ))
         }

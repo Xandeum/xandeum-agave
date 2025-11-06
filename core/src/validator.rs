@@ -1046,7 +1046,6 @@ impl Validator {
         let rpc_subscriptions = Arc::new(RpcSubscriptions::new_with_config(
             exit.clone(),
             max_complete_transaction_status_slot.clone(),
-            max_complete_rewards_slot.clone(),
             blockstore.clone(),
             bank_forks.clone(),
             block_commitment_cache.clone(),
@@ -1194,28 +1193,12 @@ impl Validator {
                 max_complete_transaction_status_slot: max_complete_transaction_status_slot.clone(),
                 prioritization_fee_cache: prioritization_fee_cache.clone(),
                 client_option,
+                transaction_results:transaction_results_clone,
+                rpc_subscriptions:rpc_subscriptions.clone()
             };
             let json_rpc_service =
                 JsonRpcService::new_with_config(rpc_svc_config).map_err(ValidatorError::Other)?;
-            let rpc_subscriptions = Arc::new(RpcSubscriptions::new_with_config(
-                exit.clone(),
-                max_complete_transaction_status_slot,
-                blockstore.clone(),
-                bank_forks.clone(),
-                block_commitment_cache.clone(),
-                optimistically_confirmed_bank.clone(),
-                config.send_transaction_service_config.clone(),
-                max_slots.clone(),
-                leader_schedule_cache.clone(),
-                connection_cache.clone(),
-                max_complete_transaction_status_slot,
-                max_complete_rewards_slot,
-                prioritization_fee_cache.clone(),
-                transaction_results_clone,
-                &rpc_subscriptions.clone()
-            )
-            .map_err(ValidatorError::Other)?;
-
+    
             let pubsub_service = if !config.rpc_config.full_api {
                 None
             } else {

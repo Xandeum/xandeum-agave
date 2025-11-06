@@ -5789,15 +5789,9 @@ dependencies = [
 
 [[package]]
 name = "solana-account-info"
-<<<<<<< HEAD
-version = "2.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0c17d606a298a205fae325489fbed88ee6dc4463c111672172327e741c8905d"
-=======
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82f4691b69b172c687d218dd2f1f23fc7ea5e9aa79df9ac26dab3d8dd829ce48"
->>>>>>> v3.0.9
 dependencies = [
  "bincode",
  "serde",
@@ -5893,15 +5887,9 @@ dependencies = [
 
 [[package]]
 name = "solana-address-lookup-table-interface"
-<<<<<<< HEAD
-version = "2.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1673f67efe870b64a65cb39e6194be5b26527691ce5922909939961a6e6b395"
-=======
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2f56cac5e70517a2f27d05e5100b20de7182473ffd0035b23ea273307905987"
->>>>>>> v3.0.9
 dependencies = [
  "bincode",
  "bytemuck",
@@ -5917,15 +5905,9 @@ dependencies = [
 
 [[package]]
 name = "solana-atomic-u64"
-<<<<<<< HEAD
-version = "2.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d52e52720efe60465b052b9e7445a01c17550666beec855cce66f44766697bc2"
-=======
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a933ff1e50aff72d02173cfcd7511bd8540b027ee720b75f353f594f834216d0"
->>>>>>> v3.0.9
 dependencies = [
  "parking_lot 0.12.2",
 ]
@@ -6005,15 +5987,9 @@ dependencies = [
 
 [[package]]
 name = "solana-big-mod-exp"
-<<<<<<< HEAD
-version = "2.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75db7f2bbac3e62cfd139065d15bcda9e2428883ba61fc8d27ccb251081e7567"
-=======
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30c80fb6d791b3925d5ec4bf23a7c169ef5090c013059ec3ed7d0b2c04efa085"
->>>>>>> v3.0.9
 dependencies = [
  "num-bigint 0.4.6",
  "num-traits",
@@ -6022,15 +5998,9 @@ dependencies = [
 
 [[package]]
 name = "solana-bincode"
-<<<<<<< HEAD
-version = "2.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19a3787b8cf9c9fe3dd360800e8b70982b9e5a8af9e11c354b6665dd4a003adc"
-=======
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "534a37aecd21986089224d0c01006a75b96ac6fb2f418c24edc15baf0d2a4c99"
->>>>>>> v3.0.9
 dependencies = [
  "bincode",
  "serde",
@@ -6039,15 +6009,9 @@ dependencies = [
 
 [[package]]
 name = "solana-blake3-hasher"
-<<<<<<< HEAD
-version = "2.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1a0801e25a1b31a14494fc80882a036be0ffd290efc4c2d640bfcca120a4672"
-=======
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ffa2e3bdac3339c6d0423275e45dafc5ac25f4d43bf344d026a3cc9a85e244a6"
->>>>>>> v3.0.9
 dependencies = [
  "blake3",
  "solana-define-syscall 3.0.0",

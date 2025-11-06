@@ -3,68 +3,35 @@
 use {
     crate::{
         filter::filter_allows,
-        optimistically_confirmed_bank_tracker::{OptimisticallyConfirmedBank},
+        optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         parsed_token_accounts::{get_parsed_token_account, get_parsed_token_accounts},
         rpc_pubsub_service::PubSubConfig,
         rpc_subscription_tracker::{
-            AccountSubscriptionParams, BlockSubscriptionKind, BlockSubscriptionParams,
-            LogsSubscriptionKind, LogsSubscriptionParams, ProgramSubscriptionParams,
-            SignatureSubscriptionParams, SignatureSubscriptionType, SubscriptionControl,
-            SubscriptionId, SubscriptionInfo, SubscriptionParams, SubscriptionsTracker,
+            AccountSubscriptionParams, BlockSubscriptionKind, BlockSubscriptionParams, LogsSubscriptionKind, LogsSubscriptionParams, ProgramSubscriptionParams, SignatureSubscriptionParams, SignatureSubscriptionType, SubscriptionControl, SubscriptionId, SubscriptionInfo, SubscriptionParams, SubscriptionsTracker
         },
-    },
-    crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender},
-    itertools::Either,
-    rayon::prelude::*,
-    serde::Serialize,
-    solana_account::{AccountSharedData, ReadableAccount},
-    solana_account_decoder::{
-        encode_ui_account, parse_token::is_known_spl_token_id, UiAccount, UiAccountEncoding,
-    },
-    solana_client::rpc_response::{RpcApiVersion},
-    solana_clock::Slot,
-    solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path},
-    solana_measure::measure::Measure,
-    solana_pubkey::Pubkey,
-    solana_rpc_client_api::response::{
+    }, crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender}, itertools::Either, rayon::prelude::*, serde::Serialize, solana_account::{AccountSharedData, ReadableAccount}, solana_account_decoder::{
+        UiAccount, UiAccountEncoding, encode_ui_account, parse_token::is_known_spl_token_id
+    }, solana_client::rpc_response::RpcApiVersion, solana_clock::Slot, solana_commitment_config::CommitmentConfig, solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path}, solana_measure::measure::Measure, solana_pubkey::Pubkey, solana_rpc_client_api::response::{
         ProcessedSignatureResult, ReceivedSignatureResult, Response as RpcResponse, RpcBlockUpdate,
         RpcBlockUpdateError, RpcKeyedAccount, RpcLogsResponse, RpcResponseContext,
         RpcSignatureResult, RpcVote, SlotInfo, SlotUpdate,
-    },
-    solana_runtime::{
+    }, solana_runtime::{
         bank::{Bank, TransactionLogInfo},
         bank_forks::BankForks,
         commitment::{BlockCommitmentCache, CommitmentSlots},
-    },
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount},
-        clock::Slot,
-        commitment_config::CommitmentConfig,
-        pubkey::Pubkey,
-        signature::Signature,
-        timing::timestamp,
-        transaction,
-        transaction::TransactionError,
-    },
-    solana_signature::Signature,
-    solana_time_utils::timestamp,
-    solana_transaction_status::{
+    }, solana_signature::Signature, solana_time_utils::timestamp, solana_transaction_error::TransactionError, solana_transaction_status::{
         BlockEncodingOptions, ConfirmedBlock, EncodeError, VersionedConfirmedBlock,
-    },
-    solana_vote::vote_transaction::VoteTransaction,
-    std::{
+    }, solana_vote::vote_transaction::VoteTransaction, std::{
         cell::RefCell,
         collections::{HashMap, VecDeque},
         io::Cursor,
         str,
         sync::{
-            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-            Arc, Mutex, RwLock, Weak,
+            Arc, Mutex, RwLock, Weak, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}
         },
         thread::{Builder, JoinHandle, sleep},
         time::{Duration, Instant},
-    },
-    tokio::sync::broadcast,
+    }, tokio::sync::broadcast
 };
 
 mod transaction {
@@ -108,7 +75,7 @@ impl From<NotificationEntry> for TimestampedNotificationEntry {
 
 pub enum NotificationEntry {
     Slot(SlotInfo),
-    Vote(Pubkey, VoteTransaction, Signature),
+    Vote((Pubkey, VoteTransaction, Signature)),
     Root(u64),
     Bank(CommitmentSlots), // Corrected from Bank(Bank) to CommitmentSlots
     SignaturesReceived(SlotSignatures),
@@ -125,9 +92,7 @@ impl std::fmt::Debug for NotificationEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             NotificationEntry::Slot(slot_info) => write!(f, "Slot({slot_info:?})"),
-            NotificationEntry::Vote(pubkey, vote, signature) => {
-                write!(f, "Vote({pubkey:?}, {vote:?}, {signature:?})")
-            }
+            NotificationEntry::Vote(vote) => write!(f, "Vote({vote:?})"),
             NotificationEntry::Root(root) => write!(f, "Root({root})"),
             NotificationEntry::Bank(commitment_slots) => {
                 write!(f, "Bank(slot: {}, root: {})", commitment_slots.slot, commitment_slots.root)
@@ -773,7 +738,7 @@ impl RpcSubscriptions {
 
 		// Construct RpcSignatureResult for subscription notifications
 		let signature_result = RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
-			err: error_message,
+			err: error_message.map(Into::into),
 		});
 
 		// Emit "confirmed" notification
@@ -804,7 +769,7 @@ impl RpcSubscriptions {
     }
 
     pub fn notify_vote(&self, vote_pubkey: Pubkey, vote: VoteTransaction, signature: Signature) {
-        self.enqueue_notification(NotificationEntry::Vote(vote_pubkey, vote, signature));
+        self.enqueue_notification(NotificationEntry::Vote((vote_pubkey, vote, signature)));
     }
 
     pub fn notify_roots(&self, mut rooted_slots: Vec<Slot>) {

@@ -648,9 +648,6 @@ opt-level = 3
 # creating problems in the testing environment.
 # To enable better performance in solana-test-validator during tests and dev builds,
 # we override the opt-level to 3 for the crate.
-[profile.dev.package.curve25519-dalek]
-opt-level = 3
-
 [patch.crates-io]
 # for details, see https://github.com/anza-xyz/crossbeam/commit/fd279d707025f0e60951e429bf778b4813d1b6bf
 crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "fd279d707025f0e60951e429bf778b4813d1b6bf" }
@@ -691,7 +688,3 @@ quinn-proto = { git = "https://github.com/anza-xyz/quinn", rev = "fc4decb0cf79b1
 # There is a similar override in `programs/sbf/Cargo.toml`.  Please keep both
 # comments and the overrides in sync.
 solana-curve25519 = { path = "curves/curve25519" }
-<<<<<<< HEAD
-solana-zk-sdk = { path = "zk-sdk" }
-=======
->>>>>>> v3.0.9

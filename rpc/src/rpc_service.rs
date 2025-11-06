@@ -9,43 +9,14 @@ use {
         rpc_cache::LargestAccountsCache,
         rpc_health::*,
         rpc_subscriptions::RpcSubscriptions,
-    }, crossbeam_channel::unbounded, jsonrpc_core::{futures::{prelude::*}, MetaIoHandler}, jsonrpc_http_server::{
-        hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
-        RequestMiddlewareAction, ServerBuilder,
-    }, prost::Message, regex::Regex, solana_client::connection_cache::ConnectionCache, solana_gossip::cluster_info::ClusterInfo, solana_ledger::{
+    }, crossbeam_channel::unbounded, jsonrpc_core::{MetaIoHandler, futures::prelude::*}, jsonrpc_http_server::{
+        AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware, RequestMiddlewareAction, ServerBuilder, hyper
+    }, prost::Message, regex::Regex, solana_cli_output::display::build_balance_message, solana_client::connection_cache::{ConnectionCache, Protocol}, solana_genesis_config::DEFAULT_GENESIS_DOWNLOAD_PATH, solana_gossip::cluster_info::ClusterInfo, solana_hash::Hash, solana_keypair::Keypair, solana_ledger::{
         bigtable_upload::ConfirmedBlockUploadConfig,
-        bigtable_upload_service::BigTableUploadService, blockstore::Blockstore,
+        bigtable_upload_service::BigTableUploadService,
+        blockstore::Blockstore,
         leader_schedule_cache::LeaderScheduleCache,
-    }, solana_metrics::inc_new_counter_info, solana_perf::thread::renice_this_thread, solana_poh::poh_recorder::PohRecorder, solana_runtime::{
-        bank_forks::BankForks, commitment::BlockCommitmentCache,
-        prioritization_fee_cache::PrioritizationFeeCache,
-        snapshot_archive_info::SnapshotArchiveInfoGetter, snapshot_config::SnapshotConfig,
-        snapshot_utils,
-    }, solana_sdk::{
-        exit::Exit, hash::Hash,
-        message::v0::LoadedAddresses, native_token::lamports_to_sol, signature::Signature,
-    }, solana_send_transaction_service::send_transaction_service::{self, SendTransactionService}, solana_storage_bigtable::CredentialType, solana_transaction_status::TransactionStatusMeta, std::{
-        collections::HashMap,
-        net::SocketAddr,
-        path::{Path, PathBuf},
-        str::FromStr,
-    },
-    solana_cli_output::display::build_balance_message,
-    solana_client::connection_cache::Protocol,
-    solana_genesis_config::DEFAULT_GENESIS_DOWNLOAD_PATH,
-    solana_gossip::cluster_info::ClusterInfo,
-    solana_hash::Hash,
-    solana_keypair::Keypair,
-    solana_ledger::{
-        bigtable_upload::ConfirmedBlockUploadConfig,
-        bigtable_upload_service::BigTableUploadService, blockstore::Blockstore,
-        leader_schedule_cache::LeaderScheduleCache,
-    },
-    solana_metrics::inc_new_counter_info,
-    solana_perf::thread::renice_this_thread,
-    solana_poh::poh_recorder::PohRecorder,
-    solana_quic_definitions::NotifyKeyUpdate,
-    solana_runtime::{
+    }, solana_message::v0::LoadedAddresses, solana_metrics::inc_new_counter_info, solana_perf::thread::renice_this_thread, solana_poh::poh_recorder::PohRecorder, solana_quic_definitions::NotifyKeyUpdate, solana_runtime::{
         bank::Bank,
         bank_forks::BankForks,
         commitment::BlockCommitmentCache,
@@ -54,33 +25,26 @@ use {
         snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_config::SnapshotConfig,
         snapshot_utils::{self, SnapshotInterval},
-    },
-    solana_send_transaction_service::{
+    }, solana_send_transaction_service::{
         send_transaction_service::{self, SendTransactionService},
         transaction_client::{ConnectionCacheClient, TpuClientNextClient, TransactionClient},
-    },
-    solana_storage_bigtable::CredentialType,
-    solana_validator_exit::Exit,
-    std::{
+    }, solana_signature::Signature, solana_storage_bigtable::CredentialType, solana_transaction_status::TransactionStatusMeta, solana_validator_exit::Exit, std::{
+        collections::HashMap,
         net::{SocketAddr, UdpSocket},
         path::{Path, PathBuf},
         pin::Pin,
+        str::FromStr,
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, Mutex, RwLock,
+            Arc, Mutex, RwLock, atomic::{AtomicBool, AtomicU64, Ordering}
         },
         task::{Context, Poll},
         thread::{self, Builder, JoinHandle},
-        time::Duration,
-    }, tokio_util::codec::{BytesCodec, FramedRead}, xandeum_protos::response::{response::{self}, ResponseWrapper, TxResponse}
         time::{Duration, Instant},
-    },
-    tokio::runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime},
-    tokio_util::{
+    }, tokio::runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime}, tokio_util::{
         bytes::Bytes,
         codec::{BytesCodec, FramedRead},
         sync::CancellationToken,
-    },
+    }, xandeum_protos::response::{ResponseWrapper, TxResponse, response::{self}}
 };
 
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
@@ -506,6 +470,8 @@ pub struct JsonRpcServiceConfig<'a> {
     pub leader_schedule_cache: Arc<LeaderScheduleCache>,
     pub max_complete_transaction_status_slot: Arc<AtomicU64>,
     pub prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+    pub transaction_results: Arc<Mutex<HashMap<String, TxResponse>>>,
+    pub rpc_subscriptions: Arc<RpcSubscriptions>,
     pub client_option: ClientOption<'a>,
 }
 
@@ -570,6 +536,8 @@ impl JsonRpcService {
                     config.max_complete_transaction_status_slot,
                     config.prioritization_fee_cache,
                     runtime,
+                    config.transaction_results,
+                    config.rpc_subscriptions,
                 )?;
                 Ok(json_rpc_service)
             }
@@ -620,6 +588,8 @@ impl JsonRpcService {
                     config.max_complete_transaction_status_slot,
                     config.prioritization_fee_cache,
                     runtime,
+                    config.transaction_results,
+                    config.rpc_subscriptions,
                 )?;
                 Ok(json_rpc_service)
             }
@@ -699,6 +669,8 @@ impl JsonRpcService {
             max_complete_transaction_status_slot,
             prioritization_fee_cache,
             runtime,
+            transaction_results,
+            rpc_subscriptions.clone(),
         )?;
         Ok(json_rpc_service)
     }
@@ -733,6 +705,8 @@ impl JsonRpcService {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         runtime: Arc<TokioRuntime>,
+        transaction_results: Arc<Mutex<HashMap<String, TxResponse>>>,
+        rpc_subscriptions: Arc<RpcSubscriptions>,
     ) -> Result<Self, String> {
         info!("rpc bound to {rpc_addr:?}");
         info!("rpc configuration: {config:?}");
@@ -749,16 +723,6 @@ impl JsonRpcService {
         let largest_accounts_cache = Arc::new(RwLock::new(LargestAccountsCache::new(
             LARGEST_ACCOUNTS_CACHE_DURATION,
         )));
-        let tpu_address = cluster_info
-            .my_contact_info()
-            .tpu(connection_cache.protocol())
-            .ok_or_else(|| {
-                format!(
-                    "Invalid {:?} socket address for TPU",
-                    connection_cache.protocol()
-                )
-            })?;
-        let runtime = service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj);
 
         let transaction_results_clone = transaction_results.clone();
         let runtime_clone1 = runtime.clone();
@@ -827,8 +791,8 @@ impl JsonRpcService {
             .max_request_body_size
             .unwrap_or(MAX_REQUEST_BODY_SIZE);
 
-            let context = zmq::Context::new();
-            let context_clone = context.clone();
+        let context = zmq::Context::new();
+        let context_clone = context.clone();
 
         // Creating UDS sockets and binding them to send Xandeum Transactions
         // to the dock
@@ -870,7 +834,7 @@ impl JsonRpcService {
             to_dock_push_socket.clone(),
             transaction_results_clone,
             responses_clone,
-            request_id_counter
+            request_id_counter,
         );
 
         let _send_transaction_service = Arc::new(SendTransactionService::new_with_client(
@@ -953,7 +917,7 @@ impl JsonRpcService {
         let rpc_sub_clone1 = rpc_subscriptions.clone();
 
         runtime_clone1.spawn(async move {
-            let request_processor = request_processor_for_responses;
+            let _request_processor = request_processor_for_responses;
             let socket = context_clone.socket(zmq::PULL).unwrap();
 
             if let Err(e) = socket.bind("ipc:///var/run/xandeum/fromdock.sock") {
@@ -1016,6 +980,7 @@ impl JsonRpcService {
                                                 },
                                                 return_data: None,
                                                 compute_units_consumed: None,
+                                                cost_units:None
                                             };
             
                                             let slot = bank_fork_clone.read().unwrap().root_bank().slot();
@@ -1081,7 +1046,6 @@ impl JsonRpcService {
         });
 
         let close_handle = close_handle_receiver.recv().unwrap()?;
-
 
         let close_handle_ = close_handle.clone();
         validator_exit
@@ -1225,6 +1189,7 @@ mod tests {
             Arc::new(MaxSlots::default()),
             Arc::new(LeaderScheduleCache::default()),
             connection_cache,
+            Arc::new(AtomicU64::default()),
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
             Arc::new(Mutex::new(HashMap::new())),
