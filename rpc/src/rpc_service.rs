@@ -40,7 +40,7 @@ use {
         task::{Context, Poll},
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
-    }, tokio::runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime}, tokio_util::{
+    }, tokio::{runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime}, task::spawn_blocking}, tokio_util::{
         bytes::Bytes,
         codec::{BytesCodec, FramedRead},
         sync::CancellationToken,
@@ -932,108 +932,119 @@ impl JsonRpcService {
                 match socket.recv_bytes(0) {
                     Ok(msg) => {
                         debug!("Received message from dock");
-                        match ResponseWrapper::decode(&msg[..]) {
-                            Ok(wrapper) => {
-                                let response = match wrapper.response {
-                                    Some(ref resp) => resp.clone(),
-                                    None => {
-                                        error!("Received empty Response in ResponseWrapper: id={}", wrapper.id);
-                                        continue;
-                                    }
-                                };
-                                info!("response wrapper : {:?}",response);
-                                match response.response {
-                                    Some(response::Response::Tx(r)) => {
-                                        // Handle TxResponse (transaction logic)
-                                        let mut lock = transaction_results.lock().unwrap();
-                                        let sig = match Signature::from_str(&r.signature) {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                error!("Invalid signature format: {:?}", e);
-                                                continue;
-                                            }
-                                        };
-                                        if !lock.contains_key(&r.signature) {
-                                            debug!("Adding Result : {:?} ", r.clone());
-                                            let message = r.message.clone();
-                                            rpc_sub_clone1.notify_xandeum_result(
-                                                sig,
-                                                serde_json::to_value(&r).unwrap(),
-                                            );
-                                            lock.insert(r.signature.clone(), r);
-            
-                                            debug!("Adding the signature to block-store");
-            
-                                            let status = TransactionStatusMeta {
-                                                status: Ok(()),
-                                                fee: 0,
-                                                pre_balances: vec![],
-                                                post_balances: vec![],
-                                                inner_instructions: None,
-                                                log_messages: Some(vec![message.clone()]),
-                                                pre_token_balances: None,
-                                                post_token_balances: None,
-                                                rewards: None,
-                                                loaded_addresses: LoadedAddresses {
-                                                    writable: vec![],
-                                                    readonly: vec![],
-                                                },
-                                                return_data: None,
-                                                compute_units_consumed: None,
-                                                cost_units:None
-                                            };
-            
-                                            let slot = bank_fork_clone.read().unwrap().root_bank().slot();
-                                            debug!("Using bank slot: {} for signature: {}", slot, sig);
-            
-                                            if let Err(e) = block_store_clone.write_transaction_status(
-                                                slot,
-                                                sig,
-                                                std::iter::empty(),
-                                                status,0
-            
-                                            ) {
-                                                error!("Failed to insert transaction status into blockstore: {:?}", e);
-                                            } else {
-                                                info!("Transaction status stored in blockstore for signature: {} at slot: {}", sig, slot);
-                                            }
-                                        } else {
-                                            debug!("Response already exists")
+
+                        let transaction_results = transaction_results.clone();
+                        let rpc_sub_clone1 = rpc_sub_clone1.clone();
+                        let block_store_clone = block_store_clone.clone();
+                        let bank_fork_clone = bank_fork_clone.clone();
+                        let responses = responses.clone();
+
+                        spawn_blocking(move || {
+
+                       
+                            match ResponseWrapper::decode(&msg[..]) {
+                                Ok(wrapper) => {
+                                    let response = match wrapper.response {
+                                        Some(ref resp) => resp.clone(),
+                                        None => {
+                                            error!("Received empty Response in ResponseWrapper: id={}", wrapper.id);
+                                            return;
                                         }
-                                    }
-                                    Some(response::Response::Metadata(_))
-                                    | Some(response::Response::Exists(_))
-                                    | Some(response::Response::ListDir(_)) => {
-            
-                                        info!(" Received Response for Request-id = {} (as u64)", wrapper.id);
-                                        let request_id = wrapper.id;
-                                        info!("Using request_id: {} for channel lookup", request_id);
-                                        
-                                        // Skip channel delivery due to async issues, directly insert into HashMap
-                                        info!("Received response for request_id: {}, storing in HashMap", request_id);
-                                        
-                                        match responses.lock() {
-                                            Ok(mut map) => {
-                                                match map.insert(request_id, wrapper) {
-                                                    Some(_) => debug!("Overwrote existing ResponseWrapper"),
-                                                    None => info!("Inserted ResponseWrapper for request_id: {}", request_id),
+                                    };
+                                    info!("response wrapper : {:?}",response);
+                                    match response.response {
+                                        Some(response::Response::Tx(r)) => {
+                                            // Handle TxResponse (transaction logic)
+                                            let mut lock = transaction_results.lock().unwrap();
+                                            let sig = match Signature::from_str(&r.signature) {
+                                                Ok(s) => s,
+                                                Err(e) => {
+                                                    error!("Invalid signature format: {:?}", e);
+                                                    return;
+                                                }
+                                            };
+                                            if !lock.contains_key(&r.signature) {
+                                                debug!("Adding Result : {:?} ", r.clone());
+                                                let message = r.message.clone();
+                                                rpc_sub_clone1.notify_xandeum_result(
+                                                    sig,
+                                                    serde_json::to_value(&r).unwrap(),
+                                                );
+                                                lock.insert(r.signature.clone(), r);
+                
+                                                debug!("Adding the signature to block-store");
+                
+                                                let status = TransactionStatusMeta {
+                                                    status: Ok(()),
+                                                    fee: 0,
+                                                    pre_balances: vec![],
+                                                    post_balances: vec![],
+                                                    inner_instructions: None,
+                                                    log_messages: Some(vec![message.clone()]),
+                                                    pre_token_balances: None,
+                                                    post_token_balances: None,
+                                                    rewards: None,
+                                                    loaded_addresses: LoadedAddresses {
+                                                        writable: vec![],
+                                                        readonly: vec![],
+                                                    },
+                                                    return_data: None,
+                                                    compute_units_consumed: None,
+                                                    cost_units:None
+                                                };
+                
+                                                let slot = bank_fork_clone.read().unwrap().root_bank().slot();
+                                                debug!("Using bank slot: {} for signature: {}", slot, sig);
+                
+                                                if let Err(e) = block_store_clone.write_transaction_status(
+                                                    slot,
+                                                    sig,
+                                                    std::iter::empty(),
+                                                    status,0
+                
+                                                ) {
+                                                    error!("Failed to insert transaction status into blockstore: {:?}", e);
+                                                } else {
+                                                    info!("Transaction status stored in blockstore for signature: {} at slot: {}", sig, slot);
+                                                }
+                                            } else {
+                                                debug!("Response already exists")
+                                            }
+                                        }
+                                        Some(response::Response::Metadata(_))
+                                        | Some(response::Response::Exists(_))
+                                        | Some(response::Response::ListDir(_)) => {
+                
+                                            info!(" Received Response for Request-id = {} (as u64)", wrapper.id);
+                                            let request_id = wrapper.id;
+                                            info!("Using request_id: {} for channel lookup", request_id);
+                                            
+                                            // Skip channel delivery due to async issues, directly insert into HashMap
+                                            info!("Received response for request_id: {}, storing in HashMap", request_id);
+                                            
+                                            match responses.lock() {
+                                                Ok(mut map) => {
+                                                    match map.insert(request_id, wrapper) {
+                                                        Some(_) => debug!("Overwrote existing ResponseWrapper"),
+                                                        None => info!("Inserted ResponseWrapper for request_id: {}", request_id),
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to acquire lock on responses: {:?}", e);
                                                 }
                                             }
-                                            Err(e) => {
-                                                error!("Failed to acquire lock on responses: {:?}", e);
-                                            }
+                                        }
+                                        None => {
+                                            error!("Received empty response variant in ResponseWrapper: id={}", wrapper.id);
                                         }
                                     }
-                                    None => {
-                                        error!("Received empty response variant in ResponseWrapper: id={}", wrapper.id);
-                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to decode ResponseWrapper: {:?}", e);
+                                    debug!("Raw message: {:?}", msg);
                                 }
                             }
-                            Err(e) => {
-                                error!("Failed to decode ResponseWrapper: {:?}", e);
-                                debug!("Raw message: {:?}", msg);
-                            }
-                        }
+                        });
                     }
                     Err(e) => {
                         error!("Receive error: {:?}", e);
