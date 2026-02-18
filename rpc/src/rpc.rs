@@ -4754,11 +4754,12 @@ pub mod rpc_full {
                                 }
                             };
 
-                            match ix.data.split_first() {
-                                Some((op, instruction_data)) => {
-                                    if *op != 4 {
+                            match ix.data.get(1) {
+                                Some(&op) => {
+                                    if op != 4 {
                                         continue; // Safety check
                                     }
+                                    let instruction_data = &ix.data[2..];
                                     let mut request_data = instruction_data.to_vec();
                                     request_data.extend_from_slice(&pda_data); // Append PDA data
 
