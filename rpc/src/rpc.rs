@@ -4682,6 +4682,7 @@ pub mod rpc_full {
             };
             // Checking if the Transaction is Xtransaction or not
             if let Some(xand_shield_pos) = xand_shield_index {
+                info!("Xandeum transaction detected");
                 let instructions = match msg {
                     SanitizedMessage::Legacy(legacy_msg) => &legacy_msg.message.instructions,
                     SanitizedMessage::V0(v0_msg) => &v0_msg.message.instructions,
@@ -4697,8 +4698,8 @@ pub mod rpc_full {
                         .filter(|ix| ix.program_id_index as usize == xand_shield_pos)
                         .filter(|ix| {
                             ix.data
-                                .split_first()
-                                .map(|(&op, _)| op == 4)
+                                .get(1)
+                                .map(|&op| op == 4)
                                 .unwrap_or(false)
                         })
                         .collect();
@@ -4767,6 +4768,7 @@ pub mod rpc_full {
                                         data: request_data,
                                         signature: tx_hash.clone(),
                                     };
+                                    info!("Sending request to docks : {:?}",req);
 
                                     if let Ok(req_bytes) = bincode::serialize(&req) {
                                         match meta.to_dock_push_socket.lock() {
@@ -4825,9 +4827,13 @@ pub mod rpc_full {
                         // let signature = unsanitized_tx_clone.signatures[0].to_string();
                         // return Ok(signature);
                     }
+                } else {
+                    info!("No Xandeum tx detected")
                 }
+
             }
             // EndXandeum
+            info!("resssssss : {:?}",res);
             res
         }
 
