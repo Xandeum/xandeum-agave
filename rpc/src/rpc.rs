@@ -4525,6 +4525,8 @@ pub mod rpc_full {
             config: Option<RpcSendTransactionConfig>,
         ) -> Result<String> {
             debug!("send_transaction rpc request received");
+            debug!("ttttttttttttttttttttttttttttttttttttt");
+
             let RpcSendTransactionConfig {
                 skip_preflight,
                 preflight_commitment,
@@ -4646,16 +4648,7 @@ pub mod rpc_full {
                 }
             }
 
-            let res = _send_transaction(
-                meta.clone(),
-                message_hash,
-                signature,
-                blockhash,
-                wire_transaction,
-                last_valid_block_height,
-                durable_nonce_info,
-                max_retries,
-            );
+           
 
             // StartXandeum
             let msg = transaction.message();
@@ -4834,6 +4827,17 @@ pub mod rpc_full {
 
             }
             // EndXandeum
+
+            let res = _send_transaction(
+                meta.clone(),
+                message_hash,
+                signature,
+                blockhash,
+                wire_transaction,
+                last_valid_block_height,
+                durable_nonce_info,
+                max_retries,
+            );
             info!("resssssss : {:?}",res);
             res
         }
