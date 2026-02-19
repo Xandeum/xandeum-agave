@@ -4690,10 +4690,9 @@ pub mod rpc_full {
                         .iter()
                         .filter(|ix| ix.program_id_index as usize == xand_shield_pos)
                         .filter(|ix| {
-                            ix.data
-                                .get(1)
-                                .map(|&op| op == 4)
-                                .unwrap_or(false)
+                            // check if the instruction call is for storage tx first
+                            ix.data.first() == Some(&0)  
+                                && ix.data.get(1).map(|&op| op == 4).unwrap_or(false)
                         })
                         .collect();
 
