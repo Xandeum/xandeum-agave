@@ -4735,7 +4735,7 @@ pub mod rpc_full {
                             }
 
                             let signer = signers[0];
-                            let pda = &msg.static_account_keys()[ix.accounts[1] as usize];
+                            let pda = &msg.static_account_keys()[ix.accounts[2] as usize];
 
                             // Fetch PDA account data
                             let pda_data = match preflight_bank.get_account(pda) {
