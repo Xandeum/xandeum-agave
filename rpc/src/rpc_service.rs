@@ -996,17 +996,17 @@ impl JsonRpcService {
                                                 let slot = bank_fork_clone.read().unwrap().root_bank().slot();
                                                 debug!("Using bank slot: {} for signature: {}", slot, sig);
                 
-                                                if let Err(e) = block_store_clone.write_transaction_status(
-                                                    slot,
-                                                    sig,
-                                                    std::iter::empty(),
-                                                    status,0
+                                                // if let Err(e) = block_store_clone.write_transaction_status(
+                                                //     slot,
+                                                //     sig,
+                                                //     std::iter::empty(),
+                                                //     status,0
                 
-                                                ) {
-                                                    error!("Failed to insert transaction status into blockstore: {:?}", e);
-                                                } else {
-                                                    info!("Transaction status stored in blockstore for signature: {} at slot: {}", sig, slot);
-                                                }
+                                                // ) {
+                                                //     error!("Failed to insert transaction status into blockstore: {:?}", e);
+                                                // } else {
+                                                //     info!("Transaction status stored in blockstore for signature: {} at slot: {}", sig, slot);
+                                                // }
                                             } else {
                                                 debug!("Response already exists")
                                             }
