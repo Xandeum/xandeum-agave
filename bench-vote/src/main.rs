@@ -16,9 +16,10 @@ use {
     solana_pubkey::Pubkey,
     solana_signer::Signer,
     solana_streamer::{
+        nonblocking::swqos::SwQosConfig,
         packet::PacketBatchRecycler,
         quic::{
-            spawn_server, QuicServerParams, DEFAULT_MAX_QUIC_CONNECTIONS_PER_PEER,
+            spawn_server_with_cancel, QuicStreamerConfig, DEFAULT_MAX_QUIC_CONNECTIONS_PER_PEER,
             DEFAULT_MAX_STAKED_CONNECTIONS,
         },
         streamer::{receiver, PacketBatchReceiver, StakedNodes, StreamerReceiveStats},
@@ -36,6 +37,7 @@ use {
         thread::{self, spawn, JoinHandle, Result},
         time::{Duration, Instant, SystemTime},
     },
+    tokio_util::sync::CancellationToken,
 };
 
 #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
@@ -45,7 +47,6 @@ static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 const SINK_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const SINK_RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
 const SOCKET_RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
-const COALESCE_TIME: Option<Duration> = Some(Duration::from_millis(1));
 
 fn sink(
     exit: Arc<AtomicBool>,
@@ -55,6 +56,7 @@ fn sink(
 ) -> JoinHandle<()> {
     spawn(move || {
         let mut last_report = Instant::now();
+        let mut last_count = 0;
         while !exit.load(Ordering::Relaxed) {
             if let Ok(packet_batch) = receiver.recv_timeout(SINK_RECEIVE_TIMEOUT) {
                 received_size.fetch_add(packet_batch.len(), Ordering::Relaxed);
@@ -63,8 +65,11 @@ fn sink(
             let count = received_size.load(Ordering::Relaxed);
 
             if verbose && last_report.elapsed() > SINK_REPORT_INTERVAL {
-                println!("Received txns count: {count}");
+                let change = count - last_count;
+                let rate = change as u64 / SINK_REPORT_INTERVAL.as_secs();
+                println!("Received txns count: total: {count}, rate {rate}/s");
                 last_report = Instant::now();
+                last_count = count;
             }
         }
     })
@@ -83,7 +88,10 @@ fn main() -> Result<()> {
                 .value_name("KEYPAIR")
                 .takes_value(true)
                 .validator(is_keypair_or_ask_keyword)
-                .help("Identity keypair for the QUIC endpoint. If it is not specified a random key is created."),
+                .help(
+                    "Identity keypair for the QUIC endpoint. If it is not specified a random key \
+                     is created.",
+                ),
         )
         .arg(
             Arg::with_name("num-recv-sockets")
@@ -118,7 +126,9 @@ fn main() -> Result<()> {
                 .long("max-connections-per-ipaddr-per-min")
                 .value_name("NUM")
                 .takes_value(true)
-                .help("Maximum client connections per ipaddr per minute allowed on the server side."),
+                .help(
+                    "Maximum client connections per ipaddr per minute allowed on the server side.",
+                ),
         )
         .arg(
             Arg::with_name("connection-pool-size")
@@ -147,7 +157,10 @@ fn main() -> Result<()> {
                 .value_name("HOST:PORT")
                 .takes_value(true)
                 .validator(|arg| solana_net_utils::is_host_port(arg.to_string()))
-                .help("The destination streamer address to which the client will send transactions to"),
+                .help(
+                    "The destination streamer address to which the client will send transactions \
+                     to",
+                ),
         )
         .arg(
             Arg::with_name("use-connection-cache")
@@ -171,7 +184,7 @@ fn main() -> Result<()> {
         )
         .get_matches();
 
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mut num_sockets = 1usize;
     if let Some(n) = matches.value_of("num-recv-sockets") {
@@ -232,8 +245,9 @@ fn main() -> Result<()> {
         }
     });
 
-    let (exit, read_threads, sink_threads, destination) = if !client_only {
+    let (exit, cancel, read_threads, sink_threads, destination) = if !client_only {
         let exit = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
 
         let mut read_channels = Vec::new();
         let mut read_threads = Vec::new();
@@ -249,7 +263,7 @@ fn main() -> Result<()> {
         let stats = Arc::new(StreamerReceiveStats::new("bench-vote-test"));
 
         if let Some(quic_params) = &quic_params {
-            let quic_server_params = QuicServerParams {
+            let quic_server_params = QuicStreamerConfig {
                 max_connections_per_ipaddr_per_min: max_connections_per_ipaddr_per_min
                     .try_into()
                     .unwrap(),
@@ -258,18 +272,20 @@ fn main() -> Result<()> {
                 max_unstaked_connections: 0,
                 ..Default::default()
             };
+            let qos_config = SwQosConfig::default();
             let (s_reader, r_reader) = unbounded();
             read_channels.push(r_reader);
 
-            let server = spawn_server(
+            let server = spawn_server_with_cancel(
                 "solRcvrBenVote",
                 "bench_vote_metrics",
                 read_sockets,
                 &quic_params.identity_keypair,
                 s_reader,
-                exit.clone(),
                 quic_params.staked_nodes.clone(),
                 quic_server_params,
+                qos_config,
+                cancel.clone(),
             )
             .unwrap();
             read_threads.push(server.thread);
@@ -286,10 +302,10 @@ fn main() -> Result<()> {
                     s_reader,
                     recycler.clone(),
                     stats.clone(),
-                    COALESCE_TIME, // coalesce
-                    true,          // use_pinned_memory
-                    None,          // in_vote_only_mode
-                    false,         // is_staked_service
+                    None,  // coalesce
+                    true,  // use_pinned_memory
+                    None,  // in_vote_only_mode
+                    false, // is_staked_service
                 ));
             }
         }
@@ -304,12 +320,13 @@ fn main() -> Result<()> {
         println!("Running server at {destination:?}");
         (
             Some(exit),
+            Some(cancel),
             Some(read_threads),
             Some(sink_threads),
             destination,
         )
     } else {
-        (None, None, None, destination.unwrap())
+        (None, None, None, None, destination.unwrap())
     };
 
     let start = SystemTime::now();
@@ -332,6 +349,7 @@ fn main() -> Result<()> {
     if !server_only {
         if let Some(exit) = exit {
             exit.store(true, Ordering::Relaxed);
+            cancel.unwrap().cancel();
         }
     } else {
         println!("To stop the server, please press ^C");

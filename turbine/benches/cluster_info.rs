@@ -26,7 +26,7 @@ use {
 };
 
 fn broadcast_shreds_bench(b: &mut Bencher) {
-    solana_logger::setup();
+    agave_logger::setup();
     let leader_keypair = Arc::new(Keypair::new());
     let (quic_endpoint_sender, _quic_endpoint_receiver) =
         tokio::sync::mpsc::channel(/*capacity:*/ 128);
@@ -57,10 +57,10 @@ fn broadcast_shreds_bench(b: &mut Bencher) {
     let data_shreds = shredder.make_merkle_shreds_from_entries(
         &leader_keypair,
         &entries,
-        true, // is_last_in_slot
-        None, // chained_merkle_root
-        0,    // next_shred_index
-        0,    // next_code_index
+        true,            // is_last_in_slot
+        Hash::default(), // chained_merkle_root
+        0,               // next_shred_index
+        0,               // next_code_index
         &ReedSolomonCache::default(),
         &mut ProcessShredsStats::default(),
     );

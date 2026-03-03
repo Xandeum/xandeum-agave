@@ -30,7 +30,7 @@ use {
     solana_svm_timings::ExecuteTimings,
     solana_transaction::sanitized::SanitizedTransaction,
     solana_transaction_error::{TransactionError, TransactionResult as Result},
-    solana_unified_scheduler_logic::SchedulingMode,
+    solana_unified_scheduler_logic::{OrderedTaskId, SchedulingMode},
     std::{
         fmt::{self, Debug},
         mem,
@@ -177,7 +177,7 @@ pub trait InstalledScheduler: Send + Sync + Debug + 'static {
     fn schedule_execution(
         &self,
         transaction: RuntimeTransaction<SanitizedTransaction>,
-        index: usize,
+        task_id: OrderedTaskId,
     ) -> ScheduleResult;
 
     /// Return the error which caused the scheduler to abort.
@@ -513,18 +513,18 @@ impl BankWithScheduler {
     /// wait_for_termination()-ed or the unified scheduler is disabled in the first place).
     pub fn schedule_transaction_executions(
         &self,
-        transactions_with_indexes: impl ExactSizeIterator<
-            Item = (RuntimeTransaction<SanitizedTransaction>, usize),
+        transaction_with_task_ids: impl ExactSizeIterator<
+            Item = (RuntimeTransaction<SanitizedTransaction>, OrderedTaskId),
         >,
     ) -> Result<()> {
         trace!(
             "schedule_transaction_executions(): {} txs",
-            transactions_with_indexes.len()
+            transaction_with_task_ids.len()
         );
 
         let schedule_result: ScheduleResult = self.inner.with_active_scheduler(|scheduler| {
-            for (sanitized_transaction, index) in transactions_with_indexes {
-                scheduler.schedule_execution(sanitized_transaction, index)?;
+            for (sanitized_transaction, task_id) in transaction_with_task_ids {
+                scheduler.schedule_execution(sanitized_transaction, task_id)?;
             }
             Ok(())
         });
@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn test_scheduler_normal_termination() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let bank = Arc::new(Bank::default_for_tests());
         let bank = BankWithScheduler::new(
@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     fn test_no_scheduler_termination() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let bank = Arc::new(Bank::default_for_tests());
         let bank = BankWithScheduler::new_without_scheduler(bank);
@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn test_scheduler_termination_from_drop() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let bank = Arc::new(Bank::default_for_tests());
         let bank = BankWithScheduler::new(
@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn test_scheduler_pause() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let bank = Arc::new(crate::bank::tests::create_simple_test_bank(42));
         let bank = BankWithScheduler::new(
@@ -920,7 +920,7 @@ mod tests {
     }
 
     fn do_test_schedule_execution(should_succeed: bool) {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let GenesisConfigInfo {
             genesis_config,

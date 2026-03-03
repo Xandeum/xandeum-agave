@@ -11,9 +11,14 @@ use {
     solana_accounts_db::accounts_index::AccountIndex,
     solana_core::{
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
+        banking_stage::{
+            transaction_scheduler::scheduler_controller::SchedulerConfig, BankingStage,
+        },
         consensus::{tower_storage::TowerStorage, Tower},
         repair::repair_service,
-        validator::ValidatorStartProgress,
+        validator::{
+            BlockProductionMethod, SchedulerPacing, TransactionStructure, ValidatorStartProgress,
+        },
     },
     solana_geyser_plugin_manager::GeyserPluginManagerRequest,
     solana_gossip::contact_info::{ContactInfo, Protocol, SOCKET_ADDR_UNSPECIFIED},
@@ -28,6 +33,7 @@ use {
         env, error,
         fmt::{self, Display},
         net::{IpAddr, SocketAddr},
+        num::NonZeroUsize,
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -259,6 +265,16 @@ pub trait AdminRpc {
         meta: Self::Metadata,
         public_tpu_forwards_addr: SocketAddr,
     ) -> Result<()>;
+
+    #[rpc(meta, name = "manageBlockProduction")]
+    fn manage_block_production(
+        &self,
+        meta: Self::Metadata,
+        block_production_method: BlockProductionMethod,
+        transaction_struct: TransactionStructure,
+        num_workers: NonZeroUsize,
+        scheduler_pacing: SchedulerPacing,
+    ) -> Result<()>;
 }
 
 pub struct AdminRpcImpl;
@@ -446,7 +462,7 @@ impl AdminRpc for AdminRpcImpl {
 
     fn set_log_filter(&self, filter: String) -> Result<()> {
         debug!("set_log_filter admin rpc request received");
-        solana_logger::setup_with(&filter);
+        agave_logger::setup_with(&filter);
         Ok(())
     }
 
@@ -739,6 +755,50 @@ impl AdminRpc for AdminRpcImpl {
             Ok(())
         })
     }
+
+    fn manage_block_production(
+        &self,
+        meta: Self::Metadata,
+        block_production_method: BlockProductionMethod,
+        transaction_struct: TransactionStructure,
+        num_workers: NonZeroUsize,
+        scheduler_pacing: SchedulerPacing,
+    ) -> Result<()> {
+        debug!("manage_block_production rpc request received");
+
+        if num_workers > BankingStage::max_num_workers() {
+            return Err(jsonrpc_core::error::Error::invalid_params(format!(
+                "Number of workers ({}) exceeds maximum allowed ({})",
+                num_workers,
+                BankingStage::max_num_workers()
+            )));
+        }
+
+        if transaction_struct != TransactionStructure::View {
+            warn!("TransactionStructure::Sdk has no effect on block production");
+        }
+
+        meta.with_post_init(|post_init| {
+            let mut banking_stage = post_init.banking_stage.write().unwrap();
+            let Some(banking_stage) = banking_stage.as_mut() else {
+                error!("banking stage is not initialized");
+                return Err(jsonrpc_core::error::Error::internal_error());
+            };
+
+            banking_stage
+                .spawn_internal_threads(
+                    block_production_method,
+                    num_workers,
+                    SchedulerConfig { scheduler_pacing },
+                )
+                .map_err(|err| {
+                    error!("Failed to spawn new non-vote threads: {err:?}");
+                    jsonrpc_core::error::Error::internal_error()
+                })?;
+
+            Ok(())
+        })
+    }
 }
 
 impl AdminRpcImpl {
@@ -1022,9 +1082,10 @@ mod tests {
                         RwLock<repair_service::OutstandingShredRepairs>,
                     >::default(),
                     cluster_slots: Arc::new(
-                        solana_core::cluster_slots_service::cluster_slots::ClusterSlots::default(),
+                        solana_core::cluster_slots_service::cluster_slots::ClusterSlots::default_for_tests(),
                     ),
                     node: None,
+                    banking_stage: Arc::new(RwLock::new(None)),
                 }))),
                 staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
                 rpc_to_plugin_manager_sender: None,

@@ -3,7 +3,6 @@ use qualifier_attr::{field_qualifiers, qualifiers};
 use {
     crate::{
         account_overrides::AccountOverrides,
-        nonce_info::NonceInfo,
         rent_calculator::{
             check_rent_state_with_account, get_account_rent_state, RENT_EXEMPT_RENT_EPOCH,
         },
@@ -35,7 +34,7 @@ use {
     solana_svm_callback::{AccountState, TransactionProcessingCallback},
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_transaction::svm_message::SVMMessage,
-    solana_transaction_context::{IndexOfAccount, TransactionAccount},
+    solana_transaction_context::{transaction_accounts::KeyedAccountSharedData, IndexOfAccount},
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::num::{NonZeroU32, Saturating},
 };
@@ -67,34 +66,34 @@ pub(crate) enum TransactionLoadResult {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
-#[cfg_attr(feature = "svm-internal", field_qualifiers(nonce(pub)))]
+#[cfg_attr(feature = "svm-internal", field_qualifiers(nonce_address(pub)))]
 pub struct CheckedTransactionDetails {
-    pub(crate) nonce: Option<NonceInfo>,
-    pub(crate) compute_budget_and_limits: Result<SVMTransactionExecutionAndFeeBudgetLimits>,
+    pub(crate) nonce_address: Option<Pubkey>,
+    pub(crate) compute_budget_and_limits: SVMTransactionExecutionAndFeeBudgetLimits,
 }
 
 #[cfg(feature = "dev-context-only-utils")]
 impl Default for CheckedTransactionDetails {
     fn default() -> Self {
         Self {
-            nonce: None,
-            compute_budget_and_limits: Ok(SVMTransactionExecutionAndFeeBudgetLimits {
+            nonce_address: None,
+            compute_budget_and_limits: SVMTransactionExecutionAndFeeBudgetLimits {
                 budget: SVMTransactionExecutionBudget::default(),
                 loaded_accounts_data_size_limit: NonZeroU32::new(32)
                     .expect("Failed to set loaded_accounts_bytes"),
                 fee_details: FeeDetails::default(),
-            }),
+            },
         }
     }
 }
 
 impl CheckedTransactionDetails {
     pub fn new(
-        nonce: Option<NonceInfo>,
-        compute_budget_and_limits: Result<SVMTransactionExecutionAndFeeBudgetLimits>,
+        nonce_address: Option<Pubkey>,
+        compute_budget_and_limits: SVMTransactionExecutionAndFeeBudgetLimits,
     ) -> Self {
         Self {
-            nonce,
+            nonce_address,
             compute_budget_and_limits,
         }
     }
@@ -137,7 +136,7 @@ pub(crate) struct LoadedTransactionAccount {
     field_qualifiers(program_indices(pub), compute_budget(pub))
 )]
 pub struct LoadedTransaction {
-    pub accounts: Vec<TransactionAccount>,
+    pub accounts: Vec<KeyedAccountSharedData>,
     pub(crate) program_indices: Vec<IndexOfAccount>,
     pub fee_details: FeeDetails,
     pub rollback_accounts: RollbackAccounts,
@@ -303,7 +302,7 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
     fn update_accounts_for_successful_tx(
         &mut self,
         message: &impl SVMMessage,
-        transaction_accounts: &[TransactionAccount],
+        transaction_accounts: &[KeyedAccountSharedData],
     ) {
         for (i, (address, account)) in (0..message.account_keys().len()).zip(transaction_accounts) {
             if !message.is_writable(i) {
@@ -364,7 +363,7 @@ pub fn update_rent_exempt_status_for_account(rent: &Rent, account: &mut AccountS
 
 /// Check whether the payer_account is capable of paying the fee. The
 /// side effect is to subtract the fee amount from the payer_account
-/// balance of lamports. If the payer_acount is not able to pay the
+/// balance of lamports. If the payer_account is not able to pay the
 /// fee, the error_metrics is incremented, and a specific error is
 /// returned.
 pub fn validate_fee_payer(
@@ -401,12 +400,14 @@ pub fn validate_fee_payer(
             TransactionError::InsufficientFundsForFee
         })?;
 
-    let payer_pre_rent_state = get_account_rent_state(rent, payer_account);
+    let payer_pre_rent_state =
+        get_account_rent_state(rent, payer_account.lamports(), payer_account.data().len());
     payer_account
         .checked_sub_lamports(fee)
         .map_err(|_| TransactionError::InsufficientFundsForFee)?;
 
-    let payer_post_rent_state = get_account_rent_state(rent, payer_account);
+    let payer_post_rent_state =
+        get_account_rent_state(rent, payer_account.lamports(), payer_account.data().len());
     check_rent_state_with_account(
         &payer_pre_rent_state,
         &payer_post_rent_state,
@@ -455,7 +456,7 @@ pub(crate) fn load_transaction<CB: TransactionProcessingCallback>(
 
 #[derive(PartialEq, Eq, Debug, Clone)]
 struct LoadedTransactionAccounts {
-    pub(crate) accounts: Vec<TransactionAccount>,
+    pub(crate) accounts: Vec<KeyedAccountSharedData>,
     pub(crate) program_indices: Vec<IndexOfAccount>,
     pub(crate) loaded_accounts_data_size: u32,
 }
@@ -559,7 +560,7 @@ fn load_transaction_accounts_simd186<CB: TransactionProcessingCallback>(
             // This has been annotated branch-by-branch because collapsing the logic is infeasible.
             // Its purpose is to ensure programdata accounts are counted once and *only* once per
             // transaction. By checking account_keys, we never double-count a programdata account
-            // that was explictly included in the transaction. We also use a hashset to gracefully
+            // that was explicitly included in the transaction. We also use a hashset to gracefully
             // handle cases that LoaderV3 presumably makes impossible, such as self-referential
             // program accounts or multiply-referenced programdata accounts, for added safety.
             //
@@ -843,7 +844,9 @@ mod tests {
         solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
         solana_system_transaction::transfer,
         solana_transaction::{sanitized::SanitizedTransaction, Transaction},
-        solana_transaction_context::{TransactionAccount, TransactionContext},
+        solana_transaction_context::{
+            transaction_accounts::KeyedAccountSharedData, TransactionContext,
+        },
         solana_transaction_error::{TransactionError, TransactionResult as Result},
         std::{
             borrow::Cow,
@@ -915,7 +918,7 @@ mod tests {
 
     fn load_accounts_with_features_and_rent(
         tx: Transaction,
-        accounts: &[TransactionAccount],
+        accounts: &[KeyedAccountSharedData],
         rent: &Rent,
         error_metrics: &mut TransactionErrorMetrics,
         feature_set: SVMFeatureSet,
@@ -954,7 +957,7 @@ mod tests {
     #[test_case(false; "informal_loaded_size")]
     #[test_case(true; "simd186_loaded_size")]
     fn test_load_accounts_unknown_program_id(formalize_loaded_transaction_data_size: bool) {
-        let mut accounts: Vec<TransactionAccount> = Vec::new();
+        let mut accounts: Vec<KeyedAccountSharedData> = Vec::new();
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let keypair = Keypair::new();
@@ -1000,7 +1003,7 @@ mod tests {
     #[test_case(false; "informal_loaded_size")]
     #[test_case(true; "simd186_loaded_size")]
     fn test_load_accounts_no_loaders(formalize_loaded_transaction_data_size: bool) {
-        let mut accounts: Vec<TransactionAccount> = Vec::new();
+        let mut accounts: Vec<KeyedAccountSharedData> = Vec::new();
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let keypair = Keypair::new();
@@ -1061,7 +1064,7 @@ mod tests {
     #[test_case(false; "informal_loaded_size")]
     #[test_case(true; "simd186_loaded_size")]
     fn test_load_accounts_bad_owner(formalize_loaded_transaction_data_size: bool) {
-        let mut accounts: Vec<TransactionAccount> = Vec::new();
+        let mut accounts: Vec<KeyedAccountSharedData> = Vec::new();
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let keypair = Keypair::new();
@@ -1119,7 +1122,7 @@ mod tests {
     #[test_case(false; "informal_loaded_size")]
     #[test_case(true; "simd186_loaded_size")]
     fn test_load_accounts_not_executable(formalize_loaded_transaction_data_size: bool) {
-        let mut accounts: Vec<TransactionAccount> = Vec::new();
+        let mut accounts: Vec<KeyedAccountSharedData> = Vec::new();
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let keypair = Keypair::new();
@@ -1169,7 +1172,7 @@ mod tests {
     #[test_case(false; "informal_loaded_size")]
     #[test_case(true; "simd186_loaded_size")]
     fn test_load_accounts_multiple_loaders(formalize_loaded_transaction_data_size: bool) {
-        let mut accounts: Vec<TransactionAccount> = Vec::new();
+        let mut accounts: Vec<KeyedAccountSharedData> = Vec::new();
         let mut error_metrics = TransactionErrorMetrics::default();
 
         let keypair = Keypair::new();
@@ -1231,7 +1234,7 @@ mod tests {
     }
 
     fn load_accounts_no_store(
-        accounts: &[TransactionAccount],
+        accounts: &[KeyedAccountSharedData],
         tx: Transaction,
         account_overrides: Option<&AccountOverrides>,
     ) -> TransactionLoadResult {
@@ -1264,7 +1267,7 @@ mod tests {
 
     #[test]
     fn test_instructions() {
-        solana_logger::setup();
+        agave_logger::setup();
         let instructions_key = solana_sdk_ids::sysvar::instructions::id();
         let keypair = Keypair::new();
         let instructions = vec![CompiledInstruction::new(1, &(), vec![0, 1])];
@@ -1288,7 +1291,7 @@ mod tests {
 
     #[test]
     fn test_overrides() {
-        solana_logger::setup();
+        agave_logger::setup();
         let mut account_overrides = AccountOverrides::default();
         let slot_history_id = sysvar::slot_history::id();
         let account = AccountSharedData::new(42, 0, &Pubkey::default());
@@ -2842,7 +2845,7 @@ mod tests {
                     u64::MAX,
                 );
 
-                // give half loaderv3 accounts (if theyre long enough) a valid programdata
+                // give half loaderv3 accounts (if they're long enough) a valid programdata
                 // a quarter a dead pointer and a quarter nothing
                 // we set executable like a program because after the flag is disabled...
                 // ...programdata and buffer accounts can be used as program ids without aborting loading

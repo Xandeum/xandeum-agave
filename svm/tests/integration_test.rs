@@ -51,7 +51,7 @@ use {
     solana_transaction::{sanitized::SanitizedTransaction, Transaction},
     solana_transaction_context::TransactionReturnData,
     solana_transaction_error::TransactionError,
-    std::{collections::HashMap, num::NonZeroU32, sync::atomic::Ordering},
+    std::{collections::HashMap, num::NonZeroU32, slice, sync::atomic::Ordering},
     test_case::test_case,
 };
 
@@ -158,6 +158,10 @@ impl SvmTestEnvironment<'_> {
             blockhash: LAST_BLOCKHASH,
             feature_set: test_entry.feature_set,
             blockhash_lamports_per_signature: LAMPORTS_PER_SIGNATURE,
+            program_runtime_environments_for_execution: batch_processor
+                .get_environments_for_epoch(EXECUTION_EPOCH),
+            program_runtime_environments_for_deployment: batch_processor
+                .get_environments_for_epoch(EXECUTION_EPOCH),
             ..TransactionProcessingEnvironment::default()
         };
 
@@ -306,7 +310,7 @@ impl SvmTestEnvironment<'_> {
                         .global_program_cache
                         .write()
                         .unwrap()
-                        .merge(programs_modified_by_tx);
+                        .merge(&self.batch_processor.environments, programs_modified_by_tx);
                 }
             }
         }
@@ -509,17 +513,19 @@ impl SvmTestEntry {
                         .saturating_add(message.num_secp256k1_signatures())
                         .saturating_add(message.num_secp256r1_signatures());
 
-                    let compute_budget = compute_budget_limits.map(|v| {
-                        v.get_compute_budget_and_limits(
-                            v.loaded_accounts_bytes,
-                            FeeDetails::new(
-                                signature_count.saturating_mul(LAMPORTS_PER_SIGNATURE),
-                                v.get_prioritization_fee(),
-                            ),
-                            self.feature_set.raise_cpi_nesting_limit_to_8,
-                        )
-                    });
-                    CheckedTransactionDetails::new(tx_details.nonce, compute_budget)
+                    let compute_budget = compute_budget_limits
+                        .map(|v| {
+                            v.get_compute_budget_and_limits(
+                                v.loaded_accounts_bytes,
+                                FeeDetails::new(
+                                    signature_count.saturating_mul(LAMPORTS_PER_SIGNATURE),
+                                    v.get_prioritization_fee(),
+                                ),
+                                self.feature_set.raise_cpi_nesting_limit_to_8,
+                            )
+                        })
+                        .unwrap();
+                    CheckedTransactionDetails::new(tx_details.nonce_address, compute_budget)
                 });
 
                 (message, check_result)
@@ -546,11 +552,12 @@ pub struct TransactionBatchItem {
 }
 
 impl TransactionBatchItem {
+    // TODO accept Pubkey and remove all NonceInfo creation from tests
     fn with_nonce(nonce_info: NonceInfo) -> Self {
         Self {
             check_result: Ok(CheckedTransactionDetails::new(
-                Some(nonce_info),
-                Ok(SVMTransactionExecutionAndFeeBudgetLimits::default()),
+                Some(*nonce_info.address()),
+                SVMTransactionExecutionAndFeeBudgetLimits::default(),
             )),
             ..Self::default()
         }
@@ -563,7 +570,7 @@ impl Default for TransactionBatchItem {
             transaction: Transaction::default(),
             check_result: Ok(CheckedTransactionDetails::new(
                 None,
-                Ok(SVMTransactionExecutionAndFeeBudgetLimits::default()),
+                SVMTransactionExecutionAndFeeBudgetLimits::default(),
             )),
             asserts: TransactionBatchItemAsserts::default(),
         }
@@ -1662,7 +1669,7 @@ fn simd83_nonce_reuse(fee_paying_nonce: bool) -> Vec<SvmTestEntry> {
             Hash::default(),
         );
 
-        test_entry.push_nonce_transaction(first_transaction, initial_nonce_info.clone());
+        test_entry.push_transaction(first_transaction);
         test_entry.push_nonce_transaction_with_status(
             second_transaction.clone(),
             advanced_nonce_info.clone(),
@@ -1672,10 +1679,6 @@ fn simd83_nonce_reuse(fee_paying_nonce: bool) -> Vec<SvmTestEntry> {
         test_entries.push(test_entry);
     }
 
-    for test_entry in &mut test_entries {
-        test_entry.add_initial_program(program_name);
-    }
-
     // batch 5:
     // * a successful blockhash transaction that closes the nonce
     // * a nonce transaction that uses the nonce; this transaction must be dropped
@@ -1683,7 +1686,7 @@ fn simd83_nonce_reuse(fee_paying_nonce: bool) -> Vec<SvmTestEntry> {
         let mut test_entry = common_test_entry.clone();
 
         let first_transaction = Transaction::new_signed_with_payer(
-            &[withdraw_instruction.clone()],
+            slice::from_ref(&withdraw_instruction),
             Some(&fee_payer),
             &[&fee_payer_keypair],
             Hash::default(),
@@ -1711,7 +1714,7 @@ fn simd83_nonce_reuse(fee_paying_nonce: bool) -> Vec<SvmTestEntry> {
         let mut test_entry = common_test_entry.clone();
 
         let first_transaction = Transaction::new_signed_with_payer(
-            &[withdraw_instruction.clone()],
+            slice::from_ref(&withdraw_instruction),
             Some(&fee_payer),
             &[&fee_payer_keypair],
             Hash::default(),
@@ -1750,7 +1753,7 @@ fn simd83_nonce_reuse(fee_paying_nonce: bool) -> Vec<SvmTestEntry> {
         let mut test_entry = common_test_entry.clone();
 
         let first_transaction = Transaction::new_signed_with_payer(
-            &[withdraw_instruction.clone()],
+            slice::from_ref(&withdraw_instruction),
             Some(&fee_payer),
             &[&fee_payer_keypair],
             Hash::default(),
@@ -1796,7 +1799,7 @@ fn simd83_nonce_reuse(fee_paying_nonce: bool) -> Vec<SvmTestEntry> {
         let mut test_entry = common_test_entry.clone();
 
         let first_transaction = Transaction::new_signed_with_payer(
-            &[withdraw_instruction.clone()],
+            slice::from_ref(&withdraw_instruction),
             Some(&fee_payer),
             &[&fee_payer_keypair],
             Hash::default(),
@@ -1846,7 +1849,7 @@ fn simd83_nonce_reuse(fee_paying_nonce: bool) -> Vec<SvmTestEntry> {
         test_entry.add_initial_account(nonce_pubkey, &fake_nonce_account);
 
         let first_transaction = Transaction::new_signed_with_payer(
-            &[successful_noop_instruction.clone()],
+            slice::from_ref(&successful_noop_instruction),
             Some(&fee_payer),
             &[&fee_payer_keypair],
             Hash::default(),
@@ -1929,7 +1932,7 @@ fn simd83_nonce_reuse(fee_paying_nonce: bool) -> Vec<SvmTestEntry> {
             ],
             Some(&fee_payer),
             &[&fee_payer_keypair, &new_authority_keypair],
-            *advanced_durable.as_hash(),
+            *initial_durable.as_hash(),
         );
 
         test_entry.push_transaction(first_transaction);
@@ -2719,15 +2722,19 @@ fn program_cache_stats() {
     let mut system_tx_usage = 0;
     let mut successful_transfers = 0;
 
-    test_entry.push_transaction(make_transaction(&[succesful_noop_instruction.clone()]));
+    test_entry.push_transaction(make_transaction(slice::from_ref(
+        &succesful_noop_instruction,
+    )));
     noop_tx_usage += 1;
 
-    test_entry.push_transaction(make_transaction(&[succesful_transfer_instruction.clone()]));
+    test_entry.push_transaction(make_transaction(slice::from_ref(
+        &succesful_transfer_instruction,
+    )));
     system_tx_usage += 1;
     successful_transfers += 1;
 
     test_entry.push_transaction_with_status(
-        make_transaction(&[failing_transfer_instruction.clone()]),
+        make_transaction(slice::from_ref(&failing_transfer_instruction)),
         ExecutionStatus::ExecutedFailed,
     );
     system_tx_usage += 1;
@@ -2771,7 +2778,7 @@ fn program_cache_stats() {
 
     // nor does discard
     test_entry.transaction_batch.push(TransactionBatchItem {
-        transaction: make_transaction(&[succesful_transfer_instruction.clone()]),
+        transaction: make_transaction(slice::from_ref(&succesful_transfer_instruction)),
         check_result: Err(TransactionError::BlockhashNotFound),
         asserts: ExecutionStatus::Discarded.into(),
     });
@@ -2847,7 +2854,7 @@ fn program_cache_stats() {
     test_entry.drop_expected_account(buffer_address);
 
     test_entry.push_transaction_with_status(
-        make_transaction(&[succesful_noop_instruction.clone()]),
+        make_transaction(slice::from_ref(&succesful_noop_instruction)),
         ExecutionStatus::ExecutedFailed,
     );
     noop_tx_usage += 1;
@@ -2882,7 +2889,7 @@ fn program_cache_stats() {
     };
 
     test_entry.push_transaction_with_status(
-        make_transaction(&[succesful_noop_instruction.clone()]),
+        make_transaction(slice::from_ref(&succesful_noop_instruction)),
         ExecutionStatus::ExecutedFailed,
     );
     noop_tx_usage += 1;
@@ -3034,8 +3041,8 @@ fn svm_inspect_nonce_load_failure(
     // by signing with the dummy account we ensure it precedes a separate nonce
     let transaction = Transaction::new_signed_with_payer(
         &[
-            compute_instruction,
             advance_instruction,
+            compute_instruction,
             fee_only_noop_instruction,
         ],
         Some(&fee_payer),
@@ -3285,17 +3292,12 @@ mod balance_collector {
         super::*,
         rand0_7::prelude::*,
         solana_program_pack::Pack,
-        solana_sdk_ids::bpf_loader,
         spl_generic_token::token_2022,
         spl_token_interface::state::{
             Account as TokenAccount, AccountState as TokenAccountState, Mint,
         },
         test_case::test_case,
     };
-
-    // this could be part of mock_bank but so far nothing but this uses it
-    static SPL_TOKEN_BYTES: &[u8] =
-        include_bytes!("../../program-test/src/programs/spl_token-3.5.0.so");
 
     const STARTING_BALANCE: u64 = LAMPORTS_PER_SOL * 100;
 
@@ -3417,13 +3419,10 @@ mod balance_collector {
             u64::MAX,
         );
 
-        let spl_token = AccountSharedData::create(
-            LAMPORTS_PER_SOL,
-            SPL_TOKEN_BYTES.to_vec(),
-            bpf_loader::id(),
-            true,
-            u64::MAX,
-        );
+        let (_, spl_token) =
+            solana_program_binaries::by_id(&spl_token_interface::id(), &Rent::default())
+                .unwrap()
+                .swap_remove(0);
 
         for _ in 0..100 {
             let mut test_entry = SvmTestEntry::default();

@@ -61,14 +61,14 @@ pub(crate) fn recv_from(
                 }
             }
             Err(e) => {
-                trace!("recv_from err {:?}", e);
+                trace!("recv_from err {e:?}");
                 return Err(e);
             }
             Ok(npkts) => {
                 if i == 0 {
                     socket.set_nonblocking(true)?;
                 }
-                trace!("got {} packets", npkts);
+                trace!("got {npkts} packets");
                 i += npkts;
                 // Try to batch into big enough buffers
                 // will cause less re-shuffling later on.
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     pub fn packet_send_recv() {
-        solana_logger::setup();
+        agave_logger::setup();
         let recv_socket = bind_to_localhost_unique().expect("should bind - receiver");
         let addr = recv_socket.local_addr().unwrap();
         let send_socket = bind_to_localhost_unique().expect("should bind - sender");
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_packet_resize() {
-        solana_logger::setup();
+        agave_logger::setup();
         let recv_socket = bind_to_localhost_unique().expect("should bind - receiver");
         let addr = recv_socket.local_addr().unwrap();
         let send_socket = bind_to_localhost_unique().expect("should bind - sender");

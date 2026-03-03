@@ -21,7 +21,7 @@ use {
 
 #[test]
 fn test_no_panic_banks_client() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let GenesisConfigInfo {
         genesis_config,
@@ -58,7 +58,7 @@ fn test_no_panic_banks_client() {
 
 #[test]
 fn test_no_panic_rpc_client() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let program_id = Pubkey::new_unique();
     let (test_validator, payer) = TestValidatorGenesis::default()
@@ -88,8 +88,8 @@ fn test_no_panic_rpc_client() {
         match rpc_client.send_and_confirm_transaction(&transaction) {
             Ok(_) => break,
             Err(e) => {
-                if !format!("{:?}", e).contains("Program is not deployed") {
-                    panic!("Unexpected error: {:?}", e);
+                if !format!("{e:?}").contains("Program is not deployed") {
+                    panic!("Unexpected error: {e:?}");
                 }
                 attempt += 1;
                 if attempt > MAX_ATTEMPTS {

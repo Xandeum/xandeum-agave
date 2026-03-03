@@ -80,37 +80,41 @@ pub(crate) fn load_program_accounts<CB: TransactionProcessingCallback>(
         );
     }
 
-    if bpf_loader_deprecated::check_id(program_account.owner()) {
-        return Some(ProgramAccountLoadResult::ProgramOfLoaderV1(program_account));
+    if bpf_loader_upgradeable::check_id(program_account.owner()) {
+        if let Ok(UpgradeableLoaderState::Program {
+            programdata_address,
+        }) = program_account.state()
+        {
+            if let Some((programdata_account, _slot)) =
+                callbacks.get_account_shared_data(&programdata_address)
+            {
+                if let Ok(UpgradeableLoaderState::ProgramData {
+                    slot,
+                    upgrade_authority_address: _,
+                }) = programdata_account.state()
+                {
+                    return Some(ProgramAccountLoadResult::ProgramOfLoaderV3(
+                        program_account,
+                        programdata_account,
+                        slot,
+                    ));
+                }
+            }
+        }
+        return Some(ProgramAccountLoadResult::InvalidAccountData(
+            ProgramCacheEntryOwner::LoaderV3,
+        ));
     }
 
     if bpf_loader::check_id(program_account.owner()) {
         return Some(ProgramAccountLoadResult::ProgramOfLoaderV2(program_account));
     }
 
-    if let Ok(UpgradeableLoaderState::Program {
-        programdata_address,
-    }) = program_account.state()
-    {
-        if let Some((programdata_account, _slot)) =
-            callbacks.get_account_shared_data(&programdata_address)
-        {
-            if let Ok(UpgradeableLoaderState::ProgramData {
-                slot,
-                upgrade_authority_address: _,
-            }) = programdata_account.state()
-            {
-                return Some(ProgramAccountLoadResult::ProgramOfLoaderV3(
-                    program_account,
-                    programdata_account,
-                    slot,
-                ));
-            }
-        }
+    if bpf_loader_deprecated::check_id(program_account.owner()) {
+        return Some(ProgramAccountLoadResult::ProgramOfLoaderV1(program_account));
     }
-    Some(ProgramAccountLoadResult::InvalidAccountData(
-        ProgramCacheEntryOwner::LoaderV3,
-    ))
+
+    None
 }
 
 /// Loads the program with the given pubkey.
@@ -290,14 +294,6 @@ mod tests {
                 .borrow()
                 .get(pubkey)
                 .map(|account| (account.clone(), 0))
-        }
-
-        fn add_builtin_account(&self, name: &str, program_id: &Pubkey) {
-            let mut account_data = AccountSharedData::default();
-            account_data.set_data(name.as_bytes().to_vec());
-            self.account_shared_data
-                .borrow_mut()
-                .insert(*program_id, account_data);
         }
     }
 
@@ -515,7 +511,7 @@ mod tests {
 
         let result = load_program_with_pubkey(
             &mock_bank,
-            &batch_processor.get_environments_for_epoch(50).unwrap(),
+            &batch_processor.get_environments_for_epoch(50),
             &key,
             500,
             &mut ExecuteTimings::default(),
@@ -538,7 +534,7 @@ mod tests {
 
         let result = load_program_with_pubkey(
             &mock_bank,
-            &batch_processor.get_environments_for_epoch(20).unwrap(),
+            &batch_processor.get_environments_for_epoch(20),
             &key,
             0, // Slot 0
             &mut ExecuteTimings::default(),
@@ -551,7 +547,6 @@ mod tests {
             ProgramCacheEntryType::FailedVerification(
                 batch_processor
                     .get_environments_for_epoch(20)
-                    .unwrap()
                     .program_runtime_v1,
             ),
         );
@@ -573,7 +568,7 @@ mod tests {
         // This should return an error
         let result = load_program_with_pubkey(
             &mock_bank,
-            &batch_processor.get_environments_for_epoch(20).unwrap(),
+            &batch_processor.get_environments_for_epoch(20),
             &key,
             200,
             &mut ExecuteTimings::default(),
@@ -585,7 +580,6 @@ mod tests {
             ProgramCacheEntryType::FailedVerification(
                 batch_processor
                     .get_environments_for_epoch(20)
-                    .unwrap()
                     .program_runtime_v1,
             ),
         );
@@ -601,7 +595,7 @@ mod tests {
 
         let result = load_program_with_pubkey(
             &mock_bank,
-            &batch_processor.get_environments_for_epoch(20).unwrap(),
+            &batch_processor.get_environments_for_epoch(20),
             &key,
             200,
             &mut ExecuteTimings::default(),
@@ -655,7 +649,7 @@ mod tests {
         // This should return an error
         let result = load_program_with_pubkey(
             &mock_bank,
-            &batch_processor.get_environments_for_epoch(0).unwrap(),
+            &batch_processor.get_environments_for_epoch(0),
             &key1,
             0,
             &mut ExecuteTimings::default(),
@@ -667,7 +661,6 @@ mod tests {
             ProgramCacheEntryType::FailedVerification(
                 batch_processor
                     .get_environments_for_epoch(0)
-                    .unwrap()
                     .program_runtime_v1,
             ),
         );
@@ -693,7 +686,7 @@ mod tests {
 
         let result = load_program_with_pubkey(
             &mock_bank,
-            &batch_processor.get_environments_for_epoch(20).unwrap(),
+            &batch_processor.get_environments_for_epoch(20),
             &key1,
             200,
             &mut ExecuteTimings::default(),
@@ -743,7 +736,7 @@ mod tests {
 
         let result = load_program_with_pubkey(
             &mock_bank,
-            &batch_processor.get_environments_for_epoch(0).unwrap(),
+            &batch_processor.get_environments_for_epoch(0),
             &key,
             0,
             &mut ExecuteTimings::default(),
@@ -755,7 +748,6 @@ mod tests {
             ProgramCacheEntryType::FailedVerification(
                 batch_processor
                     .get_environments_for_epoch(0)
-                    .unwrap()
                     .program_runtime_v1,
             ),
         );
@@ -777,7 +769,7 @@ mod tests {
 
         let result = load_program_with_pubkey(
             &mock_bank,
-            &batch_processor.get_environments_for_epoch(20).unwrap(),
+            &batch_processor.get_environments_for_epoch(20),
             &key,
             200,
             &mut ExecuteTimings::default(),
@@ -811,13 +803,14 @@ mod tests {
         let mut account_data = AccountSharedData::default();
         account_data.set_owner(bpf_loader::id());
         let batch_processor = TransactionBatchProcessor::<TestForkGraph>::default();
-
         let upcoming_environments = ProgramRuntimeEnvironments::default();
-        let current_environments = {
-            let mut global_program_cache = batch_processor.global_program_cache.write().unwrap();
-            global_program_cache.upcoming_environments = Some(upcoming_environments.clone());
-            global_program_cache.environments.clone()
-        };
+        let current_environments = batch_processor.environments.clone();
+        {
+            let mut epoch_boundary_preparation =
+                batch_processor.epoch_boundary_preparation.write().unwrap();
+            epoch_boundary_preparation.upcoming_epoch = 1;
+            epoch_boundary_preparation.upcoming_environments = Some(upcoming_environments.clone());
+        }
         mock_bank
             .account_shared_data
             .borrow_mut()
@@ -826,9 +819,7 @@ mod tests {
         for is_upcoming_env in [false, true] {
             let result = load_program_with_pubkey(
                 &mock_bank,
-                &batch_processor
-                    .get_environments_for_epoch(is_upcoming_env as u64)
-                    .unwrap(),
+                &batch_processor.get_environments_for_epoch(is_upcoming_env as u64),
                 &key,
                 200,
                 &mut ExecuteTimings::default(),

@@ -54,7 +54,8 @@ impl GossipService {
         let (request_sender, request_receiver) =
             EvictingSender::new_bounded(GOSSIP_CHANNEL_CAPACITY);
         trace!(
-            "GossipService: id: {}, listening on primary interface: {:?}, all available interfaces: {:?}",
+            "GossipService: id: {}, listening on primary interface: {:?}, all available \
+             interfaces: {:?}",
             &cluster_info.id(),
             gossip_sockets[0].local_addr().unwrap(),
             gossip_sockets,
@@ -142,16 +143,6 @@ impl GossipService {
         }
         Ok(())
     }
-}
-
-/// Discover Validators in a cluster
-#[deprecated(since = "3.0.0", note = "use `discover_validators` instead")]
-pub fn discover_cluster(
-    entrypoint: &SocketAddr,
-    num_nodes: usize,
-    socket_addr_space: SocketAddrSpace,
-) -> std::io::Result<Vec<ContactInfo>> {
-    discover_validators(entrypoint, num_nodes, 0, socket_addr_space)
 }
 
 pub fn discover_validators(
@@ -396,16 +387,13 @@ mod tests {
     };
 
     #[test]
-    #[ignore]
     // test that stage will exit when flag is set
     fn test_exit() {
         let exit = Arc::new(AtomicBool::new(false));
-        let tn = Node::new_localhost();
-        let cluster_info = ClusterInfo::new(
-            tn.info.clone(),
-            Arc::new(Keypair::new()),
-            SocketAddrSpace::Unspecified,
-        );
+        let kp = Keypair::new();
+        let tn = Node::new_localhost_with_pubkey(&kp.pubkey());
+        let cluster_info =
+            ClusterInfo::new(tn.info.clone(), Arc::new(kp), SocketAddrSpace::Unspecified);
         let c = Arc::new(cluster_info);
         let d = GossipService::new(
             &c,

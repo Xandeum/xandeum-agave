@@ -29,7 +29,7 @@ usage() {
     echo "Error: $*"
   fi
   cat <<EOF
-usage: $0 [+<cargo version>] [--debug] [--validator-only] [--release-with-debug] <install directory>
+usage: $0 [+<cargo version>] [--debug] [--validator-only] [--release-with-debug] [--no-spl-token] <install directory>
 EOF
   exit $exitcode
 }
@@ -42,6 +42,7 @@ installDir=
 buildProfileArg='--profile release'
 buildProfile='release'
 validatorOnly=
+noSPLToken=
 
 while [[ -n $1 ]]; do
   if [[ ${1:0:1} = - ]]; then
@@ -59,6 +60,9 @@ while [[ -n $1 ]]; do
       shift
     elif [[ $1 = --validator-only ]]; then
       validatorOnly=true
+      shift
+    elif [[ $1 = --no-spl-token ]]; then
+      noSPLToken=true
       shift
     else
       usage "Unknown option: $1"
@@ -98,7 +102,7 @@ else
   echo "Building binaries for all platforms: ${AGAVE_BINS_DEV[*]} ${AGAVE_BINS_END_USER[*]} ${AGAVE_BINS_DEPRECATED[*]}"
   BINS+=("${AGAVE_BINS_DEV[@]}" "${AGAVE_BINS_END_USER[@]}" "${AGAVE_BINS_DEPRECATED[@]}")
 
-  if [[ $CI_OS_NAME != windows ]]; then
+  if [[ $OSTYPE != msys ]]; then
     echo "Building binaries for linux and osx only: ${AGAVE_BINS_VAL_OP[*]}, ${AGAVE_BINS_DCOU[*]}"
     BINS+=("${AGAVE_BINS_VAL_OP[@]}")
     DCOU_BINS+=("${AGAVE_BINS_DCOU[@]}")
@@ -113,11 +117,6 @@ done
 dcouBinArgs=()
 for bin in "${DCOU_BINS[@]}"; do
   dcouBinArgs+=(--bin "$bin")
-done
-
-excludeArgs=()
-for package in "${DCOU_TAINTED_PACKAGES[@]}"; do
-  excludeArgs+=(--exclude "$package")
 done
 
 cargo_build() {
@@ -146,25 +145,25 @@ check_dcou() {
   # output after turning rustc into the nightly mode with RUSTC_BOOTSTRAP=1.
   # In this way, additional requirement of nightly rustc toolchian is avoided.
   # Note that `cargo tree` can't be used, because it doesn't support `--bin`.
-  if check_dcou "${binArgs[@]}" --workspace "${excludeArgs[@]}"; then
+  if check_dcou "${binArgs[@]}" --workspace; then
      echo 'dcou feature activation is incorrectly activated!'
      exit 1
   fi
 
   # Build our production binaries without dcou.
-  cargo_build "${binArgs[@]}" --workspace "${excludeArgs[@]}"
+  cargo_build "${binArgs[@]}" --workspace
 
   # Finally, build the remaining dev tools with dcou.
   if [[ ${#dcouBinArgs[@]} -gt 0 ]]; then
-    if ! check_dcou "${dcouBinArgs[@]}"; then
+    if ! check_dcou --manifest-path "dev-bins/Cargo.toml" "${dcouBinArgs[@]}"; then
        echo 'dcou feature activation is incorrectly remain to be deactivated!'
        exit 1
     fi
-    cargo_build "${dcouBinArgs[@]}"
+    cargo_build --manifest-path "dev-bins/Cargo.toml" "${dcouBinArgs[@]}"
   fi
 
-  # Exclude `spl-token` binary for net.sh builds
-  if [[ -z "$validatorOnly" ]]; then
+  # Exclude `spl-token` if requested
+  if [[ -z "$noSPLToken" ]]; then
     # shellcheck source=scripts/spl-token-cli-version.sh
     source "$SOLANA_ROOT"/scripts/spl-token-cli-version.sh
 
@@ -173,11 +172,15 @@ check_dcou() {
   fi
 )
 
-for bin in "${BINS[@]}" "${DCOU_BINS[@]}"; do
+for bin in "${BINS[@]}"; do
   cp -fv "target/$buildProfile/$bin" "$installDir"/bin
 done
 
-if [[ $CI_OS_NAME != windows ]]; then
+for bin in "${DCOU_BINS[@]}"; do
+  cp -fv "dev-bins/target/$buildProfile/$bin" "$installDir"/bin
+done
+
+if [[ $OSTYPE != msys ]]; then
   ./fetch-perf-libs.sh
 
   if [[ -d target/perf-libs ]]; then

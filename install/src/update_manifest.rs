@@ -1,5 +1,5 @@
 use {
-    serde_derive::{Deserialize, Serialize},
+    serde::{Deserialize, Serialize},
     solana_hash::Hash,
     solana_keypair::signable::Signable,
     solana_pubkey::Pubkey,
@@ -29,7 +29,7 @@ impl Signable for SignedUpdateManifest {
         self.account_pubkey
     }
 
-    fn signable_data(&self) -> Cow<[u8]> {
+    fn signable_data(&self) -> Cow<'_, [u8]> {
         Cow::Owned(bincode::serialize(&self.manifest).expect("serialize"))
     }
     fn get_signature(&self) -> Signature {

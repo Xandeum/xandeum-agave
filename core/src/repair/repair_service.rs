@@ -27,6 +27,7 @@ use {
     solana_epoch_schedule::EpochSchedule,
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
+    solana_keypair::Signer,
     solana_ledger::{
         blockstore::{Blockstore, SlotMeta},
         shred,
@@ -35,7 +36,7 @@ use {
     solana_pubkey::Pubkey,
     solana_runtime::{
         bank::Bank,
-        bank_forks::{BankForks, SharableBank},
+        bank_forks::{BankForks, SharableBanks},
     },
     solana_streamer::sendmmsg::{batch_send, SendPktsError},
     solana_time_utils::timestamp,
@@ -420,7 +421,7 @@ impl RepairServiceChannels {
 }
 
 struct RepairTracker {
-    root_bank: SharableBank,
+    sharable_banks: SharableBanks,
     repair_weight: RepairWeight,
     serve_repair: ServeRepair,
     repair_metrics: RepairMetrics,
@@ -633,6 +634,7 @@ impl RepairService {
         repair_metrics: &mut RepairMetrics,
     ) {
         let mut build_repairs_batch_elapsed = Measure::start("build_repairs_batch_elapsed");
+        let identity_keypair = repair_info.cluster_info.keypair();
         let batch: Vec<(Vec<u8>, SocketAddr)> = {
             let mut outstanding_requests = outstanding_requests.write().unwrap();
             repairs
@@ -646,7 +648,7 @@ impl RepairService {
                             &mut repair_metrics.stats,
                             &repair_info.repair_validators,
                             &mut outstanding_requests,
-                            &repair_info.cluster_info.keypair(),
+                            &identity_keypair,
                             repair_request_quic_sender,
                             repair_protocol,
                         )
@@ -667,7 +669,7 @@ impl RepairService {
                     error!(
                         "{} batch_send failed to send {num_failed}/{num_pkts} packets first error \
                          {err:?}",
-                        repair_info.cluster_info.id()
+                        identity_keypair.pubkey()
                     );
                 }
             }
@@ -693,7 +695,7 @@ impl RepairService {
             popular_pruned_forks_sender,
         } = repair_channels;
         let RepairTracker {
-            root_bank,
+            sharable_banks,
             repair_weight,
             serve_repair,
             repair_metrics,
@@ -701,7 +703,7 @@ impl RepairService {
             popular_pruned_forks_requests,
             outstanding_repairs,
         } = repair_tracker;
-        let root_bank = root_bank.load();
+        let root_bank = sharable_banks.root();
 
         Self::update_weighting_heuristic(
             blockstore,
@@ -751,15 +753,15 @@ impl RepairService {
         repair_info: RepairInfo,
         outstanding_requests: &RwLock<OutstandingShredRepairs>,
     ) {
-        let root_bank = repair_info.bank_forks.read().unwrap().sharable_root_bank();
-        let root_bank_slot = root_bank.load().slot();
+        let sharable_banks = repair_info.bank_forks.read().unwrap().sharable_banks();
+        let root_bank_slot = sharable_banks.root().slot();
         let mut repair_tracker = RepairTracker {
-            root_bank,
+            sharable_banks,
             repair_weight: RepairWeight::new(root_bank_slot),
             serve_repair: {
                 ServeRepair::new(
                     repair_info.cluster_info.clone(),
-                    repair_info.bank_forks.read().unwrap().sharable_root_bank(),
+                    repair_info.bank_forks.read().unwrap().sharable_banks(),
                     repair_info.repair_whitelist.clone(),
                     Box::new(StandardRepairHandler::new(blockstore.clone())),
                 )
@@ -1051,7 +1053,8 @@ impl RepairService {
             .add_request(repair_request, timestamp());
 
         // Create repair request
-        let header = RepairRequestHeader::new(cluster_info.id(), pubkey, timestamp(), nonce);
+        let header =
+            RepairRequestHeader::new(identity_keypair.pubkey(), pubkey, timestamp(), nonce);
         let request_proto = RepairProtocol::WindowIndex {
             header,
             slot,
@@ -1166,6 +1169,7 @@ impl RepairService {
                 cluster_slots,
                 serve_repair,
                 repair_validators,
+                &identity_keypair.pubkey(),
             );
             if let Some((repair_pubkey, repair_addr)) = status.repair_pubkey_and_addr {
                 let repairs = Self::generate_duplicate_repairs_for_slot(blockstore, *slot);
@@ -1210,13 +1214,19 @@ impl RepairService {
         cluster_slots: &ClusterSlots,
         serve_repair: &ServeRepair,
         repair_validators: &Option<HashSet<Pubkey>>,
+        my_pubkey: &Pubkey,
     ) {
         let now = timestamp();
         if status.repair_pubkey_and_addr.is_none()
             || now.saturating_sub(status.start_ts) >= MAX_DUPLICATE_WAIT_MS as u64
         {
             status.repair_pubkey_and_addr = serve_repair
-                .repair_request_duplicate_compute_best_peer(slot, cluster_slots, repair_validators);
+                .repair_request_duplicate_compute_best_peer(
+                    slot,
+                    cluster_slots,
+                    repair_validators,
+                    my_pubkey,
+                );
             status.start_ts = timestamp();
         }
     }
@@ -1229,6 +1239,7 @@ impl RepairService {
         cluster_slots: &ClusterSlots,
         serve_repair: &ServeRepair,
         repair_validators: &Option<HashSet<Pubkey>>,
+        my_pubkey: &Pubkey,
     ) {
         // If we're already in the middle of repairing this, ignore the signal.
         if duplicate_slot_repair_statuses.contains_key(&slot) {
@@ -1240,6 +1251,7 @@ impl RepairService {
             slot,
             cluster_slots,
             repair_validators,
+            my_pubkey,
         );
         let new_duplicate_slot_repair_status = DuplicateSlotRepairStatus {
             correct_ancestor_to_repair: (slot, Hash::default()),
@@ -1641,13 +1653,13 @@ mod test {
         let bank_forks = BankForks::new_rw_arc(bank);
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
-        let cluster_slots = ClusterSlots::default();
+        let cluster_slots = ClusterSlots::default_for_tests();
         let cluster_info = Arc::new(new_test_cluster_info());
         let identity_keypair = cluster_info.keypair();
         let serve_repair = {
             ServeRepair::new(
                 cluster_info,
-                bank_forks.read().unwrap().sharable_root_bank(),
+                bank_forks.read().unwrap().sharable_banks(),
                 Arc::new(RwLock::new(HashSet::default())),
                 Box::new(StandardRepairHandler::new(blockstore.clone())),
             )
@@ -1749,17 +1761,18 @@ mod test {
         let serve_repair = {
             ServeRepair::new(
                 cluster_info.clone(),
-                bank_forks.read().unwrap().sharable_root_bank(),
+                bank_forks.read().unwrap().sharable_banks(),
                 Arc::new(RwLock::new(HashSet::default())),
                 Box::new(StandardRepairHandler::new(blockstore)),
             )
         };
         let valid_repair_peer = Node::new_localhost().info;
+        let my_pubkey = cluster_info.id();
 
         // Signal that this peer has confirmed the dead slot, and is thus
         // a valid target for repair
         let dead_slot = 9;
-        let cluster_slots = ClusterSlots::default();
+        let cluster_slots = ClusterSlots::default_for_tests();
         cluster_slots.fake_epoch_info_for_tests(HashMap::from([(*valid_repair_peer.pubkey(), 42)]));
         cluster_slots.insert_node_id(dead_slot, *valid_repair_peer.pubkey());
         cluster_info.insert_info(valid_repair_peer);
@@ -1777,6 +1790,7 @@ mod test {
             &cluster_slots,
             &serve_repair,
             &None,
+            &my_pubkey,
         );
         assert_eq!(duplicate_status.repair_pubkey_and_addr, dummy_addr);
 
@@ -1792,6 +1806,7 @@ mod test {
             &cluster_slots,
             &serve_repair,
             &None,
+            &my_pubkey,
         );
         assert!(duplicate_status.repair_pubkey_and_addr.is_some());
 
@@ -1807,13 +1822,14 @@ mod test {
             &cluster_slots,
             &serve_repair,
             &None,
+            &my_pubkey,
         );
         assert_ne!(duplicate_status.repair_pubkey_and_addr, dummy_addr);
     }
 
     #[test]
     fn test_generate_repairs_for_wen_restart() {
-        solana_logger::setup();
+        agave_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let max_repairs = 3;

@@ -2153,7 +2153,7 @@ pub(crate) mod tests {
         OptimisticallyConfirmedBankTracker::process_notification(
             (
                 BankNotification::OptimisticallyConfirmed(3),
-                None, /* no work sequence */
+                None, /* no dependency work */
             ),
             &bank_forks,
             &optimistically_confirmed_bank,
@@ -2210,7 +2210,7 @@ pub(crate) mod tests {
         OptimisticallyConfirmedBankTracker::process_notification(
             (
                 BankNotification::Frozen(bank3),
-                None, /* no work sequence */
+                None, /* no dependency work */
             ),
             &bank_forks,
             &optimistically_confirmed_bank,
@@ -2333,7 +2333,7 @@ pub(crate) mod tests {
         OptimisticallyConfirmedBankTracker::process_notification(
             (
                 BankNotification::OptimisticallyConfirmed(3),
-                None, /* no work sequence */
+                None, /* no dependency work */
             ),
             &bank_forks,
             &optimistically_confirmed_bank,
@@ -2452,7 +2452,7 @@ pub(crate) mod tests {
         OptimisticallyConfirmedBankTracker::process_notification(
             (
                 BankNotification::OptimisticallyConfirmed(3),
-                None, /* no work sequence */
+                None, /* no dependency work */
             ),
             &bank_forks,
             &optimistically_confirmed_bank,
@@ -2511,7 +2511,7 @@ pub(crate) mod tests {
         OptimisticallyConfirmedBankTracker::process_notification(
             (
                 BankNotification::Frozen(bank3),
-                None, /* no work sequence */
+                None, /* no dependency work */
             ),
             &bank_forks,
             &optimistically_confirmed_bank,
@@ -2961,7 +2961,7 @@ pub(crate) mod tests {
         OptimisticallyConfirmedBankTracker::process_notification(
             (
                 BankNotification::OptimisticallyConfirmed(1),
-                None, /* no work sequence */
+                None, /* no dependency work */
             ),
             &bank_forks,
             &optimistically_confirmed_bank,
@@ -3020,7 +3020,7 @@ pub(crate) mod tests {
         OptimisticallyConfirmedBankTracker::process_notification(
             (
                 BankNotification::Frozen(bank2),
-                None, /* no work sequence */
+                None, /* no dependency work */
             ),
             &bank_forks,
             &optimistically_confirmed_bank,

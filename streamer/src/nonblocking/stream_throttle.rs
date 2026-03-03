@@ -9,9 +9,14 @@ use {
         },
         time::{Duration, Instant},
     },
+    tokio::time::sleep,
 };
 
-const MAX_UNSTAKED_STREAMS_PERCENT: u64 = 20;
+/// Max TPS allowed for unstaked connection
+const MAX_UNSTAKED_TPS: u64 = 200;
+/// Expected % of max TPS to be consumed by unstaked connections
+const EXPECTED_UNSTAKED_STREAMS_PERCENT: u64 = 20;
+
 pub const STREAM_THROTTLING_INTERVAL_MS: u64 = 100;
 pub const STREAM_THROTTLING_INTERVAL: Duration =
     Duration::from_millis(STREAM_THROTTLING_INTERVAL_MS);
@@ -31,6 +36,7 @@ pub(crate) struct StakedStreamLoadEMA {
     max_staked_load_in_ema_window: u64,
     // Maximum number of streams for an unstaked connection in stream throttling window
     max_unstaked_load_in_throttling_window: u64,
+    max_streams_per_ms: u64,
 }
 
 impl StakedStreamLoadEMA {
@@ -42,16 +48,14 @@ impl StakedStreamLoadEMA {
         let allow_unstaked_streams = max_unstaked_connections > 0;
         let max_staked_load_in_ema_window = if allow_unstaked_streams {
             (max_streams_per_ms
-                - Percentage::from(MAX_UNSTAKED_STREAMS_PERCENT).apply_to(max_streams_per_ms))
+                - Percentage::from(EXPECTED_UNSTAKED_STREAMS_PERCENT).apply_to(max_streams_per_ms))
                 * EMA_WINDOW_MS
         } else {
             max_streams_per_ms * EMA_WINDOW_MS
         };
 
         let max_unstaked_load_in_throttling_window = if allow_unstaked_streams {
-            Percentage::from(MAX_UNSTAKED_STREAMS_PERCENT)
-                .apply_to(max_streams_per_ms * STREAM_THROTTLING_INTERVAL_MS)
-                .saturating_div(max_unstaked_connections as u64)
+            MAX_UNSTAKED_TPS * STREAM_THROTTLING_INTERVAL_MS / 1000
         } else {
             0
         };
@@ -63,6 +67,7 @@ impl StakedStreamLoadEMA {
             stats,
             max_staked_load_in_ema_window,
             max_unstaked_load_in_throttling_window,
+            max_streams_per_ms,
         }
     }
 
@@ -181,16 +186,20 @@ impl StakedStreamLoadEMA {
             }
         }
     }
+
+    pub(crate) fn max_streams_per_ms(&self) -> u64 {
+        self.max_streams_per_ms
+    }
 }
 
 #[derive(Debug)]
-pub(crate) struct ConnectionStreamCounter {
+pub struct ConnectionStreamCounter {
     pub(crate) stream_count: AtomicU64,
     last_throttling_instant: RwLock<tokio::time::Instant>,
 }
 
 impl ConnectionStreamCounter {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             stream_count: AtomicU64::default(),
             last_throttling_instant: RwLock::new(tokio::time::Instant::now()),
@@ -215,6 +224,46 @@ impl ConnectionStreamCounter {
             *last_throttling_instant
         } else {
             last_throttling_instant
+        }
+    }
+}
+
+pub(crate) async fn throttle_stream(
+    stats: &StreamerStats,
+    peer_type: ConnectionPeerType,
+    remote_addr: std::net::SocketAddr,
+    stream_counter: &Arc<ConnectionStreamCounter>,
+    max_streams_per_throttling_interval: u64,
+) {
+    let throttle_interval_start = stream_counter.reset_throttling_params_if_needed();
+    let streams_read_in_throttle_interval = stream_counter.stream_count.load(Ordering::Relaxed);
+    if streams_read_in_throttle_interval >= max_streams_per_throttling_interval {
+        // The peer is sending faster than we're willing to read. Sleep for what's
+        // left of this read interval so the peer backs off.
+        let throttle_duration =
+            STREAM_THROTTLING_INTERVAL.saturating_sub(throttle_interval_start.elapsed());
+
+        if !throttle_duration.is_zero() {
+            debug!(
+                "Throttling stream from {remote_addr:?}, peer type: {peer_type:?}, \
+                 max_streams_per_interval: {max_streams_per_throttling_interval}, \
+                 read_interval_streams: {streams_read_in_throttle_interval} throttle_duration: \
+                 {throttle_duration:?}"
+            );
+            stats.throttled_streams.fetch_add(1, Ordering::Relaxed);
+            match peer_type {
+                ConnectionPeerType::Unstaked => {
+                    stats
+                        .throttled_unstaked_streams
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                ConnectionPeerType::Staked(_) => {
+                    stats
+                        .throttled_staked_streams
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            sleep(throttle_duration).await;
         }
     }
 }

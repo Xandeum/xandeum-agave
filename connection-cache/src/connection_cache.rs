@@ -650,7 +650,7 @@ mod tests {
         fn send_data(&self, _buffer: &[u8]) -> TransportResult<()> {
             unimplemented!()
         }
-        fn send_data_async(&self, _data: Vec<u8>) -> TransportResult<()> {
+        fn send_data_async(&self, _data: Arc<Vec<u8>>) -> TransportResult<()> {
             unimplemented!()
         }
         fn send_data_batch(&self, _buffers: &[Vec<u8>]) -> TransportResult<()> {
@@ -687,7 +687,7 @@ mod tests {
 
     #[test]
     fn test_connection_cache() {
-        solana_logger::setup();
+        agave_logger::setup();
         // Allow the test to run deterministically
         // with the same pseudorandom sequence between runs
         // and on different platforms - the cryptographic security

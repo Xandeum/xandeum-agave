@@ -233,9 +233,7 @@ impl<'a> SnapshotMinimizer<'a> {
                 .get_and_then(&pubkey, |entry| {
                     if let Some(entry) = entry {
                         let max_slot = entry
-                            .slot_list
-                            .read()
-                            .unwrap()
+                            .slot_list_read_lock()
                             .iter()
                             .map(|(slot, _)| *slot)
                             .max();
@@ -318,11 +316,8 @@ impl<'a> SnapshotMinimizer<'a> {
         let remove_pubkeys = purge_pubkeys_collect.into_inner().unwrap();
         let total_bytes = total_bytes_collect.load(Ordering::Relaxed);
 
-        let purge_pubkeys: Vec<_> = remove_pubkeys
-            .into_iter()
-            .map(|pubkey| (*pubkey, slot))
-            .collect();
-        let _ = self.accounts_db().purge_keys_exact(purge_pubkeys.iter());
+        let purge_pubkeys = remove_pubkeys.into_iter().map(|pubkey| (*pubkey, slot));
+        let _ = self.accounts_db().purge_keys_exact(purge_pubkeys);
 
         let mut shrink_in_progress = None;
         if total_bytes > 0 {
@@ -378,10 +373,10 @@ mod tests {
             genesis_utils::{self, create_genesis_config_with_leader},
             runtime_config::RuntimeConfig,
             snapshot_bank_utils,
-            snapshot_config::SnapshotConfig,
             snapshot_minimizer::SnapshotMinimizer,
             snapshot_utils,
         },
+        agave_snapshots::snapshot_config::SnapshotConfig,
         dashmap::DashSet,
         solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
         solana_accounts_db::accounts_db::{AccountsDbConfig, ACCOUNTS_DB_CONFIG_FOR_TESTING},
@@ -398,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_minimization_get_vote_accounts() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let bootstrap_validator_pubkey = solana_pubkey::new_rand();
         let bootstrap_validator_stake_lamports = 30;
@@ -427,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_minimization_get_stake_accounts() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let bootstrap_validator_pubkey = solana_pubkey::new_rand();
         let bootstrap_validator_stake_lamports = 30;
@@ -466,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_minimization_get_owner_accounts() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let (genesis_config, _) = create_genesis_config(1_000_000);
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
@@ -490,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_minimization_add_programdata_accounts() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let (genesis_config, _) = create_genesis_config(1_000_000);
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
@@ -536,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_minimize_accounts_db() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let (genesis_config, _) = create_genesis_config(1_000_000);
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
@@ -658,7 +653,7 @@ mod tests {
             skip_initial_hash_calc: !should_recalculate_accounts_lt_hash,
             ..ACCOUNTS_DB_CONFIG_FOR_TESTING
         };
-        let (roundtrip_bank, _) = snapshot_bank_utils::bank_from_snapshot_archives(
+        let roundtrip_bank = snapshot_bank_utils::bank_from_snapshot_archives(
             &[accounts_dir],
             &bank_snapshots_dir,
             &snapshot,
@@ -667,18 +662,15 @@ mod tests {
             &RuntimeConfig::default(),
             None,
             None,
-            None,
             false,
             false,
             false,
-            Some(accounts_db_config),
+            accounts_db_config,
             None,
             Arc::default(),
         )
         .unwrap();
 
-        // Wait for the startup verification to complete.  If we don't panic, then we're good!
-        roundtrip_bank.wait_for_initial_accounts_hash_verification_completed_for_tests();
         assert_eq!(roundtrip_bank, *bank);
     }
 }

@@ -1,26 +1,27 @@
 //! Serialize and deserialize the status cache for snapshots
 
+#[cfg(feature = "shuttle-test")]
+use shuttle::sync::Mutex;
+#[cfg(not(feature = "shuttle-test"))]
+use std::sync::Mutex;
 use {
     crate::{bank::BankSlotDelta, snapshot_utils, status_cache::KeySlice},
     bincode::{self, Options as _},
+    serde::{Deserialize, Serialize},
     solana_clock::Slot,
     solana_hash::Hash,
     solana_instruction::error::InstructionError,
     solana_transaction_error::TransactionError,
-    std::{
-        collections::HashMap,
-        path::Path,
-        sync::{Arc, Mutex},
-    },
+    std::{collections::HashMap, path::Path, sync::Arc},
 };
 
 #[cfg_attr(
     feature = "frozen-abi",
-    frozen_abi(digest = "DNMK4ve8crKwuyUWx4ummQfgA3ydmDuptiJTp8G8m18p")
+    frozen_abi(digest = "AardUUq1At4qq6oNNp9V2JZFsMR5k54RZmBmZkxUfk7m")
 )]
 type SerdeBankSlotDelta = SerdeSlotDelta<Result<(), SerdeTransactionError>>;
 type SerdeSlotDelta<T> = (Slot, bool, SerdeStatus<T>);
-type SerdeStatus<T> = HashMap<Hash, (usize, Vec<(KeySlice, T)>)>;
+type SerdeStatus<T> = ahash::HashMap<Hash, (usize, Vec<(KeySlice, T)>)>;
 
 /// Serializes the status cache's `slot_deltas` to file at `status_cache_path`
 ///
@@ -28,7 +29,7 @@ type SerdeStatus<T> = HashMap<Hash, (usize, Vec<(KeySlice, T)>)>;
 pub fn serialize_status_cache(
     slot_deltas: &[BankSlotDelta],
     status_cache_path: &Path,
-) -> snapshot_utils::Result<u64> {
+) -> agave_snapshots::Result<u64> {
     snapshot_utils::serialize_snapshot_data_file(status_cache_path, |stream| {
         let snapshot_slot_deltas = slot_deltas
             .iter()
@@ -68,7 +69,7 @@ pub fn serialize_status_cache(
 /// This fn deserializes the status cache from a snapshot.
 pub fn deserialize_status_cache(
     status_cache_path: &Path,
-) -> snapshot_utils::Result<Vec<BankSlotDelta>> {
+) -> agave_snapshots::Result<Vec<BankSlotDelta>> {
     snapshot_utils::deserialize_snapshot_data_file(status_cache_path, |stream| {
         let snapshot_slot_deltas: Vec<SerdeBankSlotDelta> = bincode::options()
             .with_limit(snapshot_utils::MAX_SNAPSHOT_DATA_FILE_SIZE)
@@ -97,7 +98,7 @@ pub fn deserialize_status_cache(
                             ),
                         )
                     })
-                    .collect::<HashMap<_, _>>();
+                    .collect::<ahash::HashMap<_, _>>();
                 (slot_delta.0, slot_delta.1, Arc::new(Mutex::new(status_map)))
             })
             .collect::<Vec<_>>();

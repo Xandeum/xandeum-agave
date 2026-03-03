@@ -35,6 +35,7 @@ pub const MAX_ACTIVE_SUBSCRIPTIONS: usize = 1_000_000;
 pub const DEFAULT_QUEUE_CAPACITY_ITEMS: usize = 10_000_000;
 pub const DEFAULT_TEST_QUEUE_CAPACITY_ITEMS: usize = 100;
 pub const DEFAULT_QUEUE_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_TEST_QUEUE_CAPACITY_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_WORKER_THREADS: usize = 1;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,13 +64,13 @@ impl Default for PubSubConfig {
 }
 
 impl PubSubConfig {
-    pub fn default_for_tests() -> Self {
+    pub const fn default_for_tests() -> Self {
         Self {
             enable_block_subscription: false,
             enable_vote_subscription: false,
             max_active_subscriptions: MAX_ACTIVE_SUBSCRIPTIONS,
             queue_capacity_items: DEFAULT_TEST_QUEUE_CAPACITY_ITEMS,
-            queue_capacity_bytes: DEFAULT_QUEUE_CAPACITY_BYTES,
+            queue_capacity_bytes: DEFAULT_TEST_QUEUE_CAPACITY_BYTES,
             worker_threads: DEFAULT_WORKER_THREADS,
             notification_threads: NonZeroUsize::new(2),
         }
@@ -87,7 +88,6 @@ impl PubSubService {
         pubsub_addr: SocketAddr,
     ) -> (Trigger, Self) {
         let subscription_control = subscriptions.control().clone();
-        info!("rpc_pubsub bound to {pubsub_addr:?}");
 
         let (trigger, tripwire) = Tripwire::new();
         let thread_hdl = Builder::new()
@@ -448,7 +448,19 @@ async fn listen(
     subscription_control: SubscriptionControl,
     mut tripwire: Tripwire,
 ) -> io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(&listen_address).await?;
+    let listener = match tokio::net::TcpListener::bind(&listen_address).await {
+        Ok(listener) => {
+            info!("rpc_pubsub listening on {listen_address:?}");
+            listener
+        }
+        Err(e) => {
+            error!(
+                "failed to bind rpc_pubsub listener on {listen_address:?}: {e}. Hint: is the port \
+                 already in use?"
+            );
+            return Err(e);
+        }
+    };
     let counter = TokenCounter::new("rpc_pubsub_connections");
     loop {
         select! {

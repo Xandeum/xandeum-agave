@@ -9,6 +9,7 @@ use {
             file::TieredReadableFile,
             hot::{HotStorageReader, HotStorageWriter, RENT_EXEMPT_RENT_EPOCH},
         },
+        utils::create_account_shared_data,
     },
     solana_clock::Slot,
     solana_pubkey::Pubkey,
@@ -29,8 +30,8 @@ const ACCOUNTS_COUNTS: [usize; 4] = [
     10_000, // reasonable largest number of accounts written per slot
 ];
 
-fn bench_write_accounts_file(c: &mut Criterion) {
-    let mut group = c.benchmark_group("write_accounts_file");
+fn bench_write_accounts_file(c: &mut Criterion, storage_access: StorageAccess) {
+    let mut group = c.benchmark_group(format!("write_accounts_file_{storage_access:?}"));
 
     // most accounts on mnb are 165-200 bytes, so use that here too
     let space = 200;
@@ -64,7 +65,7 @@ fn bench_write_accounts_file(c: &mut Criterion) {
                 || {
                     let path = temp_dir.path().join(format!("append_vec_{accounts_count}"));
                     let file_size = accounts.len() * (space + append_vec::STORE_META_OVERHEAD);
-                    AppendVec::new(path, true, file_size)
+                    AppendVec::new(path, true, file_size, storage_access)
                 },
                 |append_vec| {
                     let res = append_vec.append_accounts(&storable_accounts, 0).unwrap();
@@ -98,6 +99,14 @@ fn bench_write_accounts_file(c: &mut Criterion) {
     }
 }
 
+fn bench_write_accounts_file_file_io(c: &mut Criterion) {
+    bench_write_accounts_file(c, StorageAccess::File);
+}
+
+fn bench_write_accounts_file_mmap(c: &mut Criterion) {
+    bench_write_accounts_file(c, StorageAccess::Mmap);
+}
+
 fn bench_scan_pubkeys(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan_pubkeys");
     let temp_dir = tempfile::tempdir().unwrap();
@@ -125,7 +134,7 @@ fn bench_scan_pubkeys(c: &mut Criterion) {
             .iter()
             .map(|(_, account)| append_vec::aligned_stored_size(account.data().len()))
             .sum();
-        let append_vec = AppendVec::new(append_vec_path, true, file_size);
+        let append_vec = AppendVec::new(append_vec_path, true, file_size, StorageAccess::File);
         let stored_accounts_info = append_vec
             .append_accounts(&(Slot::MAX, storable_accounts.as_slice()), 0)
             .unwrap();
@@ -210,7 +219,7 @@ fn bench_get_account_shared_data(c: &mut Criterion) {
             .iter()
             .map(|(_, account)| append_vec::aligned_stored_size(account.data().len()))
             .sum();
-        let append_vec = AppendVec::new(append_vec_path, true, file_size);
+        let append_vec = AppendVec::new(append_vec_path, true, file_size, StorageAccess::File);
         let stored_accounts_info = append_vec
             .append_accounts(&(Slot::MAX, storable_accounts.as_slice()), 0)
             .unwrap();
@@ -250,7 +259,9 @@ fn bench_get_account_shared_data(c: &mut Criterion) {
             |b| {
                 b.iter_with_large_drop(|| {
                     _ = append_vec_mmap
-                        .get_stored_account_callback(0, |account| account.to_account_shared_data())
+                        .get_stored_account_callback(0, |account| {
+                            create_account_shared_data(&account)
+                        })
                         .unwrap();
                 });
             },
@@ -272,7 +283,9 @@ fn bench_get_account_shared_data(c: &mut Criterion) {
             |b| {
                 b.iter_with_large_drop(|| {
                     _ = append_vec_file
-                        .get_stored_account_callback(0, |account| account.to_account_shared_data())
+                        .get_stored_account_callback(0, |account| {
+                            create_account_shared_data(&account)
+                        })
                         .unwrap();
                 });
             },
@@ -282,7 +295,8 @@ fn bench_get_account_shared_data(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_write_accounts_file,
+    bench_write_accounts_file_file_io,
+    bench_write_accounts_file_mmap,
     bench_scan_pubkeys,
     bench_get_account_shared_data,
 );

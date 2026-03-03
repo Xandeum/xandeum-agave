@@ -74,8 +74,8 @@ impl SocketProvider for MultihomedSocketProvider {
 #[derive(Debug, Clone)]
 pub struct BindIpAddrs {
     /// The IP addresses this node may bind to
-    /// Index 0 is the primary address
-    /// Index 1+ are secondary addresses
+    /// Index 0 is the public internet address
+    /// Index 1+ are secondary addresses (i.e. multihoming)
     addrs: Vec<IpAddr>,
     active_index: Arc<AtomicUsize>,
 }
@@ -97,8 +97,8 @@ impl BindIpAddrs {
             for ip in &addrs {
                 if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
                     return Err(format!(
-                        "Invalid configuration: {:?} is not allowed with multiple --bind-address values (loopback, unspecified, or multicast)",
-                        ip
+                        "Invalid configuration: {ip:?} is not allowed with multiple \
+                         --bind-address values (loopback, unspecified, or multicast)"
                     ));
                 }
             }
@@ -115,7 +115,7 @@ impl BindIpAddrs {
         self.addrs[self.active_index.load(Ordering::Acquire)]
     }
 
-    /// Change active to index (0 = primary)
+    /// Change active to index (0 = public internet IP, 1+ = secondary IPs)
     pub fn set_active(&self, index: usize) -> Result<IpAddr, String> {
         if index >= self.addrs.len() {
             return Err(format!(
@@ -130,6 +130,11 @@ impl BindIpAddrs {
     #[inline]
     pub fn active_index(&self) -> usize {
         self.active_index.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn multihoming_enabled(&self) -> bool {
+        self.addrs.len() > 1
     }
 }
 

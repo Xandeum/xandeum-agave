@@ -3,7 +3,7 @@ use {
     crate::consensus::Stake,
     bytemuck::{Pod, Zeroable},
     crossbeam_channel::{bounded, Receiver, Sender},
-    serde::de::DeserializeOwned,
+    serde::{de::DeserializeOwned, Deserialize, Serialize},
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_gossip::{cluster_info::ClusterInfo, epoch_specs::EpochSpecs},
     solana_keypair::Keypair,
@@ -41,6 +41,14 @@ const NUM_VOTE_ROUNDS: Slot = 4;
 
 /// rough upper bound of number of testnet validators to avoid allocations
 const NUM_TESTNET_VALIDATORS: usize = 1024 * 3;
+
+// Configure maximal transmission rate to be ~ 100 KPPS.
+// On average we have ~2000 destinations, so overall broadcast should
+// take at most 20 ms.
+/// Max packets to send in one batch
+const MAX_PACKETS_PER_BATCH: usize = 200;
+/// Interval between batches
+const PACING_INTERVAL: Duration = Duration::from_millis(2);
 
 /// This is a placeholder that is only used for load-testing.
 /// This is not representative of the actual alpenglow implementation.
@@ -98,6 +106,7 @@ impl SharedState {
         self.alpenglow_state = AgStateMachine::default();
         peers
     }
+
     fn new(current_slot: Slot) -> Self {
         Self {
             current_slot_start: Instant::now(),
@@ -107,16 +116,19 @@ impl SharedState {
             alpenglow_state: AgStateMachine::default(),
         }
     }
+
     fn available(&self) -> bool {
         self.current_slot == 0
     }
+
     fn is_ready_for_slot(&self, slot: Slot) -> bool {
         self.current_slot == slot
     }
 }
+
 const ONE_SLOT: Duration = Duration::from_millis(DEFAULT_MS_PER_SLOT);
 
-fn get_state_for_slot(states: &StateArray, slot: Slot) -> &Mutex<SharedState> {
+fn get_state_for_slot_index(states: &StateArray, slot: Slot) -> &Mutex<SharedState> {
     &states[(slot % NUM_VOTE_ROUNDS) as usize]
 }
 
@@ -245,7 +257,7 @@ impl MockAlpenglowConsensus {
         );
         let staked_nodes = self.epoch_specs.current_epoch_staked_nodes();
 
-        let mut state = get_state_for_slot(&self.state, slot).lock().unwrap();
+        let mut state = get_state_for_slot_index(&self.state, slot).lock().unwrap();
         if !state.available() {
             return Err(state.current_slot);
         }
@@ -310,7 +322,11 @@ impl MockAlpenglowConsensus {
                             0 // no packets received
                         }
                         _ => {
-                            error!("Got error {:?} in mock alpenglow RX socket operation, exiting thread", e.raw_os_error());
+                            error!(
+                                "Got error {:?} in mock alpenglow RX socket operation, exiting \
+                                 thread",
+                                e.raw_os_error()
+                            );
                             return;
                         }
                     }
@@ -333,7 +349,7 @@ impl MockAlpenglowConsensus {
                     continue;
                 }
 
-                let mut state = get_state_for_slot(&self_state, vote_pkt.slot_number)
+                let mut state = get_state_for_slot_index(&self_state, vote_pkt.slot_number)
                     .lock()
                     .unwrap();
 
@@ -483,7 +499,7 @@ impl MockAlpenglowConsensus {
             // prepare addresses to send the packets
             let mut send_instructions = Vec::with_capacity(NUM_TESTNET_VALIDATORS); // we have ~2500 validators in testnet
             {
-                let state = get_state_for_slot(&state, slot).lock().unwrap();
+                let state = get_state_for_slot_index(&state, slot).lock().unwrap();
                 // check if our task was aborted, avoid sending if it was.
                 if !state.is_ready_for_slot(slot) {
                     return;
@@ -497,8 +513,12 @@ impl MockAlpenglowConsensus {
                     );
                 }
             }
-            // broadcast to everybody at once
-            let _ = batch_send(&socket, send_instructions);
+            // broadcast to everybody, but in small batches to avoid correlated packet bursts
+            for batch in send_instructions.as_slice().chunks(MAX_PACKETS_PER_BATCH) {
+                // this does not clone the Vec with bytes, only the tuples with references
+                let _ = batch_send(&socket, batch.iter().copied());
+                thread::sleep(PACING_INTERVAL);
+            }
         }
     }
 
@@ -588,10 +608,11 @@ impl MockAlpenglowConsensus {
                 if let Some(slot) = report_slot {
                     // collect stats from the previous slot's voting
                     let (peers, total_staked) = {
-                        let mut lockguard = get_state_for_slot(&state, slot).lock().unwrap();
-                        let state_slot = lockguard.current_slot;
-                        let total_staked = lockguard.total_staked;
-                        let peers = lockguard.reset();
+                        let mut state_for_slot_index =
+                            get_state_for_slot_index(&state, slot).lock().unwrap();
+                        let state_slot = state_for_slot_index.current_slot;
+                        let total_staked = state_for_slot_index.total_staked;
+                        let peers = state_for_slot_index.reset();
                         // check if state is for correct slot to not report garbage
                         if state_slot != slot {
                             continue;
@@ -636,7 +657,7 @@ fn prep_and_sign_packet(
 const SIGNATURE: [u8; SIGNATURE_BYTES] = [7u8; SIGNATURE_BYTES];
 
 fn report_collected_votes(peers: HashMap<Pubkey, PeerData>, total_staked: Stake, slot: Slot) {
-    trace!("Reporting statistics for slot {}", slot);
+    trace!("Reporting statistics for slot {slot}");
     let (total_voted_nodes, stake_weighted_delay, percent_collected) =
         compute_stake_weighted_means(&peers, total_staked);
     datapoint_info!(
@@ -752,7 +773,7 @@ fn get_test_config_from_account<T: DeserializeOwned>(bank: &Bank) -> Option<T> {
 mod tests {
     use {
         crate::mock_alpenglow_consensus::{
-            compute_stake_weighted_means, get_state_for_slot, prep_and_sign_packet,
+            compute_stake_weighted_means, get_state_for_slot_index, prep_and_sign_packet,
             MockAlpenglowConsensus, PeerData, SendCommand, SharedState, StateArray, TestConfig,
             VotorMessageType, MOCK_VOTE_HEADER_SIZE, MOCK_VOTE_PACKET_SIZE, NUM_VOTOR_TYPES,
         },
@@ -783,7 +804,7 @@ mod tests {
     fn test_mock_alpenglow_statemachine() {
         let test_timeout = Duration::from_secs(3);
         let max_slots = 5;
-        solana_logger::setup_with("trace");
+        agave_logger::setup_with("trace");
         let num_nodes = 10;
         let keypairs: Vec<Keypair> = (0..num_nodes).map(|_| Keypair::new()).collect();
         let peers: Vec<(Pubkey, UdpSocket)> = keypairs
@@ -825,7 +846,9 @@ mod tests {
             mock_prep_rx(&shared_state, slot, peers_map);
             // make sure initial state is correct
             {
-                let slot_state = get_state_for_slot(&shared_state, slot).lock().unwrap();
+                let slot_state = get_state_for_slot_index(&shared_state, slot)
+                    .lock()
+                    .unwrap();
                 assert_eq!(slot_state.alpenglow_state.notarize_stake_collected, 0);
                 assert!(!slot_state.alpenglow_state.block_notarized);
                 assert!(!slot_state.alpenglow_state.block_finalized);
@@ -848,7 +871,9 @@ mod tests {
             let cmd = vote_command_receiver.recv_timeout(test_timeout).unwrap();
             assert_eq!(cmd, SendCommand::NotarizeCertificateAndFinalize(slot));
             {
-                let slot_state = get_state_for_slot(&shared_state, slot).lock().unwrap();
+                let slot_state = get_state_for_slot_index(&shared_state, slot)
+                    .lock()
+                    .unwrap();
                 let peerdata = slot_state.peers.get(&peers[1].0).unwrap();
                 assert!(peerdata.relative_time_of_arrival[0].unwrap().as_millis() > 0);
                 assert!(peerdata.relative_time_of_arrival[0].unwrap() < test_timeout);
@@ -874,7 +899,9 @@ mod tests {
             let cmd = vote_command_receiver.recv_timeout(test_timeout).unwrap();
             assert_eq!(cmd, SendCommand::FinalizeCertificate(slot));
             {
-                let slot_state = get_state_for_slot(&shared_state, slot).lock().unwrap();
+                let slot_state = get_state_for_slot_index(&shared_state, slot)
+                    .lock()
+                    .unwrap();
                 let peerdata = slot_state.peers.get(&peers[1].0).unwrap();
                 assert!(peerdata.relative_time_of_arrival[1].unwrap().as_millis() > 0);
                 assert!(peerdata.relative_time_of_arrival[1].unwrap() < test_timeout);
@@ -907,7 +934,9 @@ mod tests {
             }
             sleep(Duration::from_millis(1));
             {
-                let slot_state = get_state_for_slot(&shared_state, slot).lock().unwrap();
+                let slot_state = get_state_for_slot_index(&shared_state, slot)
+                    .lock()
+                    .unwrap();
                 assert!(!slot_state.alpenglow_state.block_notarized);
                 assert!(!slot_state.alpenglow_state.block_finalized);
             }
@@ -928,7 +957,9 @@ mod tests {
             let cmd = vote_command_receiver.recv_timeout(test_timeout).unwrap();
             assert_eq!(cmd, SendCommand::NotarizeCertificateAndFinalize(slot));
             {
-                let slot_state = get_state_for_slot(&shared_state, slot).lock().unwrap();
+                let slot_state = get_state_for_slot_index(&shared_state, slot)
+                    .lock()
+                    .unwrap();
                 assert!(slot_state.alpenglow_state.block_notarized);
                 assert!(!slot_state.alpenglow_state.block_finalized);
             }
@@ -947,7 +978,9 @@ mod tests {
             let cmd = vote_command_receiver.recv_timeout(test_timeout).unwrap();
             assert_eq!(cmd, SendCommand::FinalizeCertificate(slot));
             {
-                let slot_state = get_state_for_slot(&shared_state, slot).lock().unwrap();
+                let slot_state = get_state_for_slot_index(&shared_state, slot)
+                    .lock()
+                    .unwrap();
                 assert!(slot_state.alpenglow_state.notarize_stake_collected >= 8);
                 assert!(slot_state.alpenglow_state.block_notarized);
                 assert!(slot_state.alpenglow_state.block_finalized);
@@ -973,7 +1006,9 @@ mod tests {
             assert_eq!(cmd, SendCommand::NotarizeCertificateAndFinalize(slot));
 
             {
-                let slot_state = get_state_for_slot(&shared_state, slot).lock().unwrap();
+                let slot_state = get_state_for_slot_index(&shared_state, slot)
+                    .lock()
+                    .unwrap();
                 assert_eq!(slot_state.alpenglow_state.notarize_stake_collected, 0);
                 assert_eq!(slot_state.alpenglow_state.finalize_stake_collected, 1);
                 assert!(slot_state.alpenglow_state.block_notarized);
@@ -991,7 +1026,9 @@ mod tests {
             let cmd = vote_command_receiver.recv_timeout(test_timeout).unwrap();
             assert_eq!(cmd, SendCommand::FinalizeCertificate(slot));
             {
-                let slot_state = get_state_for_slot(&shared_state, slot).lock().unwrap();
+                let slot_state = get_state_for_slot_index(&shared_state, slot)
+                    .lock()
+                    .unwrap();
                 assert_eq!(slot_state.alpenglow_state.notarize_stake_collected, 0);
                 assert_eq!(slot_state.alpenglow_state.finalize_stake_collected, 1);
                 assert!(slot_state.alpenglow_state.block_notarized);
@@ -1024,7 +1061,7 @@ mod tests {
     }
 
     fn mock_prep_rx(state: &StateArray, slot: Slot, peer_map: HashMap<Pubkey, PeerData>) {
-        let mut state = get_state_for_slot(state, slot).lock().unwrap();
+        let mut state = get_state_for_slot_index(state, slot).lock().unwrap();
         state.reset();
         state.current_slot = slot;
         state.current_slot_start = Instant::now();

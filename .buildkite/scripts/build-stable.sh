@@ -6,7 +6,7 @@ here=$(dirname "$0")
 # shellcheck source=.buildkite/scripts/common.sh
 source "$here"/common.sh
 
-agent="${1-solana}"
+agent="${1-default}"
 
 parallelism=5
 partitions=()
@@ -23,6 +23,19 @@ for i in $(seq 1 $parallelism); do
 EOF
   )")
 done
+
+# add dev-bins
+partitions+=(
+  "$(
+    cat <<EOF
+{
+  "name": "dev-bins",
+  "command": "ci/docker-run-default-image.sh cargo nextest run --profile ci --manifest-path ./dev-bins/Cargo.toml",
+  "timeout_in_minutes": 35,
+  "agent": "$agent"
+}
+EOF
+  )")
 
 parallelism=10
 local_cluster_partitions=()

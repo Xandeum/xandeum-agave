@@ -8,19 +8,19 @@ use {
         leader_schedule_cache::LeaderScheduleCache,
         use_snapshot_archives_at_startup::{self, UseSnapshotArchivesAtStartup},
     },
-    log::*,
-    solana_accounts_db::accounts_update_notifier_interface::AccountsUpdateNotifier,
-    solana_genesis_config::GenesisConfig,
-    solana_runtime::{
-        bank_forks::BankForks,
+    agave_snapshots::{
+        error::SnapshotError,
+        paths as snapshot_paths,
         snapshot_archive_info::{
             FullSnapshotArchiveInfo, IncrementalSnapshotArchiveInfo, SnapshotArchiveInfoGetter,
         },
-        snapshot_bank_utils,
         snapshot_config::SnapshotConfig,
         snapshot_hash::{FullSnapshotHash, IncrementalSnapshotHash, StartingSnapshotHashes},
-        snapshot_utils,
     },
+    log::*,
+    solana_accounts_db::accounts_update_notifier_interface::AccountsUpdateNotifier,
+    solana_genesis_config::GenesisConfig,
+    solana_runtime::{bank_forks::BankForks, snapshot_bank_utils, snapshot_utils},
     std::{
         path::PathBuf,
         result,
@@ -39,7 +39,7 @@ pub enum BankForksUtilsError {
          incremental snapshot archive: {incremental_snapshot_archive}"
     )]
     BankFromSnapshotsArchive {
-        source: Box<snapshot_utils::SnapshotError>,
+        source: Box<SnapshotError>,
         full_snapshot_archive: String,
         incremental_snapshot_archive: String,
     },
@@ -52,7 +52,7 @@ pub enum BankForksUtilsError {
 
     #[error("failed to load bank from snapshot '{path}': {source}")]
     BankFromSnapshotsDirectory {
-        source: snapshot_utils::SnapshotError,
+        source: SnapshotError,
         path: PathBuf,
     },
 
@@ -137,7 +137,7 @@ pub fn load_bank_forks(
         };
 
         let Some(full_snapshot_archive_info) =
-            snapshot_utils::get_highest_full_snapshot_archive_info(
+            snapshot_paths::get_highest_full_snapshot_archive_info(
                 &snapshot_config.full_snapshot_archives_dir,
             )
         else {
@@ -149,7 +149,7 @@ pub fn load_bank_forks(
         };
 
         let incremental_snapshot_archive_info =
-            snapshot_utils::get_highest_incremental_snapshot_archive_info(
+            snapshot_paths::get_highest_incremental_snapshot_archive_info(
                 &snapshot_config.incremental_snapshot_archives_dir,
                 full_snapshot_archive_info.slot(),
             );
@@ -194,12 +194,6 @@ pub fn load_bank_forks(
                 exit,
             )
             .map_err(BankForksUtilsError::ProcessBlockstoreFromGenesis)?;
-            bank_forks
-                .read()
-                .unwrap()
-                .root_bank()
-                .set_initial_accounts_hash_verification_completed();
-
             (bank_forks, None)
         };
 
@@ -276,13 +270,12 @@ fn bank_forks_from_snapshot(
     };
 
     let bank = if let Some(fastboot_snapshot) = fastboot_snapshot {
-        let (bank, _) = snapshot_bank_utils::bank_from_snapshot_dir(
+        snapshot_bank_utils::bank_from_snapshot_dir(
             &account_paths,
             &fastboot_snapshot,
             genesis_config,
             &process_options.runtime_config,
             process_options.debug_keys.clone(),
-            None,
             process_options.limit_load_slot_count_from_snapshot,
             process_options.verify_index,
             process_options.accounts_db_config.clone(),
@@ -292,8 +285,7 @@ fn bank_forks_from_snapshot(
         .map_err(|err| BankForksUtilsError::BankFromSnapshotsDirectory {
             source: err,
             path: fastboot_snapshot.snapshot_path(),
-        })?;
-        bank
+        })?
     } else {
         // Given that we are going to boot from an archive, the append vecs held in the snapshot dirs for fast-boot should
         // be released.  They will be released by the account_background_service anyway.  But in the case of the account_paths
@@ -301,7 +293,7 @@ fn bank_forks_from_snapshot(
         // the archives, causing the out-of-memory problem.  So, purge the snapshot dirs upfront before loading from the archive.
         snapshot_utils::purge_all_bank_snapshots(&snapshot_config.bank_snapshots_dir);
 
-        let (bank, _) = snapshot_bank_utils::bank_from_snapshot_archives(
+        snapshot_bank_utils::bank_from_snapshot_archives(
             &account_paths,
             &snapshot_config.bank_snapshots_dir,
             &full_snapshot_archive_info,
@@ -309,7 +301,6 @@ fn bank_forks_from_snapshot(
             genesis_config,
             &process_options.runtime_config,
             process_options.debug_keys.clone(),
-            None,
             process_options.limit_load_slot_count_from_snapshot,
             process_options.accounts_db_skip_shrink,
             process_options.accounts_db_force_initial_clean,
@@ -325,8 +316,7 @@ fn bank_forks_from_snapshot(
                 .as_ref()
                 .map(|archive| archive.path().display().to_string())
                 .unwrap_or("none".to_string()),
-        })?;
-        bank
+        })?
     };
 
     // We must inform accounts-db of the latest full snapshot slot, which is used by the background

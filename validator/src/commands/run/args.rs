@@ -4,7 +4,9 @@ use {
         cli::{hash_validator, port_range_validator, port_validator, DefaultArgs},
         commands::{FromClapArgMatches, Result},
     },
+    agave_snapshots::{SnapshotVersion, SUPPORTED_ARCHIVE_COMPRESSION},
     clap::{values_t, App, Arg, ArgMatches},
+    solana_accounts_db::utils::create_and_canonicalize_directory,
     solana_clap_utils::{
         hidden_unless_forced,
         input_parsers::keypair_of,
@@ -18,20 +20,17 @@ use {
     },
     solana_core::{
         banking_trace::DirByteLimit,
-        validator::{BlockProductionMethod, BlockVerificationMethod, TransactionStructure},
+        validator::{BlockProductionMethod, BlockVerificationMethod},
     },
     solana_keypair::Keypair,
     solana_ledger::{blockstore_options::BlockstoreOptions, use_snapshot_archives_at_startup},
     solana_pubkey::Pubkey,
     solana_rpc::{rpc::JsonRpcConfig, rpc_pubsub_service::PubSubConfig},
-    solana_runtime::snapshot_utils::{SnapshotVersion, SUPPORTED_ARCHIVE_COMPRESSION},
-    solana_send_transaction_service::send_transaction_service::{
-        MAX_BATCH_SEND_RATE_MS, MAX_TRANSACTION_BATCH_SIZE,
-    },
+    solana_send_transaction_service::send_transaction_service::Config as SendTransactionServiceConfig,
     solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
-    std::{collections::HashSet, net::SocketAddr, str::FromStr},
+    std::{collections::HashSet, net::SocketAddr, path::PathBuf, str::FromStr},
 };
 
 const EXCLUDE_KEY: &str = "account-index-exclude-key";
@@ -62,11 +61,13 @@ pub mod json_rpc_config;
 pub mod pub_sub_config;
 pub mod rpc_bigtable_config;
 pub mod rpc_bootstrap_config;
+pub mod send_transaction_config;
 
 #[derive(Debug, PartialEq)]
 pub struct RunArgs {
     pub identity_keypair: Keypair,
-    pub logfile: String,
+    pub ledger_path: PathBuf,
+    pub logfile: Option<PathBuf>,
     pub entrypoints: Vec<SocketAddr>,
     pub known_validators: Option<HashSet<Pubkey>>,
     pub socket_addr_space: SocketAddrSpace,
@@ -74,6 +75,7 @@ pub struct RunArgs {
     pub blockstore_options: BlockstoreOptions,
     pub json_rpc_config: JsonRpcConfig,
     pub pub_sub_config: PubSubConfig,
+    pub send_transaction_service_config: SendTransactionServiceConfig,
 }
 
 impl FromClapArgMatches for RunArgs {
@@ -84,10 +86,30 @@ impl FromClapArgMatches for RunArgs {
                 clap::ErrorKind::ArgumentNotFound,
             ))?;
 
+        let ledger_path = PathBuf::from(matches.value_of("ledger_path").ok_or(
+            clap::Error::with_description(
+                "The --ledger <DIR> argument is required",
+                clap::ErrorKind::ArgumentNotFound,
+            ),
+        )?);
+        // Canonicalize ledger path to avoid issues with symlink creation
+        let ledger_path =
+            create_and_canonicalize_directory(ledger_path.as_path()).map_err(|err| {
+                crate::commands::Error::Dynamic(Box::<dyn std::error::Error>::from(format!(
+                    "failed to create and canonicalize ledger path '{}': {err}",
+                    ledger_path.display(),
+                )))
+            })?;
+
         let logfile = matches
             .value_of("logfile")
-            .map(|s| s.into())
+            .map(String::from)
             .unwrap_or_else(|| format!("agave-validator-{}.log", identity_keypair.pubkey()));
+        let logfile = if logfile == "-" {
+            None
+        } else {
+            Some(PathBuf::from(logfile))
+        };
 
         let mut entrypoints = values_t!(matches, "entrypoint", String).unwrap_or_default();
         // sort() + dedup() to yield a vector of unique elements
@@ -115,6 +137,7 @@ impl FromClapArgMatches for RunArgs {
 
         Ok(RunArgs {
             identity_keypair,
+            ledger_path,
             logfile,
             entrypoints,
             known_validators,
@@ -123,6 +146,9 @@ impl FromClapArgMatches for RunArgs {
             blockstore_options: BlockstoreOptions::from_clap_arg_match(matches)?,
             json_rpc_config: JsonRpcConfig::from_clap_arg_match(matches)?,
             pub_sub_config: PubSubConfig::from_clap_arg_match(matches)?,
+            send_transaction_service_config: SendTransactionServiceConfig::from_clap_arg_match(
+                matches,
+            )?,
         })
     }
 }
@@ -199,37 +225,10 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Rendezvous with the cluster at this gossip entrypoint"),
     )
     .arg(
-        Arg::with_name("no_snapshot_fetch")
-            .long("no-snapshot-fetch")
-            .takes_value(false)
-            .help(
-                "Do not attempt to fetch a snapshot from the cluster, start from a local snapshot \
-                 if present",
-            ),
-    )
-    .arg(
-        Arg::with_name("no_genesis_fetch")
-            .long("no-genesis-fetch")
-            .takes_value(false)
-            .help("Do not fetch genesis from the cluster"),
-    )
-    .arg(
         Arg::with_name("no_voting")
             .long("no-voting")
             .takes_value(false)
             .help("Launch validator without voting"),
-    )
-    .arg(
-        Arg::with_name("check_vote_account")
-            .long("check-vote-account")
-            .takes_value(true)
-            .value_name("RPC_URL")
-            .requires("entrypoint")
-            .conflicts_with_all(&["no_voting"])
-            .help(
-                "Sanity check vote account state at startup. The JSON RPC endpoint at RPC_URL \
-                 must expose `--full-rpc-api`",
-            ),
     )
     .arg(
         Arg::with_name("restricted_repair_only_mode")
@@ -242,26 +241,12 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
-        Arg::with_name("dev_halt_at_slot")
-            .long("dev-halt-at-slot")
-            .value_name("SLOT")
-            .validator(is_slot)
-            .takes_value(true)
-            .help("Halt the validator when it reaches the given slot"),
-    )
-    .arg(
         Arg::with_name("rpc_port")
             .long("rpc-port")
             .value_name("PORT")
             .takes_value(true)
             .validator(port_validator)
             .help("Enable JSON RPC on this port, and the next port for the RPC websocket"),
-    )
-    .arg(
-        Arg::with_name("full_rpc_api")
-            .long("full-rpc-api")
-            .takes_value(false)
-            .help("Expose RPC methods for querying chain state and transaction history"),
     )
     .arg(
         Arg::with_name("private_rpc")
@@ -275,79 +260,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .takes_value(false)
             .hidden(hidden_unless_forced())
             .help("Do not perform TCP/UDP reachable port checks at start-up"),
-    )
-    .arg(
-        Arg::with_name("enable_rpc_transaction_history")
-            .long("enable-rpc-transaction-history")
-            .takes_value(false)
-            .help(
-                "Enable historical transaction info over JSON RPC, including the \
-                 'getConfirmedBlock' API. This will cause an increase in disk usage and IOPS",
-            ),
-    )
-    .arg(
-        Arg::with_name("enable_rpc_bigtable_ledger_storage")
-            .long("enable-rpc-bigtable-ledger-storage")
-            .requires("enable_rpc_transaction_history")
-            .takes_value(false)
-            .help(
-                "Fetch historical transaction info from a BigTable instance as a fallback to \
-                 local ledger data",
-            ),
-    )
-    .arg(
-        Arg::with_name("enable_bigtable_ledger_upload")
-            .long("enable-bigtable-ledger-upload")
-            .requires("enable_rpc_transaction_history")
-            .takes_value(false)
-            .help("Upload new confirmed blocks into a BigTable instance"),
-    )
-    .arg(
-        Arg::with_name("enable_extended_tx_metadata_storage")
-            .long("enable-extended-tx-metadata-storage")
-            .requires("enable_rpc_transaction_history")
-            .takes_value(false)
-            .help(
-                "Include CPI inner instructions, logs, and return data in the historical \
-                 transaction info stored",
-            ),
-    )
-    .arg(
-        Arg::with_name("rpc_max_multiple_accounts")
-            .long("rpc-max-multiple-accounts")
-            .value_name("MAX ACCOUNTS")
-            .takes_value(true)
-            .default_value(&default_args.rpc_max_multiple_accounts)
-            .help(
-                "Override the default maximum accounts accepted by the getMultipleAccounts JSON \
-                 RPC method",
-            ),
-    )
-    .arg(
-        Arg::with_name("health_check_slot_distance")
-            .long("health-check-slot-distance")
-            .value_name("SLOT_DISTANCE")
-            .takes_value(true)
-            .default_value(&default_args.health_check_slot_distance)
-            .help(
-                "Report this validator as healthy if its latest replayed optimistically confirmed \
-                 slot is within the specified number of slots from the cluster's latest \
-                 optimistically confirmed slot",
-            ),
-    )
-    .arg(
-        Arg::with_name("skip_preflight_health_check")
-            .long("skip-preflight-health-check")
-            .takes_value(false)
-            .help("Skip health check when running a preflight check"),
-    )
-    .arg(
-        Arg::with_name("rpc_faucet_addr")
-            .long("rpc-faucet-address")
-            .value_name("HOST:PORT")
-            .takes_value(true)
-            .validator(solana_net_utils::is_host_port)
-            .help("Enable the JSON RPC 'requestAirdrop' API with this faucet address."),
     )
     .arg(
         Arg::with_name("account_paths")
@@ -498,12 +410,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "full_snapshot_interval_slots",
             ])
             .help("Disable all snapshot generation"),
-    )
-    .arg(
-        Arg::with_name("no_incremental_snapshots")
-            .long("no-incremental-snapshots")
-            .takes_value(false)
-            .help("Disable incremental snapshots"),
     )
     .arg(
         Arg::with_name("snapshot_interval_slots")
@@ -702,12 +608,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Skip ledger verification at validator bootup."),
     )
     .arg(
-        Arg::with_name("cuda")
-            .long("cuda")
-            .takes_value(false)
-            .help("Use CUDA"),
-    )
-    .arg(
         clap::Arg::with_name("require_tower")
             .long("require-tower")
             .takes_value(false)
@@ -803,14 +703,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Log when transactions are processed which reference a given key."),
     )
     .arg(
-        Arg::with_name("only_known_rpc")
-            .alias("no-untrusted-rpc")
-            .long("only-known-rpc")
-            .takes_value(false)
-            .requires("known_validators")
-            .help("Use the RPC service of known validators only"),
-    )
-    .arg(
         Arg::with_name("repair_validators")
             .long("repair-validator")
             .validator(is_pubkey)
@@ -847,14 +739,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "A list of validators to gossip with. If specified, gossip will not push/pull \
                  from from validators outside this set. [default: all validators]",
             ),
-    )
-    .arg(
-        Arg::with_name("tpu_coalesce_ms")
-            .long("tpu-coalesce-ms")
-            .value_name("MILLISECS")
-            .takes_value(true)
-            .validator(is_parsable::<u64>)
-            .help("Milliseconds to wait in the TPU receiver for packet coalescing."),
     )
     .arg(
         Arg::with_name("tpu_connection_pool_size")
@@ -986,267 +870,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
-        Arg::with_name("rpc_threads")
-            .long("rpc-threads")
-            .value_name("NUMBER")
-            .validator(is_parsable::<usize>)
-            .takes_value(true)
-            .default_value(&default_args.rpc_threads)
-            .help("Number of threads to use for servicing RPC requests"),
-    )
-    .arg(
-        Arg::with_name("rpc_blocking_threads")
-            .long("rpc-blocking-threads")
-            .value_name("NUMBER")
-            .validator(is_parsable::<usize>)
-            .validator(|value| {
-                value
-                    .parse::<u64>()
-                    .map_err(|err| format!("error parsing '{value}': {err}"))
-                    .and_then(|threads| {
-                        if threads > 0 {
-                            Ok(())
-                        } else {
-                            Err("value must be >= 1".to_string())
-                        }
-                    })
-            })
-            .takes_value(true)
-            .default_value(&default_args.rpc_blocking_threads)
-            .help(
-                "Number of blocking threads to use for servicing CPU bound RPC requests (eg \
-                 getMultipleAccounts)",
-            ),
-    )
-    .arg(
-        Arg::with_name("rpc_niceness_adj")
-            .long("rpc-niceness-adjustment")
-            .value_name("ADJUSTMENT")
-            .takes_value(true)
-            .validator(solana_perf::thread::is_niceness_adjustment_valid)
-            .default_value(&default_args.rpc_niceness_adjustment)
-            .help(
-                "Add this value to niceness of RPC threads. Negative value increases priority, \
-                 positive value decreases priority.",
-            ),
-    )
-    .arg(
-        Arg::with_name("rpc_bigtable_timeout")
-            .long("rpc-bigtable-timeout")
-            .value_name("SECONDS")
-            .validator(is_parsable::<u64>)
-            .takes_value(true)
-            .default_value(&default_args.rpc_bigtable_timeout)
-            .help("Number of seconds before timing out RPC requests backed by BigTable"),
-    )
-    .arg(
-        Arg::with_name("rpc_bigtable_instance_name")
-            .long("rpc-bigtable-instance-name")
-            .takes_value(true)
-            .value_name("INSTANCE_NAME")
-            .default_value(&default_args.rpc_bigtable_instance_name)
-            .help("Name of the Bigtable instance to upload to"),
-    )
-    .arg(
-        Arg::with_name("rpc_bigtable_app_profile_id")
-            .long("rpc-bigtable-app-profile-id")
-            .takes_value(true)
-            .value_name("APP_PROFILE_ID")
-            .default_value(&default_args.rpc_bigtable_app_profile_id)
-            .help("Bigtable application profile id to use in requests"),
-    )
-    .arg(
-        Arg::with_name("rpc_bigtable_max_message_size")
-            .long("rpc-bigtable-max-message-size")
-            .value_name("BYTES")
-            .validator(is_parsable::<usize>)
-            .takes_value(true)
-            .default_value(&default_args.rpc_bigtable_max_message_size)
-            .help("Max encoding and decoding message size used in Bigtable Grpc client"),
-    )
-    .arg(
-        Arg::with_name("rpc_pubsub_worker_threads")
-            .long("rpc-pubsub-worker-threads")
-            .takes_value(true)
-            .value_name("NUMBER")
-            .validator(is_parsable::<usize>)
-            .default_value(&default_args.rpc_pubsub_worker_threads)
-            .help("PubSub worker threads"),
-    )
-    .arg(
-        Arg::with_name("rpc_pubsub_enable_block_subscription")
-            .long("rpc-pubsub-enable-block-subscription")
-            .requires("enable_rpc_transaction_history")
-            .takes_value(false)
-            .help("Enable the unstable RPC PubSub `blockSubscribe` subscription"),
-    )
-    .arg(
-        Arg::with_name("rpc_pubsub_enable_vote_subscription")
-            .long("rpc-pubsub-enable-vote-subscription")
-            .takes_value(false)
-            .help("Enable the unstable RPC PubSub `voteSubscribe` subscription"),
-    )
-    .arg(
-        Arg::with_name("rpc_pubsub_max_active_subscriptions")
-            .long("rpc-pubsub-max-active-subscriptions")
-            .takes_value(true)
-            .value_name("NUMBER")
-            .validator(is_parsable::<usize>)
-            .default_value(&default_args.rpc_pubsub_max_active_subscriptions)
-            .help(
-                "The maximum number of active subscriptions that RPC PubSub will accept across \
-                 all connections.",
-            ),
-    )
-    .arg(
-        Arg::with_name("rpc_pubsub_queue_capacity_items")
-            .long("rpc-pubsub-queue-capacity-items")
-            .takes_value(true)
-            .value_name("NUMBER")
-            .validator(is_parsable::<usize>)
-            .default_value(&default_args.rpc_pubsub_queue_capacity_items)
-            .help(
-                "The maximum number of notifications that RPC PubSub will store across all \
-                 connections.",
-            ),
-    )
-    .arg(
-        Arg::with_name("rpc_pubsub_queue_capacity_bytes")
-            .long("rpc-pubsub-queue-capacity-bytes")
-            .takes_value(true)
-            .value_name("BYTES")
-            .validator(is_parsable::<usize>)
-            .default_value(&default_args.rpc_pubsub_queue_capacity_bytes)
-            .help(
-                "The maximum total size of notifications that RPC PubSub will store across all \
-                 connections.",
-            ),
-    )
-    .arg(
-        Arg::with_name("rpc_pubsub_notification_threads")
-            .long("rpc-pubsub-notification-threads")
-            .requires("full_rpc_api")
-            .takes_value(true)
-            .value_name("NUM_THREADS")
-            .validator(is_parsable::<usize>)
-            .default_value_if(
-                "full_rpc_api",
-                None,
-                &default_args.rpc_pubsub_notification_threads,
-            )
-            .help(
-                "The maximum number of threads that RPC PubSub will use for generating \
-                 notifications. 0 will disable RPC PubSub notifications",
-            ),
-    )
-    .arg(
-        Arg::with_name("rpc_send_transaction_retry_ms")
-            .long("rpc-send-retry-ms")
-            .value_name("MILLISECS")
-            .takes_value(true)
-            .validator(is_parsable::<u64>)
-            .default_value(&default_args.rpc_send_transaction_retry_ms)
-            .help("The rate at which transactions sent via rpc service are retried."),
-    )
-    .arg(
-        Arg::with_name("rpc_send_transaction_batch_ms")
-            .long("rpc-send-batch-ms")
-            .value_name("MILLISECS")
-            .hidden(hidden_unless_forced())
-            .takes_value(true)
-            .validator(|s| is_within_range(s, 1..=MAX_BATCH_SEND_RATE_MS))
-            .default_value(&default_args.rpc_send_transaction_batch_ms)
-            .help("The rate at which transactions sent via rpc service are sent in batch."),
-    )
-    .arg(
-        Arg::with_name("rpc_send_transaction_leader_forward_count")
-            .long("rpc-send-leader-count")
-            .value_name("NUMBER")
-            .takes_value(true)
-            .validator(is_parsable::<u64>)
-            .default_value(&default_args.rpc_send_transaction_leader_forward_count)
-            .help(
-                "The number of upcoming leaders to which to forward transactions sent via rpc \
-                 service.",
-            ),
-    )
-    .arg(
-        Arg::with_name("rpc_send_transaction_default_max_retries")
-            .long("rpc-send-default-max-retries")
-            .value_name("NUMBER")
-            .takes_value(true)
-            .validator(is_parsable::<usize>)
-            .help(
-                "The maximum number of transaction broadcast retries when unspecified by the \
-                 request, otherwise retried until expiration.",
-            ),
-    )
-    .arg(
-        Arg::with_name("rpc_send_transaction_service_max_retries")
-            .long("rpc-send-service-max-retries")
-            .value_name("NUMBER")
-            .takes_value(true)
-            .validator(is_parsable::<usize>)
-            .default_value(&default_args.rpc_send_transaction_service_max_retries)
-            .help(
-                "The maximum number of transaction broadcast retries, regardless of requested \
-                 value.",
-            ),
-    )
-    .arg(
-        Arg::with_name("rpc_send_transaction_batch_size")
-            .long("rpc-send-batch-size")
-            .value_name("NUMBER")
-            .hidden(hidden_unless_forced())
-            .takes_value(true)
-            .validator(|s| is_within_range(s, 1..=MAX_TRANSACTION_BATCH_SIZE))
-            .default_value(&default_args.rpc_send_transaction_batch_size)
-            .help("The size of transactions to be sent in batch."),
-    )
-    .arg(
-        Arg::with_name("rpc_send_transaction_retry_pool_max_size")
-            .long("rpc-send-transaction-retry-pool-max-size")
-            .value_name("NUMBER")
-            .takes_value(true)
-            .validator(is_parsable::<usize>)
-            .default_value(&default_args.rpc_send_transaction_retry_pool_max_size)
-            .help("The maximum size of transactions retry pool."),
-    )
-    .arg(
-        Arg::with_name("rpc_send_transaction_tpu_peer")
-            .long("rpc-send-transaction-tpu-peer")
-            .takes_value(true)
-            .number_of_values(1)
-            .multiple(true)
-            .value_name("HOST:PORT")
-            .validator(solana_net_utils::is_host_port)
-            .help("Peer(s) to broadcast transactions to instead of the current leader"),
-    )
-    .arg(
-        Arg::with_name("rpc_send_transaction_also_leader")
-            .long("rpc-send-transaction-also-leader")
-            .requires("rpc_send_transaction_tpu_peer")
-            .help(
-                "With `--rpc-send-transaction-tpu-peer HOST:PORT`, also send to the current leader",
-            ),
-    )
-    .arg(
-        Arg::with_name("rpc_scan_and_fix_roots")
-            .long("rpc-scan-and-fix-roots")
-            .takes_value(false)
-            .requires("enable_rpc_transaction_history")
-            .help("Verifies blockstore roots on boot and fixes any gaps"),
-    )
-    .arg(
-        Arg::with_name("rpc_max_request_body_size")
-            .long("rpc-max-request-body-size")
-            .value_name("BYTES")
-            .takes_value(true)
-            .validator(is_parsable::<usize>)
-            .default_value(&default_args.rpc_max_request_body_size)
-            .help("The maximum request body size accepted by rpc service"),
-    )
-    .arg(
         Arg::with_name("geyser_plugin_config")
             .long("geyser-plugin-config")
             .alias("accountsdb-plugin-config")
@@ -1284,14 +907,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                  generally produce higher compression ratio at the expense of speed and memory. \
                  See the zstd manpage for more information.",
             ),
-    )
-    .arg(
-        Arg::with_name("max_genesis_archive_unpacked_size")
-            .long("max-genesis-archive-unpacked-size")
-            .value_name("NUMBER")
-            .takes_value(true)
-            .default_value(&default_args.genesis_archive_unpacked_size)
-            .help("maximum total uncompressed file size of downloaded genesis archive"),
     )
     .arg(
         Arg::with_name("wal_recovery_mode")
@@ -1472,11 +1087,10 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("accounts-db-mark-obsolete-accounts")
             .help("Enables experimental obsolete account tracking")
             .long_help(
-                "Enables experimental obsolete account tracking. \
-                 This feature tracks obsolete accounts in the account storage entry allowing \
-                 for earlier cleaning of obsolete accounts in the storages and index. \
-                 At this time this feature is not compatible with booting from local \
-                 snapshot state and must unpack from archives.",
+                "Enables experimental obsolete account tracking. This feature tracks obsolete \
+                 accounts in the account storage entry allowing for earlier cleaning of obsolete \
+                 accounts in the storages and index. At this time this feature is not compatible \
+                 with booting from local snapshot state and must unpack from archives.",
             )
             .hidden(hidden_unless_forced()),
     )
@@ -1500,14 +1114,33 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Number of bins to divide the accounts index into"),
     )
     .arg(
+        Arg::with_name("accounts_index_initial_accounts_count")
+            .long("accounts-index-initial-accounts-count")
+            .value_name("NUMBER")
+            .validator(is_parsable::<usize>)
+            .takes_value(true)
+            .help("Pre-allocate the accounts index, assuming this many accounts")
+            .hidden(hidden_unless_forced()),
+    )
+    .arg(
         Arg::with_name("accounts_index_path")
             .long("accounts-index-path")
             .value_name("PATH")
             .takes_value(true)
             .multiple(true)
+            .requires("enable_accounts_disk_index")
             .help(
                 "Persistent accounts-index location. May be specified multiple times. [default: \
                  <LEDGER>/accounts_index]",
+            ),
+    )
+    .arg(
+        Arg::with_name("enable_accounts_disk_index")
+            .long("enable-accounts-disk-index")
+            .help("Enables the disk-based accounts index")
+            .long_help(
+                "Enables the disk-based accounts index. Reduce the memory footprint of the \
+                 accounts index at the cost of index performance.",
             ),
     )
     .arg(
@@ -1610,13 +1243,15 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help(BlockProductionMethod::cli_message()),
     )
     .arg(
-        Arg::with_name("transaction_struct")
-            .long("transaction-structure")
-            .value_name("STRUCT")
+        Arg::with_name("block_production_pacing_fill_time_millis")
+            .long("block-production-pacing-fill-time-millis")
+            .value_name("MILLIS")
             .takes_value(true)
-            .possible_values(TransactionStructure::cli_names())
-            .default_value(TransactionStructure::default().into())
-            .help(TransactionStructure::cli_message()),
+            .default_value(&default_args.block_production_pacing_fill_time_millis)
+            .help(
+                "Pacing fill time in milliseconds for the central-scheduler block production \
+                 method",
+            ),
     )
     .arg(
         Arg::with_name("unified_scheduler_handler_threads")
@@ -1687,6 +1322,11 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                  set,tpu-client-next is used by default.",
             ),
     )
+    .args(&pub_sub_config::args(/*test_validator:*/ false))
+    .args(&json_rpc_config::args())
+    .args(&rpc_bigtable_config::args())
+    .args(&send_transaction_config::args())
+    .args(&rpc_bootstrap_config::args())
 }
 
 fn validators_set(
@@ -1719,33 +1359,36 @@ mod tests {
     use {
         super::*,
         crate::cli::thread_args::thread_args,
-        solana_rpc::rpc::MAX_REQUEST_BODY_SIZE,
-        std::net::{IpAddr, Ipv4Addr},
+        scopeguard::defer,
+        std::{
+            fs,
+            net::{IpAddr, Ipv4Addr},
+            path::{absolute, PathBuf},
+        },
     };
 
     impl Default for RunArgs {
         fn default() -> Self {
             let identity_keypair = Keypair::new();
-            let logfile = format!("agave-validator-{}.log", identity_keypair.pubkey());
+            let ledger_path = absolute(PathBuf::from("ledger")).unwrap();
+            let logfile =
+                PathBuf::from(format!("agave-validator-{}.log", identity_keypair.pubkey()));
             let entrypoints = vec![];
             let known_validators = None;
 
+            let json_rpc_config =
+                crate::commands::run::args::json_rpc_config::tests::default_json_rpc_config();
+
             RunArgs {
                 identity_keypair,
-                logfile,
+                ledger_path,
+                logfile: Some(logfile),
                 entrypoints,
                 known_validators,
                 socket_addr_space: SocketAddrSpace::Global,
                 rpc_bootstrap_config: RpcBootstrapConfig::default(),
                 blockstore_options: BlockstoreOptions::default(),
-                json_rpc_config: JsonRpcConfig {
-                    health_check_slot_distance: 128,
-                    max_multiple_accounts: Some(100),
-                    rpc_threads: num_cpus::get(),
-                    rpc_blocking_threads: 1.max(num_cpus::get() / 4),
-                    max_request_body_size: Some(MAX_REQUEST_BODY_SIZE),
-                    ..JsonRpcConfig::default()
-                },
+                json_rpc_config,
                 pub_sub_config: PubSubConfig {
                     worker_threads: 4,
                     notification_threads: None,
@@ -1753,6 +1396,7 @@ mod tests {
                         solana_rpc::rpc_pubsub_service::DEFAULT_QUEUE_CAPACITY_ITEMS,
                     ..PubSubConfig::default_for_tests()
                 },
+                send_transaction_service_config: SendTransactionServiceConfig::default(),
             }
         }
     }
@@ -1765,10 +1409,12 @@ mod tests {
                 entrypoints: self.entrypoints.clone(),
                 known_validators: self.known_validators.clone(),
                 socket_addr_space: self.socket_addr_space,
+                ledger_path: self.ledger_path.clone(),
                 rpc_bootstrap_config: self.rpc_bootstrap_config.clone(),
                 blockstore_options: self.blockstore_options.clone(),
                 json_rpc_config: self.json_rpc_config.clone(),
                 pub_sub_config: self.pub_sub_config.clone(),
+                send_transaction_service_config: self.send_transaction_service_config.clone(),
             }
         }
     }
@@ -1867,15 +1513,102 @@ mod tests {
     }
 
     #[test]
+    fn verify_args_struct_by_command_run_with_ledger_path() {
+        // nonexistent absolute ledger path
+        {
+            let default_run_args = RunArgs::default();
+            let tmp_dir = fs::canonicalize(tempfile::tempdir().unwrap()).unwrap();
+            let ledger_path = tmp_dir.join("nonexistent_ledger_path");
+            assert!(!fs::exists(&ledger_path).unwrap());
+
+            let expected_args = RunArgs {
+                ledger_path: ledger_path.clone(),
+                ..default_run_args.clone()
+            };
+            verify_args_struct_by_command_run_with_identity_setup(
+                default_run_args,
+                vec!["--ledger", ledger_path.to_str().unwrap()],
+                expected_args,
+            );
+            assert!(fs::exists(&ledger_path).unwrap());
+        }
+
+        // existing absolute ledger path
+        {
+            let default_run_args = RunArgs::default();
+            let tmp_dir = tempfile::tempdir().unwrap();
+            let ledger_path = tmp_dir.path().join("existing_ledger_path");
+            fs::create_dir_all(&ledger_path).unwrap();
+            let ledger_path = fs::canonicalize(ledger_path).unwrap();
+            assert!(fs::exists(ledger_path.as_path()).unwrap());
+
+            let expected_args = RunArgs {
+                ledger_path: ledger_path.clone(),
+                ..default_run_args.clone()
+            };
+            verify_args_struct_by_command_run_with_identity_setup(
+                default_run_args,
+                vec!["--ledger", ledger_path.to_str().unwrap()],
+                expected_args,
+            );
+            assert!(fs::exists(&ledger_path).unwrap());
+        }
+
+        // nonexistent relative ledger path
+        {
+            let default_run_args = RunArgs::default();
+            let ledger_path = PathBuf::from("nonexistent_ledger_path");
+            assert!(!fs::exists(&ledger_path).unwrap());
+            defer! {
+                fs::remove_dir_all(&ledger_path).unwrap()
+            };
+
+            let expected_args = RunArgs {
+                ledger_path: absolute(&ledger_path).unwrap(),
+                ..default_run_args.clone()
+            };
+            verify_args_struct_by_command_run_with_identity_setup(
+                default_run_args,
+                vec!["--ledger", ledger_path.to_str().unwrap()],
+                expected_args,
+            );
+            assert!(fs::exists(&ledger_path).unwrap());
+        }
+
+        // existing relative ledger path
+        {
+            let default_run_args = RunArgs::default();
+            let ledger_path = PathBuf::from("existing_ledger_path");
+            fs::create_dir_all(&ledger_path).unwrap();
+            assert!(fs::exists(&ledger_path).unwrap());
+            defer! {
+                fs::remove_dir_all(&ledger_path).unwrap()
+            };
+
+            let expected_args = RunArgs {
+                ledger_path: absolute(&ledger_path).unwrap(),
+                ..default_run_args.clone()
+            };
+            verify_args_struct_by_command_run_with_identity_setup(
+                default_run_args,
+                vec!["--ledger", ledger_path.to_str().unwrap()],
+                expected_args,
+            );
+            assert!(fs::exists(&ledger_path).unwrap());
+        }
+    }
+
+    #[test]
     fn verify_args_struct_by_command_run_with_log() {
         let default_run_args = RunArgs::default();
 
         // default
         {
             let expected_args = RunArgs {
-                logfile: "agave-validator-".to_string()
-                    + &default_run_args.identity_keypair.pubkey().to_string()
-                    + ".log",
+                logfile: Some(PathBuf::from(format!(
+                    "agave-validator-{}.log",
+                    default_run_args.identity_keypair.pubkey()
+                ))),
                 ..default_run_args.clone()
             };
             verify_args_struct_by_command_run_with_identity_setup(
@@ -1888,7 +1621,7 @@ mod tests {
         // short arg
         {
             let expected_args = RunArgs {
-                logfile: "-".to_string(),
+                logfile: None,
                 ..default_run_args.clone()
             };
             verify_args_struct_by_command_run_with_identity_setup(
@@ -1901,7 +1634,7 @@ mod tests {
         // long arg
         {
             let expected_args = RunArgs {
-                logfile: "custom_log.log".to_string(),
+                logfile: Some(PathBuf::from("custom_log.log")),
                 ..default_run_args.clone()
             };
             verify_args_struct_by_command_run_with_identity_setup(

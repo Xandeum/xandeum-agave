@@ -7,6 +7,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 and follows a [Backwards Compatibility Policy](https://docs.anza.xyz/backwards-compatibility)
 
+## 3.1.0
+### RPC
+#### Breaking
+* A signature verification failure in `simulateTransaction()` or the preflight stage of `sendTransaction()` will now be attached to the simulation result's `err` property as `TransactionError::SignatureFailure` instead of being thrown as a JSON RPC API error (-32003). Applications that already guard against JSON RPC exceptions should expect signature verification errors to appear on the simulation result instead. Applications that already handle the materialization of `TransactionErrors` on simulation results can now expect to receive errors of type `TransactionError::SignatureFailure` at those verification sites.
+#### Changes
+* The `getProgramAccounts` RPC endpoint now returns JSON-RPC errors when malformed filters are provided (previously these malformed filters would be silently ignored and the RPC call would execute an unfiltered query).
+* `PubsubClient` can now be constructed with the URI of an RPC (as a `str`, `String`, or `Uri`) as well as an `http::Request<()>`. The addition of `Request` allows you to set request headers when establishing a websocket connection with an RPC.
+### Validator
+#### Breaking
+#### Deprecations
+* The `--monitor` flag with `agave-validator exit` is now deprecated. Operators can use the `monitor` command after `exit` instead.
+* The `--disable-accounts-disk-index` flag is now deprecated.
+* All monorepo crates falling outside the
+[backward compatibility policy](https://docs.anza.xyz/backwards-compatibility) are now
+deprecated, signaling their inclusion in the Agave Unstable API. Enable the
+`agave-unstable-api` crate feature to acknowledge use of an interface that may break
+without warning. From v4.0.0 onward, symbols in these crates will be unavailable without
+`agave-unstable-api` enabled.
+* The `--dev-halt-at-slot` flag is now deprecated.
+
+#### Changes
+* The accounts index is now kept entirely in memory by default.
+
 ## 3.0.0
 
 ### RPC
@@ -32,11 +55,13 @@ and follows a [Backwards Compatibility Policy](https://docs.anza.xyz/backwards-c
   * `--no-check-vote-account`
   * `--no-rocksdb-compaction`, `--rocksdb-compaction-interval-slots`, `--rocksdb-max-compaction-jitter-slots`
   * `--replay-slots-concurrently`
+    * Use `--replay-forks-threads` with a value of `4` to match preexisting behavior
   * `--rpc-pubsub-max-connections`, `--rpc-pubsub-max-fragment-size`, `--rpc-pubsub-max-in-buffer-capacity`, `--rpc-pubsub-max-out-buffer-capacity`, `--enable-cpi-and-log-storage`, `--minimal-rpc-api`
   * `--skip-poh-verify`
 * Deprecated snapshot archive formats have been removed and are no longer loadable.
 * Using `--snapshot-interval-slots 0` to disable generating snapshots has been removed. Use `--no-snapshots` instead.
 * Validator will now bind all ports within provided `--dynamic-port-range`, including the client ports. A range of at least 25 ports is recommended to avoid failures to bind during startup.
+* Agave and agave-ledger-tool can no longer operate with legacy shreds. Legacy shreds have not been in circulation since the activation of https://explorer.solana.com/address/GV49KKQdBNaiv2pgqhS2Dy3GWYJGXMTVYbYkdk91orRy. This change may break operations with old ledgers that may still contain legacy shreds.
 
 #### Changes
 * `--transaction-structure view` is now the default.

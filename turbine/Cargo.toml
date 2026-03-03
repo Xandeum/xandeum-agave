@@ -1,9 +1,9 @@
 [package]
 name = "solana-turbine"
-description = "Blockchain, Rebuilt for Scale"
 documentation = "https://docs.rs/solana-turbine"
 version = { workspace = true }
 authors = { workspace = true }
+description = { workspace = true }
 repository = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }
@@ -14,6 +14,7 @@ agave-unstable-api = []
 
 [dependencies]
 agave-feature-set = { workspace = true }
+agave-votor = { workspace = true }
 agave-xdp = { workspace = true }
 bincode = { workspace = true }
 bytes = { workspace = true }
@@ -58,18 +59,18 @@ solana-transaction-error = { workspace = true }
 static_assertions = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+wincode = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = { workspace = true }
 
 [dev-dependencies]
+agave-logger = { workspace = true }
 assert_matches = { workspace = true }
 bencher = { workspace = true }
 bs58 = { workspace = true }
-conditional-mod = { workspace = true }
 solana-genesis-config = { workspace = true }
 solana-ledger = { workspace = true, features = ["agave-unstable-api","dev-context-only-utils"] }
-solana-logger = { workspace = true }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
 solana-signature = { workspace = true, features = ["rand"] }
 solana-transaction = { workspace = true }

@@ -78,8 +78,8 @@ impl AddressLookupTableSubCommands for App<'_, '_> {
                                 .takes_value(true)
                                 .validator(is_pubkey_or_keypair)
                                 .help(
-                                    "Lookup table authority address \
-                                    [default: the default configured keypair].",
+                                    "Lookup table authority address [default: the default \
+                                     configured keypair].",
                                 ),
                         )
                         .arg(
@@ -113,8 +113,8 @@ impl AddressLookupTableSubCommands for App<'_, '_> {
                                 .takes_value(true)
                                 .validator(is_valid_signer)
                                 .help(
-                                    "Lookup table authority \
-                                    [default: the default configured keypair]",
+                                    "Lookup table authority [default: the default configured \
+                                     keypair]",
                                 ),
                         )
                         .arg(
@@ -143,8 +143,8 @@ impl AddressLookupTableSubCommands for App<'_, '_> {
                                 .takes_value(true)
                                 .validator(is_valid_signer)
                                 .help(
-                                    "Lookup table authority \
-                                    [default: the default configured keypair]",
+                                    "Lookup table authority [default: the default configured \
+                                     keypair]",
                                 ),
                         )
                         .arg(
@@ -187,8 +187,8 @@ impl AddressLookupTableSubCommands for App<'_, '_> {
                                 .takes_value(true)
                                 .validator(is_valid_signer)
                                 .help(
-                                    "Lookup table authority \
-                                    [default: the default configured keypair]",
+                                    "Lookup table authority [default: the default configured \
+                                     keypair]",
                                 ),
                         )
                         .arg(
@@ -227,8 +227,8 @@ impl AddressLookupTableSubCommands for App<'_, '_> {
                                 .takes_value(true)
                                 .validator(is_valid_signer)
                                 .help(
-                                    "Lookup table authority \
-                                    [default: the default configured keypair]",
+                                    "Lookup table authority [default: the default configured \
+                                     keypair]",
                                 ),
                         ),
                 )
@@ -680,7 +680,10 @@ fn process_extend_lookup_table(
         Some(&config.signers[0].pubkey()),
     ));
 
-    tx.try_sign(&[config.signers[0], authority_signer], blockhash)?;
+    tx.try_sign(
+        &[config.signers[0], authority_signer, payer_signer],
+        blockhash,
+    )?;
     let result = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
         &tx,
         config.commitment,

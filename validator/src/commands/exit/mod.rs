@@ -46,10 +46,18 @@ impl FromClapArgMatches for ExitArgs {
             Some(PostExitAction::Wait)
         };
 
+        // Deprecated in v3.0.0
         if matches.is_present("wait_for_exit") {
             eprintln!(
                 "WARN: The --wait-for-exit flag has been deprecated, waiting for exit is now the \
                  default behavior"
+            );
+        }
+        // Deprecated in v3.1.0
+        if matches.is_present("monitor") {
+            eprintln!(
+                "WARN: The --monitor flag has been deprecated, use \"agave-validator monitor\" \
+                 instead"
             );
         }
 
@@ -83,6 +91,7 @@ pub fn command<'a>() -> App<'a, 'a> {
                 .long("monitor")
                 .takes_value(false)
                 .requires("no_wait_for_exit")
+                .hidden(hidden_unless_forced())
                 .help("Monitor the validator after sending the exit request"),
         )
         .arg(

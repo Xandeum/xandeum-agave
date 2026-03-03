@@ -1,13 +1,18 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
-    agave_feature_set::{alpenglow, raise_cpi_nesting_limit_to_8, FeatureSet, FEATURE_NAMES},
+    agave_feature_set::{
+        alpenglow, increase_cpi_account_info_limit, raise_cpi_nesting_limit_to_8, FeatureSet,
+        FEATURE_NAMES,
+    },
+    agave_snapshots::{
+        paths::BANK_SNAPSHOTS_DIR, snapshot_config::SnapshotConfig, SnapshotInterval,
+    },
     base64::{prelude::BASE64_STANDARD, Engine},
     crossbeam_channel::Receiver,
     log::*,
     solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
     solana_accounts_db::{
         accounts_db::AccountsDbConfig, accounts_index::AccountsIndexConfig,
-        hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
         utils::create_accounts_run_and_snapshot_dirs,
     },
     solana_cli_output::CliAccount,
@@ -21,6 +26,7 @@ use {
     },
     solana_epoch_schedule::EpochSchedule,
     solana_fee_calculator::FeeRateGovernor,
+    solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
     solana_geyser_plugin_manager::{
         geyser_plugin_manager::GeyserPluginManager, GeyserPluginManagerRequest,
     },
@@ -46,11 +52,8 @@ use {
     solana_rpc_client::{nonblocking, rpc_client::RpcClient},
     solana_rpc_client_api::request::MAX_MULTIPLE_ACCOUNTS,
     solana_runtime::{
-        bank_forks::BankForks,
-        genesis_utils::{self, create_genesis_config_with_leader_ex_no_features},
+        bank_forks::BankForks, genesis_utils::create_genesis_config_with_leader_ex,
         runtime_config::RuntimeConfig,
-        snapshot_config::SnapshotConfig,
-        snapshot_utils::{SnapshotInterval, BANK_SNAPSHOTS_DIR},
     },
     solana_sdk_ids::address_lookup_table,
     solana_signer::Signer,
@@ -172,7 +175,7 @@ impl Default for TestValidatorGenesis {
             log_messages_bytes_limit: Option::<usize>::default(),
             transaction_account_lock_limit: Option::<usize>::default(),
             tpu_enable_udp: DEFAULT_TPU_ENABLE_UDP,
-            geyser_plugin_manager: Arc::new(RwLock::new(GeyserPluginManager::new())),
+            geyser_plugin_manager: Arc::new(RwLock::new(GeyserPluginManager::default())),
             admin_rpc_service_post_init:
                 Arc::<RwLock<Option<AdminRpcRequestMetadataPostInit>>>::default(),
         }
@@ -347,7 +350,7 @@ impl TestValidatorGenesis {
     {
         let addresses: Vec<Pubkey> = addresses.into_iter().collect();
         for chunk in addresses.chunks(MAX_MULTIPLE_ACCOUNTS) {
-            info!("Fetching {:?} over RPC...", chunk);
+            info!("Fetching {chunk:?} over RPC...");
             let responses = rpc_client
                 .get_multiple_accounts(chunk)
                 .map_err(|err| format!("Failed to fetch: {err}"))?;
@@ -355,7 +358,7 @@ impl TestValidatorGenesis {
                 if let Some(account) = res {
                     self.add_account(*address, transform(address, account)?);
                 } else if skip_missing {
-                    warn!("Could not find {}, skipping.", address);
+                    warn!("Could not find {address}, skipping.");
                 } else {
                     return Err(format!("Failed to fetch {address}"));
                 }
@@ -399,7 +402,7 @@ impl TestValidatorGenesis {
         let mut alt_entries: Vec<Pubkey> = Vec::new();
 
         for chunk in addresses.chunks(MAX_MULTIPLE_ACCOUNTS) {
-            info!("Fetching {:?} over RPC...", chunk);
+            info!("Fetching {chunk:?} over RPC...");
             let responses = rpc_client
                 .get_multiple_accounts(chunk)
                 .map_err(|err| format!("Failed to fetch: {err}"))?;
@@ -571,7 +574,7 @@ impl TestValidatorGenesis {
             json_files.extend(matched_files);
         }
 
-        debug!("account files found: {:?}", json_files);
+        debug!("account files found: {json_files:?}");
 
         let accounts: Vec<_> = json_files
             .iter()
@@ -844,15 +847,6 @@ impl TestValidator {
             .expect("validator start failed")
     }
 
-    /// allow tests to indicate that validator has completed initialization
-    pub fn set_startup_verification_complete_for_tests(&self) {
-        self.bank_forks()
-            .read()
-            .unwrap()
-            .root_bank()
-            .set_initial_accounts_hash_verification_completed();
-    }
-
     /// Initialize the ledger directory
     ///
     /// If `ledger_path` is `None`, a temporary ledger will be created.  Otherwise the ledger will
@@ -871,25 +865,23 @@ impl TestValidator {
         let mint_lamports = 500_000_000 * LAMPORTS_PER_SOL;
 
         // Only activate features which are not explicitly deactivated.
-        let mut feature_set = FeatureSet::default().inactive().clone();
+        let mut feature_set = FeatureSet::all_enabled();
         for feature in &config.deactivate_feature_set {
-            if feature_set.remove(feature) {
-                info!("Feature for {:?} deactivated", feature)
+            if FEATURE_NAMES.contains_key(feature) {
+                feature_set.deactivate(feature);
+                info!("Feature for {feature:?} deactivated");
             } else {
-                warn!(
-                    "Feature {:?} set for deactivation is not a known Feature public key",
-                    feature,
-                )
+                warn!("Feature {feature:?} set for deactivation is not a known Feature public key",)
             }
         }
 
         let mut accounts = config.accounts.clone();
-        for (address, account) in solana_program_test::programs::spl_programs(&config.rent) {
+        for (address, account) in solana_program_binaries::spl_programs(&config.rent) {
             accounts.entry(address).or_insert(account);
         }
         for (address, account) in
-            solana_program_test::programs::core_bpf_programs(&config.rent, |feature_id| {
-                feature_set.contains(feature_id)
+            solana_program_binaries::core_bpf_programs(&config.rent, |feature_id| {
+                feature_set.is_active(feature_id)
             })
         {
             accounts.entry(address).or_insert(account);
@@ -933,17 +925,19 @@ impl TestValidator {
             );
         }
 
-        let mut genesis_config = create_genesis_config_with_leader_ex_no_features(
+        let mut genesis_config = create_genesis_config_with_leader_ex(
             mint_lamports,
             &mint_address,
             &validator_identity.pubkey(),
             &validator_vote_account.pubkey(),
             &validator_stake_account.pubkey(),
+            None,
             validator_stake_lamports,
             validator_identity_lamports,
             config.fee_rate_governor.clone(),
             config.rent.clone(),
             solana_cluster_type::ClusterType::Development,
+            &feature_set,
             accounts.into_iter().collect(),
         );
         genesis_config.epoch_schedule = config
@@ -958,10 +952,6 @@ impl TestValidator {
 
         if let Some(inflation) = config.inflation {
             genesis_config.inflation = inflation;
-        }
-
-        for feature in feature_set {
-            genesis_utils::activate_feature(&mut genesis_config, feature);
         }
 
         let ledger_path = match &config.ledger_path {
@@ -1038,7 +1028,7 @@ impl TestValidator {
         let node = {
             let bind_ip_addr = config.node_config.bind_ip_addr;
             let validator_node_config = NodeConfig {
-                bind_ip_addrs: Arc::new(BindIpAddrs::new(vec![bind_ip_addr])?),
+                bind_ip_addrs: BindIpAddrs::new(vec![bind_ip_addr])?,
                 gossip_port: config.node_config.gossip_addr.port(),
                 port_range: config.node_config.port_range,
                 advertised_ip: bind_ip_addr,
@@ -1081,11 +1071,11 @@ impl TestValidator {
             }
         }
 
-        let accounts_db_config = Some(AccountsDbConfig {
+        let accounts_db_config = AccountsDbConfig {
             index: Some(AccountsIndexConfig::default()),
             account_indexes: Some(config.rpc_config.account_indexes.clone()),
             ..AccountsDbConfig::default()
-        });
+        };
 
         let runtime_config = RuntimeConfig {
             compute_budget: config
@@ -1096,6 +1086,9 @@ impl TestValidator {
                         !config
                             .deactivate_feature_set
                             .contains(&raise_cpi_nesting_limit_to_8::id()),
+                        !config
+                            .deactivate_feature_set
+                            .contains(&increase_cpi_account_info_limit::id()),
                     )
                 }),
             log_messages_bytes_limit: config.log_messages_bytes_limit,
@@ -1208,13 +1201,13 @@ impl TestValidator {
                             }
                         }
                         Err(err) => {
-                            warn!("get_fee_for_message() failed: {:?}", err);
+                            warn!("get_fee_for_message() failed: {err:?}");
                             break;
                         }
                     }
                 }
                 Err(err) => {
-                    warn!("get_latest_blockhash() failed: {:?}", err);
+                    warn!("get_latest_blockhash() failed: {err:?}");
                     break;
                 }
             }
@@ -1257,13 +1250,13 @@ impl TestValidator {
                 match rpc_client.send_transaction(&transaction).await {
                     Ok(_) => *is_deployed = true,
                     Err(e) => {
-                        if format!("{:?}", e).contains("Program is not deployed") {
-                            debug!("{:?} - not deployed", program_id);
+                        if format!("{e:?}").contains("Program is not deployed") {
+                            debug!("{program_id:?} - not deployed");
                         } else {
                             // Assuming all other other errors could only occur *after*
                             // program is deployed for usability.
                             *is_deployed = true;
-                            debug!("{:?} - Unexpected error: {:?}", program_id, e);
+                            debug!("{program_id:?} - Unexpected error: {e:?}");
                         }
                     }
                 }
@@ -1272,7 +1265,7 @@ impl TestValidator {
                 return;
             }
 
-            println!("Waiting for programs to be fully deployed {} ...", attempt);
+            println!("Waiting for programs to be fully deployed {attempt} ...");
             sleep(Duration::from_millis(DEFAULT_MS_PER_SLOT)).await;
         }
         panic!("Timeout waiting for program to become usable");
@@ -1359,7 +1352,6 @@ mod test {
     #[test]
     fn get_health() {
         let (test_validator, _payer) = TestValidatorGenesis::default().start();
-        test_validator.set_startup_verification_complete_for_tests();
         let rpc_client = test_validator.get_rpc_client();
         rpc_client.get_health().expect("health");
     }
@@ -1367,7 +1359,6 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nonblocking_get_health() {
         let (test_validator, _payer) = TestValidatorGenesis::default().start_async().await;
-        test_validator.set_startup_verification_complete_for_tests();
         let rpc_client = test_validator.get_async_rpc_client();
         rpc_client.get_health().await.expect("health");
     }
@@ -1516,13 +1507,7 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_core_bpf_programs() {
-        let (test_validator, _payer) = TestValidatorGenesis::default()
-            .deactivate_features(&[
-                // Don't migrate the stake program.
-                agave_feature_set::migrate_stake_program_to_core_bpf::id(),
-            ])
-            .start_async()
-            .await;
+        let (test_validator, _payer) = TestValidatorGenesis::default().start_async().await;
 
         let rpc_client = test_validator.get_async_rpc_client();
 
@@ -1551,9 +1536,9 @@ mod test {
         assert_eq!(account.owner, solana_sdk_ids::bpf_loader_upgradeable::id());
         assert!(account.executable);
 
-        // Stake is a builtin.
+        // Stake is a BPF program.
         let account = fetched_programs[3].as_ref().unwrap();
-        assert_eq!(account.owner, solana_sdk_ids::native_loader::id());
+        assert_eq!(account.owner, solana_sdk_ids::bpf_loader_upgradeable::id());
         assert!(account.executable);
     }
 }

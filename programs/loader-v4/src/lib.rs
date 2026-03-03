@@ -1,5 +1,12 @@
-#[cfg(feature = "agave-unstable-api")]
-use qualifier_attr::qualifiers;
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 use {
     solana_bincode::limited_deserialize,
     solana_bpf_loader_program::{deploy_program, execute},
@@ -20,12 +27,11 @@ use {
     solana_svm_log_collector::{ic_logger_msg, LogCollector},
     solana_svm_measure::measure::Measure,
     solana_svm_type_overrides::sync::Arc,
-    solana_transaction_context::{BorrowedAccount, InstructionContext},
+    solana_transaction_context::{BorrowedInstructionAccount, InstructionContext},
     std::{cell::RefCell, rc::Rc},
 };
 
-#[cfg_attr(feature = "agave-unstable-api", qualifiers(pub))]
-const DEFAULT_COMPUTE_UNITS: u64 = 2_000;
+pub const DEFAULT_COMPUTE_UNITS: u64 = 2_000;
 
 pub fn get_state(data: &[u8]) -> Result<&LoaderV4State, InstructionError> {
     unsafe {
@@ -58,7 +64,7 @@ fn get_state_mut(data: &mut [u8]) -> Result<&mut LoaderV4State, InstructionError
 fn check_program_account(
     log_collector: &Option<Rc<RefCell<LogCollector>>>,
     instruction_context: &InstructionContext,
-    program: &BorrowedAccount,
+    program: &BorrowedInstructionAccount,
     authority_address: &Pubkey,
 ) -> Result<LoaderV4State, InstructionError> {
     if !loader_v4::check_id(program.get_owner()) {
@@ -422,7 +428,7 @@ fn process_instruction_finalize(
 declare_builtin_function!(
     Entrypoint,
     fn rust(
-        invoke_context: &mut InvokeContext,
+        invoke_context: &mut InvokeContext<'static, 'static>,
         _arg0: u64,
         _arg1: u64,
         _arg2: u64,
@@ -434,8 +440,8 @@ declare_builtin_function!(
     }
 );
 
-fn process_instruction_inner(
-    invoke_context: &mut InvokeContext,
+fn process_instruction_inner<'a>(
+    invoke_context: &mut InvokeContext<'a, 'a>,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let log_collector = invoke_context.get_log_collector();
     let transaction_context = &invoke_context.transaction_context;
@@ -618,7 +624,7 @@ mod tests {
             &instruction,
             transaction_accounts.clone(),
             &[],
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
 
         // Error: Missing authority account
@@ -627,7 +633,7 @@ mod tests {
             &instruction,
             transaction_accounts.clone(),
             &[(0, false, true)],
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
 
         // Error: Program not owned by loader
@@ -1428,7 +1434,7 @@ mod tests {
             &bincode::serialize(&LoaderV4Instruction::TransferAuthority).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (3, true, false)],
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
 
         // Error: Program is uninitialized

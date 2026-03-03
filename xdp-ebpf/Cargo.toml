@@ -2,7 +2,7 @@
 name = "agave-xdp-ebpf"
 version = { workspace = true }
 authors = { workspace = true }
-description = "Agave eBPF XDP program"
+description = { workspace = true }
 repository = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }

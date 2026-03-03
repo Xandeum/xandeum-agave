@@ -5,12 +5,12 @@ use {
     super::leader_updater::LeaderUpdater,
     crate::{
         connection_worker::DEFAULT_MAX_CONNECTION_HANDSHAKE_TIMEOUT,
-        logging::{debug, warn},
+        logging::debug,
         quic_networking::{
             create_client_config, create_client_endpoint, QuicClientCertificate, QuicError,
         },
         transaction_batch::TransactionBatch,
-        workers_cache::{shutdown_worker, spawn_worker, WorkersCache, WorkersCacheError},
+        workers_cache::{shutdown_worker, WorkersCache, WorkersCacheError},
         SendTransactionStats,
     },
     async_trait::async_trait,
@@ -62,6 +62,7 @@ pub enum ConnectionWorkersSchedulerError {
 /// The idea of having a separate `connect` parameter is to create a set of
 /// nodes to connect to in advance in order to hide the latency of opening new
 /// connection. Hence, `connect` must be greater or equal to `send`
+#[derive(Debug, Clone)]
 pub struct Fanout {
     /// The number of leaders to target for sending transactions.
     pub send: usize,
@@ -269,19 +270,16 @@ impl ConnectionWorkersScheduler {
             // add future leaders to the cache to hide the latency of opening
             // the connection.
             for peer in connect_leaders {
-                if !workers.contains(&peer) {
-                    let worker = spawn_worker(
-                        &endpoint,
-                        &peer,
-                        worker_channel_size,
-                        skip_check_transaction_age,
-                        max_reconnect_attempts,
-                        DEFAULT_MAX_CONNECTION_HANDSHAKE_TIMEOUT,
-                        stats.clone(),
-                    );
-                    if let Some(pop_worker) = workers.push(peer, worker) {
-                        shutdown_worker(pop_worker)
-                    }
+                if let Some(evicted_worker) = workers.ensure_worker(
+                    peer,
+                    &endpoint,
+                    worker_channel_size,
+                    skip_check_transaction_age,
+                    max_reconnect_attempts,
+                    DEFAULT_MAX_CONNECTION_HANDSHAKE_TIMEOUT,
+                    stats.clone(),
+                ) {
+                    shutdown_worker(evicted_worker);
                 }
             }
 
@@ -305,7 +303,7 @@ impl ConnectionWorkersScheduler {
 }
 
 /// Sets up the QUIC endpoint for the scheduler to handle connections.
-fn setup_endpoint(
+pub fn setup_endpoint(
     bind: BindTarget,
     stake_identity: Option<StakeIdentity>,
 ) -> Result<Endpoint, ConnectionWorkersSchedulerError> {
@@ -335,11 +333,6 @@ impl WorkersBroadcaster for NonblockingBroadcaster {
         transaction_batch: TransactionBatch,
     ) -> Result<(), ConnectionWorkersSchedulerError> {
         for new_leader in leaders {
-            if !workers.contains(new_leader) {
-                warn!("No existing worker for {new_leader:?}, skip sending to this leader.");
-                continue;
-            }
-
             let send_res =
                 workers.try_send_transactions_to_address(new_leader, transaction_batch.clone());
             if let Err(err) = send_res {
@@ -360,7 +353,7 @@ impl WorkersBroadcaster for NonblockingBroadcaster {
 ///
 /// This function selects up to `send_fanout` addresses from the `leaders` list, ensuring that
 /// only unique addresses are included while maintaining their original order.
-fn extract_send_leaders(leaders: &[SocketAddr], send_fanout: usize) -> Vec<SocketAddr> {
+pub fn extract_send_leaders(leaders: &[SocketAddr], send_fanout: usize) -> Vec<SocketAddr> {
     let send_count = send_fanout.min(leaders.len());
     remove_duplicates(&leaders[..send_count])
 }

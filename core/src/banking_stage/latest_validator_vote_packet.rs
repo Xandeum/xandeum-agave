@@ -1,14 +1,15 @@
 #[cfg(test)]
 use solana_perf::packet::PacketRef;
 use {
-    super::immutable_deserialized_packet::{DeserializedPacketError, ImmutableDeserializedPacket},
+    crate::banking_stage::transaction_scheduler::transaction_state_container::SharedBytes,
+    agave_transaction_view::transaction_view::SanitizedTransactionView,
     solana_bincode::limited_deserialize,
     solana_clock::{Slot, UnixTimestamp},
     solana_hash::Hash,
     solana_packet::PACKET_DATA_SIZE,
     solana_pubkey::Pubkey,
     solana_vote_program::vote_instruction::VoteInstruction,
-    std::sync::Arc,
+    thiserror::Error,
 };
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
@@ -18,28 +19,27 @@ pub enum VoteSource {
 }
 
 /// Holds deserialized vote messages as well as their source, and slot
-#[derive(Debug, Clone)]
-pub struct LatestValidatorVotePacket {
+#[derive(Debug)]
+pub struct LatestValidatorVote {
     vote_source: VoteSource,
     vote_pubkey: Pubkey,
-    vote: Option<Arc<ImmutableDeserializedPacket>>,
     authorized_voter_pubkey: Pubkey,
+    vote: Option<SanitizedTransactionView<SharedBytes>>,
     slot: Slot,
     hash: Hash,
     timestamp: Option<UnixTimestamp>,
 }
 
-impl LatestValidatorVotePacket {
-    pub fn new_from_immutable(
-        vote: Arc<ImmutableDeserializedPacket>,
+impl LatestValidatorVote {
+    pub fn new_from_view(
+        vote: SanitizedTransactionView<SharedBytes>,
         vote_source: VoteSource,
         deprecate_legacy_vote_ixs: bool,
     ) -> Result<Self, DeserializedPacketError> {
-        let message = vote.transaction().get_message();
-        let (_, instruction) = message
+        let (_, instruction) = vote
             .program_instructions_iter()
             .next()
-            .ok_or(DeserializedPacketError::VoteTransactionError)?;
+            .ok_or(DeserializedPacketError::VoteTransaction)?;
 
         let instruction_filter = |ix: &VoteInstruction| {
             if deprecate_legacy_vote_ixs {
@@ -52,31 +52,30 @@ impl LatestValidatorVotePacket {
             }
         };
 
-        match limited_deserialize::<VoteInstruction>(&instruction.data, PACKET_DATA_SIZE as u64) {
+        match limited_deserialize::<VoteInstruction>(instruction.data, PACKET_DATA_SIZE as u64) {
             Ok(vote_state_update_instruction)
                 if instruction_filter(&vote_state_update_instruction) =>
             {
-                let ix_key = |offset: usize| {
+                let ix_key = |offset| {
                     let index = instruction
                         .accounts
                         .get(offset)
                         .copied()
-                        .ok_or(DeserializedPacketError::VoteTransactionError)?;
-                    let pubkey = message
-                        .message
+                        .ok_or(DeserializedPacketError::VoteTransaction)?;
+                    let pubkey = vote
                         .static_account_keys()
                         .get(index as usize)
                         .copied()
-                        .ok_or(DeserializedPacketError::VoteTransactionError)?;
-                    let signed = message.message.is_signer(index as usize);
+                        .ok_or(DeserializedPacketError::VoteTransaction)?;
+                    let signed = index < vote.num_required_signatures();
 
-                    Ok::<(Pubkey, bool), DeserializedPacketError>((pubkey, signed))
+                    Ok((pubkey, signed))
                 };
 
                 let (vote_pubkey, _) = ix_key(0)?;
                 let (authorized_voter_pubkey, authorized_voter_signed) = ix_key(1)?;
                 if !authorized_voter_signed {
-                    return Err(DeserializedPacketError::VoteTransactionError);
+                    return Err(DeserializedPacketError::VoteTransaction);
                 }
 
                 let slot = vote_state_update_instruction.last_voted_slot().unwrap_or(0);
@@ -93,7 +92,7 @@ impl LatestValidatorVotePacket {
                     timestamp,
                 })
             }
-            _ => Err(DeserializedPacketError::VoteTransactionError),
+            _ => Err(DeserializedPacketError::VoteTransaction),
         }
     }
 
@@ -104,11 +103,16 @@ impl LatestValidatorVotePacket {
         deprecate_legacy_vote_ixs: bool,
     ) -> Result<Self, DeserializedPacketError> {
         if !packet.meta().is_simple_vote_tx() {
-            return Err(DeserializedPacketError::VoteTransactionError);
+            return Err(DeserializedPacketError::VoteTransaction);
         }
 
-        let vote = Arc::new(ImmutableDeserializedPacket::new(packet)?);
-        Self::new_from_immutable(vote, vote_source, deprecate_legacy_vote_ixs)
+        let vote = SanitizedTransactionView::try_new_sanitized(
+            std::sync::Arc::new(packet.data(..).unwrap().to_vec()),
+            false,
+        )
+        .unwrap();
+
+        Self::new_from_view(vote, vote_source, deprecate_legacy_vote_ixs)
     }
 
     pub fn vote_pubkey(&self) -> Pubkey {
@@ -139,9 +143,15 @@ impl LatestValidatorVotePacket {
         self.vote.is_none()
     }
 
-    pub fn take_vote(&mut self) -> Option<Arc<ImmutableDeserializedPacket>> {
+    pub fn take_vote(&mut self) -> Option<SanitizedTransactionView<SharedBytes>> {
         self.vote.take()
     }
+}
+
+#[derive(Debug, Error)]
+pub enum DeserializedPacketError {
+    #[error("vote transaction failure")]
+    VoteTransaction,
 }
 
 #[cfg(test)]
@@ -161,10 +171,10 @@ mod tests {
     fn deserialize_packets(
         packet_batch: &PacketBatch,
         vote_source: VoteSource,
-    ) -> impl Iterator<Item = LatestValidatorVotePacket> + '_ {
-        packet_batch.iter().filter_map(move |packet| {
-            LatestValidatorVotePacket::new(packet, vote_source, true).ok()
-        })
+    ) -> impl Iterator<Item = LatestValidatorVote> + '_ {
+        packet_batch
+            .iter()
+            .filter_map(move |packet| LatestValidatorVote::new(packet, vote_source, true).ok())
     }
 
     #[test]

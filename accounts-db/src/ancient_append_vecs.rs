@@ -1122,9 +1122,12 @@ pub mod tests {
                 ShrinkCollectRefs,
             },
             accounts_file::StorageAccess,
-            accounts_index::{AccountsIndexScanResult, ScanFilter, UpsertReclaim},
+            accounts_index::{
+                AccountsIndexScanResult, ReclaimsSlotList, RefCount, ScanFilter, UpsertReclaim,
+            },
             append_vec::{self, aligned_stored_size},
             storable_accounts::StorableAccountsBySlot,
+            utils::create_account_shared_data,
         },
         rand::seq::SliceRandom as _,
         solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
@@ -1211,11 +1214,14 @@ pub mod tests {
     fn test_write_packed_storages_too_few_slots() {
         let (db, storages, slots, _infos) = get_sample_storages(1, None);
         let accounts_to_combine = AccountsToCombine::default();
+        let offset = 0;
         let account = storages
             .first()
             .unwrap()
             .accounts
-            .get_stored_account_meta_callback(0, |account| AccountFromStorage::new(&account))
+            .get_stored_account_without_data_callback(offset, |account| {
+                AccountFromStorage::new(offset, &account)
+            })
             .unwrap();
         let accounts = [&account];
 
@@ -1280,7 +1286,7 @@ pub mod tests {
         // n slots
         // m accounts per slot
         // divide into different ideal sizes so that we combine multiple slots sometimes and combine partial slots
-        solana_logger::setup();
+        agave_logger::setup();
         let total_accounts_per_storage = 10;
         let account_size = 184;
         for num_slots in 0..4 {
@@ -1388,7 +1394,7 @@ pub mod tests {
         // each account has different size
         // divide into different ideal sizes so that we combine multiple slots sometimes and combine partial slots
         // compare at end that all accounts are in result exactly once
-        solana_logger::setup();
+        agave_logger::setup();
         let total_accounts_per_storage = 10;
         let account_size = 184;
         for num_slots in 0..4 {
@@ -1608,14 +1614,7 @@ pub mod tests {
                             let storage = db.storage.get_slot_storage_entry(slot);
                             if all_slots_shrunk {
                                 assert!(storage.is_some());
-                                // Here we use can_append() as a proxy to assert the backup storage of the accounts after shrinking.
-                                // When storage_access is set to `File`, after shrinking an ancient slot, the backup storage should be
-                                // open as File, which means can_append() will return false.
-                                // When storage_access is set to `Mmap`, backup storage is still Mmap, and can_append() will return true.
-                                assert_eq!(
-                                    storage.unwrap().accounts.can_append(),
-                                    storage_access == StorageAccess::Mmap
-                                );
+                                assert!(!storage.unwrap().has_accounts());
                             } else {
                                 assert!(storage.is_none());
                             }
@@ -1631,7 +1630,7 @@ pub mod tests {
         // n storages
         // 1 account each
         // all accounts have 1 ref or all accounts have 2 refs
-        solana_logger::setup();
+        agave_logger::setup();
 
         let data_size = 48;
         let alive_bytes_per_slot = aligned_stored_size(data_size as usize) as u64;
@@ -1795,10 +1794,10 @@ pub mod tests {
                                         );
                                         assert!(db.accounts_index.purge_exact(
                                             &pk,
-                                            &[storage.slot()]
+                                            [storage.slot()]
                                                 .into_iter()
                                                 .collect::<std::collections::HashSet<Slot>>(),
-                                            &mut Vec::default()
+                                            &mut ReclaimsSlotList::new()
                                         ));
                                     });
                                 }
@@ -2051,7 +2050,7 @@ pub mod tests {
             assert_eq!(
                 one_ref_accounts_account_shared_data
                     .iter()
-                    .map(|meta| meta.to_account_shared_data())
+                    .map(create_account_shared_data)
                     .collect::<Vec<_>>(),
                 vec![account_with_1_ref]
             );
@@ -2130,7 +2129,7 @@ pub mod tests {
                 .accounts
                 .get_stored_account_callback(0, |account| {
                     assert_eq!(account.pubkey(), pk_with_2_refs);
-                    account.to_account_shared_data()
+                    create_account_shared_data(&account)
                 })
                 .unwrap();
             assert_eq!(account, account_shared_data_with_2_refs);
@@ -2139,7 +2138,7 @@ pub mod tests {
 
     #[test]
     fn test_calc_accounts_to_combine_opposite() {
-        solana_logger::setup();
+        agave_logger::setup();
         // 1 storage
         // 2 accounts
         // 1 with 1 ref
@@ -2244,7 +2243,7 @@ pub mod tests {
             assert_eq!(
                 one_ref_accounts_account_shared_data
                     .iter()
-                    .map(|meta| meta.to_account_shared_data())
+                    .map(create_account_shared_data)
                     .collect::<Vec<_>>(),
                 vec![account_with_1_ref]
             );
@@ -2278,7 +2277,7 @@ pub mod tests {
             let accounts_shrunk_same_slot = storage
                 .accounts
                 .get_stored_account_callback(0, |account| {
-                    (*account.pubkey(), account.to_account_shared_data())
+                    (*account.pubkey(), create_account_shared_data(&account))
                 })
                 .unwrap();
             let mut reader = append_vec::new_scan_accounts_reader();
@@ -2874,7 +2873,7 @@ pub mod tests {
 
     #[test]
     fn test_truncate_to_max_storages() {
-        solana_logger::setup();
+        agave_logger::setup();
         for filter in [false, true] {
             let ideal_storage_size_large = get_ancient_append_vec_capacity();
             let mut infos = create_test_infos(1);
@@ -3149,8 +3148,8 @@ pub mod tests {
                                 let mut accounts = Vec::default();
                                 storage
                                     .accounts
-                                    .scan_accounts_stored_meta(|account| {
-                                        accounts.push(AccountFromStorage::new(&account));
+                                    .scan_accounts_without_data(|offset, account| {
+                                        accounts.push(AccountFromStorage::new(offset, &account));
                                     })
                                     .expect("must scan accounts storage");
                                 (storage.slot(), accounts)
@@ -3232,7 +3231,7 @@ pub mod tests {
                                 .new_storage()
                                 .accounts
                                 .scan_accounts(&mut reader, |_offset, meta| {
-                                    two.push((*meta.pubkey(), meta.to_account_shared_data()));
+                                    two.push((*meta.pubkey(), create_account_shared_data(&meta)));
                                 })
                                 .expect("must scan accounts storage");
 
@@ -3491,7 +3490,7 @@ pub mod tests {
         // NOTE: The recycler has been removed.  Creating this many extra storages is no longer
         // necessary, but also does no harm either.
         const MAX_RECYCLE_STORES: usize = 1000;
-        solana_logger::setup();
+        agave_logger::setup();
 
         // When we pack ancient append vecs, the packed append vecs are recycled first if possible. This means they aren't dropped directly.
         // This test tests that we are releasing Arc refcounts for storages when we pack them into ancient append vecs.
@@ -3582,11 +3581,12 @@ pub mod tests {
         let num_slots = 1;
         let data_size = None;
         let (_db, storages, _slots, _infos) = get_sample_storages(num_slots, data_size);
+        let offset = 0;
 
         storages[0]
             .accounts
-            .get_stored_account_meta_callback(0, |stored_account_meta| {
-                let account = AccountFromStorage::new(&stored_account_meta);
+            .get_stored_account_without_data_callback(offset, |stored_account| {
+                let account = AccountFromStorage::new(offset, &stored_account);
                 let slot = 1;
                 let capacity = 0;
                 for i in 0..4usize {
@@ -3746,8 +3746,8 @@ pub mod tests {
                 .map(|_| solana_pubkey::new_rand())
                 .collect::<Vec<_>>();
             // how many of `many_ref_accounts` should be found in the index with ref_count=1
-            let mut expected_ref_counts_before_unref = HashMap::<Pubkey, u64>::default();
-            let mut expected_ref_counts_after_unref = HashMap::<Pubkey, u64>::default();
+            let mut expected_ref_counts_before_unref = HashMap::<Pubkey, RefCount>::default();
+            let mut expected_ref_counts_after_unref = HashMap::<Pubkey, RefCount>::default();
 
             pubkeys_to_unref.iter().for_each(|k| {
                 for slot in 0..2 {
@@ -3759,7 +3759,7 @@ pub mod tests {
                         &empty_account,
                         &crate::accounts_index::AccountSecondaryIndexes::default(),
                         AccountInfo::default(),
-                        &mut Vec::default(),
+                        &mut ReclaimsSlotList::new(),
                         UpsertReclaim::IgnoreReclaims,
                     );
                 }
@@ -3788,7 +3788,7 @@ pub mod tests {
             // Assert ref_counts before unref.
             db.accounts_index.scan(
                 shrink_collect.pubkeys_to_unref.iter().cloned(),
-                |k, slot_refs, _entry| {
+                |k, slot_refs| {
                     assert_eq!(
                         expected_ref_counts_before_unref.remove(k).unwrap(),
                         slot_refs.unwrap().1
@@ -3796,7 +3796,6 @@ pub mod tests {
                     AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
                 },
                 None,
-                false,
                 ScanFilter::All,
             );
             assert!(expected_ref_counts_before_unref.is_empty());
@@ -3807,7 +3806,7 @@ pub mod tests {
             // Assert ref_counts after unref
             db.accounts_index.scan(
                 shrink_collect.pubkeys_to_unref.iter().cloned(),
-                |k, slot_refs, _entry| {
+                |k, slot_refs| {
                     assert_eq!(
                         expected_ref_counts_after_unref.remove(k).unwrap(),
                         slot_refs.unwrap().1
@@ -3815,7 +3814,6 @@ pub mod tests {
                     AccountsIndexScanResult::OnlyKeepInMemoryIfDirty
                 },
                 None,
-                false,
                 ScanFilter::All,
             );
             // should have removed all of them

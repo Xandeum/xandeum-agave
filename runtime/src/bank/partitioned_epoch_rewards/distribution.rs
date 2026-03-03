@@ -11,6 +11,7 @@ use {
         stake_account::StakeAccount,
     },
     log::error,
+    serde::{Deserialize, Serialize},
     solana_account::{state_traits::StateMut, AccountSharedData, ReadableAccount, WritableAccount},
     solana_accounts_db::stake_rewards::StakeReward,
     solana_measure::measure_us,
@@ -316,6 +317,7 @@ mod tests {
                 tests::create_genesis_config,
             },
             inflation_rewards::points::PointValue,
+            stake_utils,
         },
         rand::Rng,
         solana_account::from_account,
@@ -329,7 +331,6 @@ mod tests {
             stake_flags::StakeFlags,
             state::{Meta, Stake},
         },
-        solana_stake_program::stake_state,
         solana_sysvar as sysvar,
         solana_vote_program::vote_state,
         std::sync::Arc,
@@ -404,14 +405,20 @@ mod tests {
         let validator_pubkey = Pubkey::new_unique();
         let validator_vote_pubkey = Pubkey::new_unique();
 
-        let validator_vote_account =
-            vote_state::create_account(&validator_vote_pubkey, &validator_pubkey, 10, 20);
+        let validator_vote_account = vote_state::create_v4_account_with_authorized(
+            &validator_pubkey,
+            &validator_vote_pubkey,
+            &validator_vote_pubkey,
+            None,
+            1000,
+            20,
+        );
 
         for stake_reward in rewards.iter() {
             // store account in Bank, since distribution now checks for account existence
             let lamports = stake_reward.stake_account.lamports()
                 - stake_reward.stake_reward_info.lamports as u64;
-            let validator_stake_account = stake_state::create_account(
+            let validator_stake_account = stake_utils::create_stake_account(
                 &stake_reward.stake_pubkey,
                 &validator_vote_pubkey,
                 &validator_vote_account,
@@ -438,7 +445,7 @@ mod tests {
             0,
             42,
             num_partitions,
-            PointValue {
+            &PointValue {
                 rewards: total_rewards,
                 points: total_points,
             },

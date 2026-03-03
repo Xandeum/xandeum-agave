@@ -12,7 +12,7 @@ use {
     solana_cli_output::{parse_sign_only_reply_string, OutputFormat},
     solana_commitment_config::CommitmentConfig,
     solana_epoch_schedule::EpochSchedule,
-    solana_faucet::faucet::run_local_faucet,
+    solana_faucet::faucet::run_local_faucet_with_unique_port_for_tests,
     solana_fee_calculator::FeeRateGovernor,
     solana_fee_structure::FeeStructure,
     solana_keypair::{keypair_from_seed, Keypair},
@@ -39,7 +39,7 @@ fn test_stake_delegation_force() {
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
     let authorized_withdrawer = Keypair::new().pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let slots_per_epoch = 32;
     let test_validator = TestValidatorGenesis::default()
         .fee_rate_governor(FeeRateGovernor::new(0, 0))
@@ -200,11 +200,11 @@ fn test_stake_delegation_force() {
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
 fn test_seed_stake_delegation_and_deactivation(compute_unit_price: Option<u64>) {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator =
         TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
@@ -295,11 +295,11 @@ fn test_seed_stake_delegation_and_deactivation(compute_unit_price: Option<u64>) 
 
 #[test]
 fn test_stake_delegation_and_withdraw_available() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator =
         TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
@@ -464,11 +464,11 @@ fn test_stake_delegation_and_withdraw_available() {
 
 #[test]
 fn test_stake_delegation_and_withdraw_all() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator =
         TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
@@ -629,11 +629,11 @@ fn test_stake_delegation_and_withdraw_all() {
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
 fn test_stake_delegation_and_deactivation(compute_unit_price: Option<u64>) {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator =
         TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
@@ -721,11 +721,11 @@ fn test_stake_delegation_and_deactivation(compute_unit_price: Option<u64>) {
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
 fn test_offline_stake_delegation_and_deactivation(compute_unit_price: Option<u64>) {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator =
         TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
@@ -881,11 +881,11 @@ fn test_offline_stake_delegation_and_deactivation(compute_unit_price: Option<u64
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
 fn test_nonced_stake_delegation_and_deactivation(compute_unit_price: Option<u64>) {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator =
         TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
@@ -1010,11 +1010,11 @@ fn test_nonced_stake_delegation_and_deactivation(compute_unit_price: Option<u64>
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
 fn test_stake_authorize(compute_unit_price: Option<u64>) {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator =
         TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
@@ -1338,13 +1338,13 @@ fn test_stake_authorize(compute_unit_price: Option<u64>) {
 
 #[test]
 fn test_stake_authorize_with_fee_payer() {
-    solana_logger::setup();
+    agave_logger::setup();
     let fee_one_sig = FeeStructure::default().get_max_fee(1, 0);
     let fee_two_sig = FeeStructure::default().get_max_fee(2, 0);
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator = TestValidator::with_custom_fees(
         mint_pubkey,
         fee_one_sig,
@@ -1520,11 +1520,11 @@ fn test_stake_authorize_with_fee_payer() {
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
 fn test_stake_split(compute_unit_price: Option<u64>) {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator = TestValidator::with_custom_fees(
         mint_pubkey,
         1,
@@ -1681,11 +1681,11 @@ fn test_stake_split(compute_unit_price: Option<u64>) {
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
 fn test_stake_set_lockup(compute_unit_price: Option<u64>) {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator = TestValidator::with_custom_fees(
         mint_pubkey,
         1,
@@ -1969,11 +1969,11 @@ fn test_stake_set_lockup(compute_unit_price: Option<u64>) {
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
 fn test_offline_nonced_create_stake_account_and_withdraw(compute_unit_price: Option<u64>) {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator =
         TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
@@ -2212,11 +2212,11 @@ fn test_offline_nonced_create_stake_account_and_withdraw(compute_unit_price: Opt
 
 #[test]
 fn test_stake_checked_instructions() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
     let test_validator =
         TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 

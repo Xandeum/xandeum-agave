@@ -172,7 +172,7 @@ impl<D: TransactionData> SVMMessage for ResolvedTransactionView<D> {
         usize::from(self.view.num_instructions())
     }
 
-    fn instructions_iter(&self) -> impl Iterator<Item = SVMInstruction> {
+    fn instructions_iter(&self) -> impl Iterator<Item = SVMInstruction<'_>> {
         self.view.instructions_iter()
     }
 
@@ -181,7 +181,7 @@ impl<D: TransactionData> SVMMessage for ResolvedTransactionView<D> {
     ) -> impl Iterator<
         Item = (
             &solana_pubkey::Pubkey,
-            solana_svm_transaction::instruction::SVMInstruction,
+            solana_svm_transaction::instruction::SVMInstruction<'_>,
         ),
     > + Clone {
         self.view.program_instructions_iter()
@@ -191,7 +191,7 @@ impl<D: TransactionData> SVMMessage for ResolvedTransactionView<D> {
         self.view.static_account_keys()
     }
 
-    fn account_keys(&self) -> AccountKeys {
+    fn account_keys(&self) -> AccountKeys<'_> {
         AccountKeys::new(
             self.view.static_account_keys(),
             self.resolved_addresses.as_ref(),
@@ -223,7 +223,9 @@ impl<D: TransactionData> SVMMessage for ResolvedTransactionView<D> {
         usize::from(self.view.num_address_table_lookups())
     }
 
-    fn message_address_table_lookups(&self) -> impl Iterator<Item = SVMMessageAddressTableLookup> {
+    fn message_address_table_lookups(
+        &self,
+    ) -> impl Iterator<Item = SVMMessageAddressTableLookup<'_>> {
         self.view.address_table_lookup_iter()
     }
 }
@@ -284,7 +286,7 @@ mod tests {
             }),
         };
         let bytes = bincode::serialize(&transaction).unwrap();
-        let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref()).unwrap();
+        let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
         let result = ResolvedTransactionView::try_new(view, None, &HashSet::default());
         assert!(matches!(
             result,
@@ -315,7 +317,7 @@ mod tests {
             }),
         };
         let bytes = bincode::serialize(&transaction).unwrap();
-        let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref()).unwrap();
+        let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
         let result =
             ResolvedTransactionView::try_new(view, Some(loaded_addresses), &HashSet::default());
         assert!(matches!(
@@ -352,7 +354,7 @@ mod tests {
             }),
         };
         let bytes = bincode::serialize(&transaction).unwrap();
-        let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref()).unwrap();
+        let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
         let result =
             ResolvedTransactionView::try_new(view, Some(loaded_addresses), &HashSet::default());
         assert!(matches!(
@@ -402,7 +404,7 @@ mod tests {
             };
             let transaction = create_transaction_with_keys(static_keys, &loaded_addresses);
             let bytes = bincode::serialize(&transaction).unwrap();
-            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref()).unwrap();
+            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
             let resolved_view = ResolvedTransactionView::try_new(
                 view,
                 Some(loaded_addresses),
@@ -425,7 +427,7 @@ mod tests {
             };
             let transaction = create_transaction_with_keys(static_keys, &loaded_addresses);
             let bytes = bincode::serialize(&transaction).unwrap();
-            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref()).unwrap();
+            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
             let resolved_view = ResolvedTransactionView::try_new(
                 view,
                 Some(loaded_addresses),
@@ -448,7 +450,7 @@ mod tests {
             };
             let transaction = create_transaction_with_keys(static_keys, &loaded_addresses);
             let bytes = bincode::serialize(&transaction).unwrap();
-            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref()).unwrap();
+            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
             let resolved_view = ResolvedTransactionView::try_new(
                 view,
                 Some(loaded_addresses),
@@ -509,7 +511,7 @@ mod tests {
             let static_keys = vec![key0, key1, key2];
             let transaction = create_transaction_with_static_keys(static_keys, &loaded_addresses);
             let bytes = bincode::serialize(&transaction).unwrap();
-            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref()).unwrap();
+            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
             let resolved_view = ResolvedTransactionView::try_new(
                 view,
                 Some(loaded_addresses.clone()),
@@ -528,7 +530,7 @@ mod tests {
             let static_keys = vec![key0, key1, bpf_loader_upgradeable::ID];
             let transaction = create_transaction_with_static_keys(static_keys, &loaded_addresses);
             let bytes = bincode::serialize(&transaction).unwrap();
-            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref()).unwrap();
+            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
             let resolved_view = ResolvedTransactionView::try_new(
                 view,
                 Some(loaded_addresses.clone()),
@@ -551,7 +553,7 @@ mod tests {
             };
             let transaction = create_transaction_with_static_keys(static_keys, &loaded_addresses);
             let bytes = bincode::serialize(&transaction).unwrap();
-            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref()).unwrap();
+            let view = SanitizedTransactionView::try_new_sanitized(bytes.as_ref(), true).unwrap();
 
             let resolved_view = ResolvedTransactionView::try_new(
                 view,

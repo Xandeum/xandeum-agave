@@ -14,13 +14,17 @@ use {
     },
     agave_feature_set::{self as feature_set, FeatureSet},
     agave_reserved_account_keys::ReservedAccountKeys,
+    agave_snapshots::{
+        snapshot_archive_info::SnapshotArchiveInfoGetter as _, ArchiveFormat, SnapshotVersion,
+        DEFAULT_ARCHIVE_COMPRESSION, SUPPORTED_ARCHIVE_COMPRESSION,
+    },
     clap::{
         crate_description, crate_name, value_t, value_t_or_exit, values_t_or_exit, App,
         AppSettings, Arg, ArgMatches, SubCommand,
     },
     dashmap::DashMap,
     log::*,
-    serde_derive::Serialize,
+    serde::Serialize,
     solana_account::{state_traits::StateMut, AccountSharedData, ReadableAccount, WritableAccount},
     solana_accounts_db::accounts_index::{ScanConfig, ScanOrder},
     solana_clap_utils::{
@@ -35,10 +39,12 @@ use {
     solana_cluster_type::ClusterType,
     solana_core::{
         banking_simulation::{BankingSimulator, BankingTraceEvents},
+        resource_limits::adjust_nofile_limit,
         system_monitor_service::{SystemMonitorService, SystemMonitorStatsReportConfig},
         validator::{BlockProductionMethod, BlockVerificationMethod, TransactionStructure},
     },
     solana_cost_model::{cost_model::CostModel, cost_tracker::CostTracker},
+    solana_entry::entry::create_ticks,
     solana_feature_gate_interface::{self as feature, Feature},
     solana_inflation::Inflation,
     solana_instruction::TRANSACTION_LEVEL_STACK_HEIGHT,
@@ -61,18 +67,14 @@ use {
         },
         bank_forks::BankForks,
         inflation_rewards::points::{InflationPointCalculationEvent, PointValue},
-        snapshot_archive_info::SnapshotArchiveInfoGetter,
+        installed_scheduler_pool::BankWithScheduler,
         snapshot_bank_utils,
         snapshot_minimizer::SnapshotMinimizer,
-        snapshot_utils::{
-            ArchiveFormat, SnapshotVersion, DEFAULT_ARCHIVE_COMPRESSION,
-            SUPPORTED_ARCHIVE_COMPRESSION,
-        },
+        stake_utils,
     },
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_shred_version::compute_shred_version,
     solana_stake_interface::{self as stake, state::StakeStateV2},
-    solana_stake_program::stake_state,
     solana_system_interface::program as system_program,
     solana_transaction::sanitized::MessageHash,
     solana_transaction_status::parse_ui_instruction,
@@ -80,7 +82,7 @@ use {
     solana_vote::vote_state_view::VoteStateView,
     solana_vote_program::{
         self,
-        vote_state::{self, VoteStateV3},
+        vote_state::{self, VoteStateV4},
     },
     std::{
         collections::{HashMap, HashSet},
@@ -470,6 +472,7 @@ fn compute_slot_cost(
                     None,
                     SimpleAddressLoader::Disabled,
                     &reserved_account_keys.active,
+                    feature_set.is_active(&agave_feature_set::static_instruction_limit::id()),
                 )
                 .map_err(|err| {
                     warn!("Failed to compute cost of transaction: {err:?}");
@@ -856,7 +859,7 @@ fn main() {
         unsafe { signal_hook::low_level::register(signal_hook::consts::SIGUSR1, || {}) }.unwrap();
     }
 
-    solana_logger::setup_with_default_filter();
+    agave_logger::setup_with_default_filter();
 
     let load_genesis_config_arg = load_genesis_arg();
     let accounts_db_config_args = accounts_db_args();
@@ -942,7 +945,7 @@ fn main() {
 
     let rent = Rent::default();
     let default_bootstrap_validator_lamports = &(500 * LAMPORTS_PER_SOL)
-        .max(VoteStateV3::get_rent_exempt_reserve(&rent))
+        .max(rent.minimum_balance(VoteStateV4::size_of()))
         .to_string();
     let default_bootstrap_validator_stake_lamports = &(LAMPORTS_PER_SOL / 2)
         .max(rent.minimum_balance(StakeStateV2::size_of()))
@@ -999,9 +1002,9 @@ fn main() {
                 .takes_value(false)
                 .global(true)
                 .help(
-                    "Allow opening the blockstore to succeed even if the desired open file \
-                     descriptor limit cannot be configured. Use with caution as some commands may \
-                     run fine with a reduced file descriptor limit while others will not",
+                    "Allow the command to continue even if the desired open file descriptor limit \
+                     cannot be configured. Use with caution as some commands may run fine with a \
+                     a reduced file descriptor limit while others may fail in nonobvious ways",
                 ),
         )
         .arg(
@@ -1513,6 +1516,14 @@ fn main() {
                         .long("enable-capitalization-change")
                         .takes_value(false)
                         .help("If snapshot creation should succeed with a capitalization delta."),
+                )
+                .arg(
+                    Arg::with_name("fix_testnet_ed25519_precompile_account")
+                        .long("fix-testnet-ed25519-precompile-account")
+                        .help(
+                            "correct misassigned owner and data on testnet ed25519 precompile \
+                             account deployment",
+                        ),
                 ),
         )
         .subcommand(
@@ -1691,6 +1702,12 @@ fn main() {
     let ledger_path = PathBuf::from(value_t_or_exit!(matches, "ledger_path", String));
     let verbose_level = matches.occurrences_of("verbose");
 
+    let enforce_nofile_limit = !matches.is_present("ignore_ulimit_nofile_error");
+    adjust_nofile_limit(enforce_nofile_limit).unwrap_or_else(|err| {
+        eprintln!("Error: {err:?}");
+        exit(1);
+    });
+
     // Name the rayon global thread pool
     rayon::ThreadPoolBuilder::new()
         .thread_name(|i| format!("solRayonGlob{i:02}"))
@@ -1777,7 +1794,7 @@ fn main() {
                     create_new_ledger(
                         &output_directory,
                         &genesis_config,
-                        solana_accounts_db::hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+                        solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
                         LedgerColumnOptions::default(),
                     )
                     .unwrap_or_else(|err| {
@@ -2063,6 +2080,9 @@ fn main() {
                         archive_format
                     };
 
+                    let fix_testnet_ed25519_precompile_account =
+                        arg_matches.is_present("fix_testnet_ed25519_precompile_account");
+
                     let genesis_config = open_genesis_config_by(&ledger_path, arg_matches);
                     let mut process_options = parse_process_options(&ledger_path, arg_matches);
 
@@ -2150,23 +2170,20 @@ fn main() {
                             exit(1);
                         });
 
+                    // If we are creating an incremental snapshot, it must be based on a full snapshot
+                    if is_incremental {
+                        assert!(bank
+                            .accounts()
+                            .accounts_db
+                            .latest_full_snapshot_slot()
+                            .is_some());
+                    }
+
                     // Snapshot creation will implicitly perform AccountsDb
                     // flush and clean operations. These operations cannot be
                     // run concurrently, so ensure ABS is stopped to avoid that
                     // possibility.
                     accounts_background_service.join().unwrap();
-
-                    // Similar to waiting for ABS to stop, we also wait for the initial startup
-                    // verification to complete. The startup verification runs in the background
-                    // and verifies the snapshot's accounts hashes are correct. We only want a
-                    // single accounts hash calculation to run at a time, and since snapshot
-                    // creation below will calculate the accounts hash, we wait for the startup
-                    // verification to complete before proceeding.
-                    bank.rc
-                        .accounts
-                        .accounts_db
-                        .verify_accounts_hash_in_bg
-                        .join_background_thread();
 
                     let child_bank_required = rent_burn_percentage.is_ok()
                         || hashes_per_tick.is_some()
@@ -2175,7 +2192,8 @@ fn main() {
                         || !feature_gates_to_deactivate.is_empty()
                         || !vote_accounts_to_destake.is_empty()
                         || faucet_pubkey.is_some()
-                        || bootstrap_validator_pubkeys.is_some();
+                        || bootstrap_validator_pubkeys.is_some()
+                        || fix_testnet_ed25519_precompile_account;
 
                     if child_bank_required {
                         let mut child_bank = Bank::new_from_parent(
@@ -2287,6 +2305,48 @@ fn main() {
                         }
                     }
 
+                    if fix_testnet_ed25519_precompile_account {
+                        use solana_sdk_ids::{ed25519_program, native_loader, system_program};
+
+                        if bank.cluster_type() != ClusterType::Testnet {
+                            eprintln!(
+                                "--fix-testnet-ed25519-precompile-account is incompatible with \
+                                 the supplied base snapshot"
+                            );
+                            std::process::exit(1);
+                        }
+
+                        let mut ed25519_program_account =
+                            bank.get_account(&ed25519_program::id()).unwrap_or_else(|| {
+                                eprintln!("Error: `{}` is not deployed", ed25519_program::id());
+                                exit(1);
+                            });
+
+                        if ed25519_program_account.owner() != &system_program::id() {
+                            eprintln!(
+                                "Error: expected `{}` to be owned by `{}`, found `{}`",
+                                ed25519_program::id(),
+                                system_program::id(),
+                                ed25519_program_account.owner(),
+                            );
+                            exit(1);
+                        }
+
+                        if !ed25519_program_account.data().is_empty() {
+                            eprintln!(
+                                "Error: expected `{}` account data to be empty, found {} bytes",
+                                ed25519_program::id(),
+                                ed25519_program_account.data().len(),
+                            );
+                            exit(1);
+                        }
+
+                        ed25519_program_account.set_owner(native_loader::id());
+                        ed25519_program_account.set_data_from_slice(b"ed25519_program");
+
+                        bank.store_account(&ed25519_program::id(), &ed25519_program_account);
+                    }
+
                     if let Some(bootstrap_validator_pubkeys) = bootstrap_validator_pubkeys {
                         assert_eq!(bootstrap_validator_pubkeys.len() % 3, 0);
 
@@ -2337,17 +2397,18 @@ fn main() {
                                 ),
                             );
 
-                            let vote_account = vote_state::create_account_with_authorized(
+                            let vote_account = vote_state::create_v4_account_with_authorized(
                                 identity_pubkey,
                                 identity_pubkey,
                                 identity_pubkey,
-                                100,
-                                VoteStateV3::get_rent_exempt_reserve(&rent).max(1),
+                                None,
+                                10000,
+                                rent.minimum_balance(VoteStateV4::size_of()).max(1),
                             );
 
                             bank.store_account(
                                 stake_pubkey,
-                                &stake_state::create_account(
+                                &stake_utils::create_stake_account(
                                     bootstrap_stake_authorized_pubkey
                                         .as_ref()
                                         .unwrap_or(identity_pubkey),
@@ -2381,7 +2442,16 @@ fn main() {
                     }
 
                     if child_bank_required {
-                        bank.fill_bank_with_ticks_for_tests();
+                        let num_ticks_per_slot = bank.ticks_per_slot();
+                        let num_hashes_per_tick = bank.hashes_per_tick().unwrap_or(0);
+                        let parent_blockhash = bank.last_blockhash();
+                        let tick_entries =
+                            create_ticks(num_ticks_per_slot, num_hashes_per_tick, parent_blockhash);
+
+                        let scheduler = BankWithScheduler::no_scheduler_available();
+                        tick_entries.iter().for_each(|tick_entry| {
+                            bank.register_tick(&tick_entry.hash, &scheduler);
+                        });
                     }
 
                     let pre_capitalization = bank.capitalization();
@@ -2586,20 +2656,14 @@ fn main() {
                         "block_production_method",
                         BlockProductionMethod
                     );
-                    let transaction_struct =
-                        value_t_or_exit!(arg_matches, "transaction_struct", TransactionStructure);
 
-                    info!(
-                        "Using: block-production-method: {block_production_method} \
-                         transaction-structure: {transaction_struct}"
-                    );
+                    info!("Using: block-production-method: {block_production_method}");
 
                     match simulator.start(
                         genesis_config,
                         bank_forks,
                         blockstore,
                         block_production_method,
-                        transaction_struct,
                     ) {
                         Ok(()) => println!("Ok"),
                         Err(error) => {

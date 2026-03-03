@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 use {
     solana_account::AccountSharedData, solana_clock::Slot,
     solana_precompile_error::PrecompileError, solana_pubkey::Pubkey,
@@ -34,8 +43,6 @@ pub trait InvokeContextCallback {
 /// Runtime callbacks for transaction processing.
 pub trait TransactionProcessingCallback: InvokeContextCallback {
     fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)>;
-
-    fn add_builtin_account(&self, _name: &str, _program_id: &Pubkey) {}
 
     fn inspect_account(&self, _address: &Pubkey, _account_state: AccountState, _is_writable: bool) {
     }

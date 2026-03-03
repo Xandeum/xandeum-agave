@@ -1,10 +1,10 @@
 use {
+    agave_logger::redirect_stderr_to_file,
     clap::{crate_name, Parser},
     crossbeam_channel::bounded,
     log::*,
     solana_core::banking_trace::BankingTracer,
     solana_keypair::read_keypair_file,
-    solana_logger::redirect_stderr_to_file,
     solana_net_utils::sockets::{bind_in_range_with_config, SocketConfiguration as SocketConfig},
     solana_quic_definitions::QUIC_PORT_OFFSET,
     solana_signer::Signer,
@@ -23,15 +23,16 @@ use {
         collections::HashMap,
         env,
         net::{IpAddr, SocketAddr},
+        path::PathBuf,
         sync::{atomic::AtomicBool, Arc, RwLock},
-        time::Duration,
     },
+    tokio_util::sync::CancellationToken,
 };
 
 const DEFAULT_CHANNEL_SIZE: usize = 100_000;
 
 pub fn main() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let args = Cli::parse();
     let solana_version = solana_version::version!();
@@ -54,7 +55,7 @@ pub fn main() {
             None
         } else {
             println!("log file: {logfile}");
-            Some(logfile)
+            Some(PathBuf::from(logfile))
         }
     };
     let _logger_thread = redirect_stderr_to_file(logfile);
@@ -76,13 +77,13 @@ pub fn main() {
 
     let max_connections_per_ipaddr_per_min = args.max_connections_per_ipaddr_per_minute;
     let num_quic_endpoints = args.num_quic_endpoints;
-    let tpu_coalesce = Duration::from_millis(args.tpu_coalesce_ms);
     let dynamic_port_range = args.dynamic_port_range;
 
     let tpu_address = args.tpu_address;
     let tpu_forward_address = args.tpu_forward_address;
     let max_streams_per_ms = args.max_streams_per_ms;
     let exit = Arc::new(AtomicBool::new(false));
+    let cancel = CancellationToken::new();
     // To be linked with the Tpu sigverify and forwarder service
     let (tpu_sender, tpu_receiver) = bounded(DEFAULT_CHANNEL_SIZE);
     let (tpu_fwd_sender, _tpu_fwd_receiver) = bounded(DEFAULT_CHANNEL_SIZE);
@@ -200,9 +201,8 @@ pub fn main() {
         max_fwd_unstaked_connections,
         max_streams_per_ms,
         max_connections_per_ipaddr_per_min,
-        tpu_coalesce,
         &identity_keypair,
-        exit,
+        cancel.clone(),
     );
     vortexor.join().unwrap();
     sigverify_stage.join().unwrap();

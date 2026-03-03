@@ -1,6 +1,7 @@
 use {
     crate::crds_data::sanitize_wallclock,
     itertools::Itertools,
+    serde::{Deserialize, Serialize},
     solana_clock::Slot,
     solana_ledger::{
         blockstore::BlockstoreError,
@@ -457,7 +458,7 @@ pub(crate) mod tests {
             &entries,
             is_last_in_slot,
             // chained_merkle_root
-            Some(Hash::new_from_array(rng.gen())),
+            Hash::new_from_array(rng.gen()),
             next_shred_index,
             next_code_index, // next_code_index
             &ReedSolomonCache::default(),
@@ -603,7 +604,7 @@ pub(crate) mod tests {
                 None
             }
         };
-        let test_cases = vec![
+        let test_cases = [
             (
                 new_rand_data_shred(&mut rng, next_shred_index, &shredder, &leader, true),
                 new_rand_data_shred(
@@ -1117,8 +1118,7 @@ pub(crate) mod tests {
         let coding_shred_different_retransmitter =
             Shred::new_from_serialized_shred(coding_shred_different_retransmitter_payload).unwrap();
 
-        let test_cases = vec![
-            // Same data shred from different retransmitter
+        let test_cases = [
             (data_shred, data_shred_different_retransmitter),
             // Same coding shred from different retransmitter
             (coding_shred, coding_shred_different_retransmitter),

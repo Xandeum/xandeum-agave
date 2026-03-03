@@ -293,7 +293,9 @@ impl SigVerifyStage {
         verifier: &mut T,
         stats: &mut SigVerifierStats,
     ) -> Result<(), T::SendType> {
-        let (mut batches, num_packets, recv_duration) = streamer::recv_packet_batches(recvr)?;
+        const SOFT_RECEIVE_CAP: usize = 5_000;
+        let (mut batches, num_packets, recv_duration) =
+            streamer::recv_packet_batches(recvr, SOFT_RECEIVE_CAP)?;
 
         let batches_len = batches.len();
         debug!(
@@ -455,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_packet_discard() {
-        solana_logger::setup();
+        agave_logger::setup();
         let batch_size = 10;
         let mut batch = PinnedPacketBatch::with_capacity(batch_size);
         let packet = Packet::default();
@@ -498,7 +500,7 @@ mod tests {
     }
 
     fn test_sigverify_stage(use_same_tx: bool) {
-        solana_logger::setup();
+        agave_logger::setup();
         trace!("start");
         let (packet_s, packet_r) = unbounded();
         let (verified_s, verified_r) = BankingTracer::channel_for_test();

@@ -58,6 +58,13 @@ pub struct ShredFetchStats {
     pub(super) bad_shred_type: usize,
     pub(super) shred_version_mismatch: usize,
     pub(super) bad_parent_offset: usize,
+    pub(super) fec_set_index_bad_deserialize: usize,
+    pub(super) misaligned_fec_set: usize,
+    pub(super) erasure_config_bad_deserialize: usize,
+    pub(super) misaligned_erasure_config: usize,
+    pub(super) shred_flags_bad_deserialize: usize,
+    pub(super) misaligned_last_data_index: usize,
+    pub(super) unexpected_data_complete_shred: usize,
     since: Option<Instant>,
     pub overflow_shreds: usize,
 }
@@ -67,8 +74,6 @@ impl ProcessShredsStats {
         &mut self,
         name: &'static str,
         slot: Slot,
-        num_data_shreds: u32,
-        num_coding_shreds: u32,
         slot_broadcast_time: Option<Duration>,
     ) {
         let slot_broadcast_time = slot_broadcast_time
@@ -83,14 +88,8 @@ impl ProcessShredsStats {
             ("slot", slot, i64),
             ("shredding_time", self.shredding_elapsed, i64),
             ("receive_time", self.receive_elapsed, i64),
-            ("num_data_shreds", num_data_shreds, i64),
-            ("num_coding_shreds", num_coding_shreds, i64),
-            ("num_merkle_data_shreds", self.num_merkle_data_shreds, i64),
-            (
-                "num_merkle_coding_shreds",
-                self.num_merkle_coding_shreds,
-                i64
-            ),
+            ("num_data_shreds", self.num_merkle_data_shreds, i64),
+            ("num_coding_shreds", self.num_merkle_coding_shreds, i64),
             ("slot_broadcast_time", slot_broadcast_time, i64),
             (
                 "get_leader_schedule_time",
@@ -182,7 +181,38 @@ impl ShredFetchStats {
             ("bad_shred_type", self.bad_shred_type, i64),
             ("shred_version_mismatch", self.shred_version_mismatch, i64),
             ("bad_parent_offset", self.bad_parent_offset, i64),
+            (
+                "fec_set_index_bad_deserialize",
+                self.fec_set_index_bad_deserialize,
+                i64
+            ),
+            ("misaligned_fec_set_size", self.misaligned_fec_set, i64),
+            (
+                "erasure_config_bad_deserialize",
+                self.erasure_config_bad_deserialize,
+                i64
+            ),
+            (
+                "misaligned_erasure_config",
+                self.misaligned_erasure_config,
+                i64
+            ),
+            (
+                "shred_flags_bad_deserialize",
+                self.shred_flags_bad_deserialize,
+                i64
+            ),
+            (
+                "misaligned_last_data_index",
+                self.misaligned_last_data_index,
+                i64
+            ),
             ("overflow_shreds", self.overflow_shreds, i64),
+            (
+                "unexpected_data_complete_shred",
+                self.unexpected_data_complete_shred,
+                i64
+            )
         );
         *self = Self {
             since: Some(Instant::now()),

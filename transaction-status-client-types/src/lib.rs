@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 //! Core types for solana-transaction-status
 use {
     crate::option_serializer::OptionSerializer,
@@ -6,9 +15,8 @@ use {
     serde::{
         de::{self, Deserialize as DeserializeTrait, Error as DeserializeError},
         ser::{Serialize as SerializeTrait, SerializeTupleVariant},
-        Deserializer,
+        Deserialize, Deserializer, Serialize,
     },
-    serde_derive::{Deserialize, Serialize},
     serde_json::{from_value, Value},
     solana_account_decoder_client_types::token::UiTokenAmount,
     solana_commitment_config::CommitmentConfig,
@@ -64,17 +72,13 @@ impl fmt::Display for UiTransactionEncoding {
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum TransactionDetails {
+    #[default]
     Full,
     Signatures,
     None,
     Accounts,
-}
-
-impl Default for TransactionDetails {
-    fn default() -> Self {
-        Self::Full
-    }
 }
 
 #[derive(Error, Debug, PartialEq, Eq, Clone)]

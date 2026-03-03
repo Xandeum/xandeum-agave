@@ -1,5 +1,9 @@
 mod snapshot_gossip_manager;
 use {
+    agave_snapshots::{
+        paths as snapshot_paths, snapshot_config::SnapshotConfig,
+        snapshot_hash::StartingSnapshotHashes,
+    },
     snapshot_gossip_manager::SnapshotGossipManager,
     solana_accounts_db::accounts_db::AccountStorageEntry,
     solana_clock::Slot,
@@ -7,9 +11,8 @@ use {
     solana_measure::{meas_dur, measure::Measure, measure_us},
     solana_perf::thread::renice_this_thread,
     solana_runtime::{
-        accounts_background_service::PendingSnapshotPackages, snapshot_config::SnapshotConfig,
-        snapshot_controller::SnapshotController, snapshot_hash::StartingSnapshotHashes,
-        snapshot_package::SnapshotPackage, snapshot_utils,
+        accounts_background_service::PendingSnapshotPackages,
+        snapshot_controller::SnapshotController, snapshot_package::SnapshotPackage, snapshot_utils,
     },
     std::{
         sync::{
@@ -188,7 +191,7 @@ impl SnapshotPackagerService {
         }
         info!("Flushing account storages... Done in {:?}", start.elapsed());
 
-        let bank_snapshot_dir = snapshot_utils::get_bank_snapshot_dir(
+        let bank_snapshot_dir = snapshot_paths::get_bank_snapshot_dir(
             &snapshot_config.bank_snapshots_dir,
             state.snapshot_slot,
         );
@@ -202,8 +205,8 @@ impl SnapshotPackagerService {
         );
         if let Err(err) = result {
             warn!("Failed to hard link account storages: {err}");
-            // If hard linking the storages failed, we do *NOT* want to write
-            // the "storages flushed" file, so return early.
+            // If hard linking the storages failed, we do *NOT* want to mark the bank snapshot as
+            // loadable so return early.
             return;
         }
         info!(
@@ -211,9 +214,24 @@ impl SnapshotPackagerService {
             start.elapsed(),
         );
 
-        let result = snapshot_utils::write_storages_flushed_file(&bank_snapshot_dir);
+        info!("Saving obsolete accounts...");
+        let start = Instant::now();
+        let result = snapshot_utils::write_obsolete_accounts_to_snapshot(
+            &bank_snapshot_dir,
+            &state.snapshot_storages,
+            state.snapshot_slot,
+        );
         if let Err(err) = result {
-            warn!("Failed to mark snapshot storages 'flushed': {err}");
+            warn!("Failed to serialize obsolete accounts: {err}");
+            // If serializing the obsolete accounts failed, we do *NOT* want to mark the bank snapshot
+            // as loadable so return early.
+            return;
+        }
+        info!("Saving obsolete accounts... Done in {:?}", start.elapsed());
+
+        let result = snapshot_utils::mark_bank_snapshot_as_loadable(&bank_snapshot_dir);
+        if let Err(err) = result {
+            warn!("Failed to mark bank snapshot as loadable: {err}");
         }
     }
 }

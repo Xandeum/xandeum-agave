@@ -6,15 +6,20 @@ use {
         commands::{run::args::RunArgs, FromClapArgMatches},
         ledger_lockfile, lock_ledger,
     },
+    agave_logger::redirect_stderr_to_file,
+    agave_snapshots::{
+        paths::BANK_SNAPSHOTS_DIR,
+        snapshot_config::{SnapshotConfig, SnapshotUsage},
+        ArchiveFormat, SnapshotInterval, SnapshotVersion,
+    },
     clap::{crate_name, value_t, value_t_or_exit, values_t, values_t_or_exit, ArgMatches},
     crossbeam_channel::unbounded,
     log::*,
     rand::{seq::SliceRandom, thread_rng},
     solana_accounts_db::{
-        accounts_db::{AccountShrinkThreshold, AccountsDbConfig},
+        accounts_db::{AccountShrinkThreshold, AccountsDbConfig, MarkObsoleteAccounts},
         accounts_file::StorageAccess,
         accounts_index::{AccountSecondaryIndexes, AccountsIndexConfig, IndexLimitMb, ScanFilter},
-        hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
         utils::{
             create_all_accounts_run_and_snapshot_dirs, create_and_canonicalize_directories,
             create_and_canonicalize_directory,
@@ -25,17 +30,20 @@ use {
     },
     solana_clock::{Slot, DEFAULT_SLOTS_PER_EPOCH},
     solana_core::{
+        banking_stage::transaction_scheduler::scheduler_controller::SchedulerConfig,
         banking_trace::DISABLED_BAKING_TRACE_DIR,
         consensus::tower_storage,
         repair::repair_handler::RepairHandlerType,
         snapshot_packager_service::SnapshotPackagerService,
         system_monitor_service::SystemMonitorService,
+        tpu::MAX_VOTES_PER_SECOND,
         validator::{
             is_snapshot_config_valid, BlockProductionMethod, BlockVerificationMethod,
-            TransactionStructure, Validator, ValidatorConfig, ValidatorError,
-            ValidatorStartProgress, ValidatorTpuConfig,
+            SchedulerPacing, Validator, ValidatorConfig, ValidatorError, ValidatorStartProgress,
+            ValidatorTpuConfig,
         },
     },
+    solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
     solana_gossip::{
         cluster_info::{NodeConfig, DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS},
         contact_info::ContactInfo,
@@ -47,21 +55,16 @@ use {
         blockstore_cleanup_service::{DEFAULT_MAX_LEDGER_SHREDS, DEFAULT_MIN_MAX_LEDGER_SHREDS},
         use_snapshot_archives_at_startup::{self, UseSnapshotArchivesAtStartup},
     },
-    solana_logger::redirect_stderr_to_file,
     solana_net_utils::multihomed_sockets::BindIpAddrs,
     solana_perf::recycler::enable_recycler_warming,
     solana_poh::poh_service,
     solana_pubkey::Pubkey,
-    solana_runtime::{
-        runtime_config::RuntimeConfig,
-        snapshot_config::{SnapshotConfig, SnapshotUsage},
-        snapshot_utils::{
-            self, ArchiveFormat, SnapshotInterval, SnapshotVersion, BANK_SNAPSHOTS_DIR,
-        },
-    },
-    solana_send_transaction_service::send_transaction_service,
+    solana_runtime::{runtime_config::RuntimeConfig, snapshot_utils},
     solana_signer::Signer,
-    solana_streamer::quic::{QuicServerParams, DEFAULT_TPU_COALESCE},
+    solana_streamer::{
+        nonblocking::{simple_qos::SimpleQosConfig, swqos::SwQosConfig},
+        quic::{QuicStreamerConfig, SimpleQosQuicStreamerConfig, SwQosQuicStreamerConfig},
+    },
     solana_tpu_client::tpu_client::DEFAULT_TPU_ENABLE_UDP,
     solana_turbine::{
         broadcast_stage::BroadcastStageType,
@@ -77,7 +80,6 @@ use {
         process::exit,
         str::FromStr,
         sync::{atomic::AtomicBool, Arc, RwLock},
-        time::Duration,
     },
 };
 
@@ -87,12 +89,9 @@ pub enum Operation {
     Run,
 }
 
-const MILLIS_PER_SECOND: u64 = 1000;
-
 pub fn execute(
     matches: &ArgMatches,
     solana_version: &str,
-    ledger_path: &Path,
     operation: Operation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let run_args = RunArgs::from_clap_arg_match(matches)?;
@@ -100,7 +99,6 @@ pub fn execute(
     let cli::thread_args::NumThreadConfig {
         accounts_db_background_threads,
         accounts_db_foreground_threads,
-        accounts_db_hash_threads,
         accounts_index_flush_threads,
         block_production_num_workers,
         ip_echo_server_threads,
@@ -118,12 +116,9 @@ pub fn execute(
     let identity_keypair = Arc::new(run_args.identity_keypair);
 
     let logfile = run_args.logfile;
-    let logfile = if logfile == "-" {
-        None
-    } else {
-        println!("log file: {logfile}");
-        Some(logfile)
-    };
+    if let Some(logfile) = logfile.as_ref() {
+        println!("log file: {}", logfile.display());
+    }
     let use_progress_bar = logfile.is_none();
     let _logger_thread = redirect_stderr_to_file(logfile);
 
@@ -165,17 +160,8 @@ pub fn execute(
 
     let private_rpc = matches.is_present("private_rpc");
     let do_port_check = !matches.is_present("no_port_check");
-    let tpu_coalesce = value_t!(matches, "tpu_coalesce_ms", u64)
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_TPU_COALESCE);
 
-    // Canonicalize ledger path to avoid issues with symlink creation
-    let ledger_path = create_and_canonicalize_directory(ledger_path).map_err(|err| {
-        format!(
-            "unable to access ledger path '{}': {err}",
-            ledger_path.display(),
-        )
-    })?;
+    let ledger_path = run_args.ledger_path;
 
     let max_ledger_shreds = if matches.is_present("limit_ledger_size") {
         let limit_ledger_size = match matches.value_of("limit_ledger_size") {
@@ -231,6 +217,33 @@ pub fn execute(
             .collect::<Result<Vec<_>, _>>()?;
         BindIpAddrs::new(parsed).map_err(|err| format!("invalid bind_addresses: {err}"))?
     };
+
+    if bind_addresses.len() > 1 {
+        for (flag, msg) in [
+            (
+                "use_connection_cache",
+                "Connection cache can not be used in a multihoming context",
+            ),
+            (
+                "advertised_ip",
+                "--advertised-ip cannot be used in a multihoming context. In multihoming, the \
+                 validator will advertise the first --bind-address as this node's public IP \
+                 address.",
+            ),
+            (
+                "tpu_vortexor_receiver_address",
+                "--tpu-vortexor-receiver-address can not be used in a multihoming context",
+            ),
+            (
+                "public_tpu_addr",
+                "--public-tpu-address can not be used in a multihoming context",
+            ),
+        ] {
+            if matches.is_present(flag) {
+                Err(String::from(msg))?;
+            }
+        }
+    }
 
     let rpc_bind_address = if matches.is_present("rpc_bind_address") {
         solana_net_utils::parse_host(matches.value_of("rpc_bind_address").unwrap())
@@ -306,8 +319,13 @@ pub fn execute(
     if let Ok(bins) = value_t!(matches, "accounts_index_bins", usize) {
         accounts_index_config.bins = Some(bins);
     }
+    if let Ok(num_initial_accounts) =
+        value_t!(matches, "accounts_index_initial_accounts_count", usize)
+    {
+        accounts_index_config.num_initial_accounts = Some(num_initial_accounts);
+    }
 
-    accounts_index_config.index_limit_mb = if matches.is_present("disable_accounts_disk_index") {
+    accounts_index_config.index_limit_mb = if !matches.is_present("enable_accounts_disk_index") {
         IndexLimitMb::InMemOnly
     } else {
         IndexLimitMb::Minimal
@@ -408,7 +426,11 @@ pub fn execute(
         })
         .unwrap_or_default();
 
-    let mark_obsolete_accounts = matches.is_present("accounts_db_mark_obsolete_accounts");
+    let mark_obsolete_accounts = if matches.is_present("accounts_db_mark_obsolete_accounts") {
+        MarkObsoleteAccounts::Enabled
+    } else {
+        MarkObsoleteAccounts::Disabled
+    };
 
     let accounts_db_config = AccountsDbConfig {
         index: Some(accounts_index_config),
@@ -433,12 +455,10 @@ pub fn execute(
         scan_filter_for_shrinking,
         num_background_threads: Some(accounts_db_background_threads),
         num_foreground_threads: Some(accounts_db_foreground_threads),
-        num_hash_threads: Some(accounts_db_hash_threads),
         mark_obsolete_accounts,
+        memlock_budget_size: solana_accounts_db::accounts_db::DEFAULT_MEMLOCK_BUDGET_SIZE,
         ..AccountsDbConfig::default()
     };
-
-    let accounts_db_config = Some(accounts_db_config);
 
     let on_start_geyser_plugin_config_files = if matches.is_present("geyser_plugin_config") {
         Some(
@@ -452,48 +472,6 @@ pub fn execute(
     };
     let starting_with_geyser_plugins: bool = on_start_geyser_plugin_config_files.is_some()
         || matches.is_present("geyser_plugin_always_enabled");
-
-    let rpc_send_retry_rate_ms = value_t_or_exit!(matches, "rpc_send_transaction_retry_ms", u64);
-    let rpc_send_batch_size = value_t_or_exit!(matches, "rpc_send_transaction_batch_size", usize);
-    let rpc_send_batch_send_rate_ms =
-        value_t_or_exit!(matches, "rpc_send_transaction_batch_ms", u64);
-
-    if rpc_send_batch_send_rate_ms > rpc_send_retry_rate_ms {
-        Err(format!(
-            "the specified rpc-send-batch-ms ({rpc_send_batch_send_rate_ms}) is invalid, it must \
-             be <= rpc-send-retry-ms ({rpc_send_retry_rate_ms})"
-        ))?;
-    }
-
-    let tps = rpc_send_batch_size as u64 * MILLIS_PER_SECOND / rpc_send_batch_send_rate_ms;
-    if tps > send_transaction_service::MAX_TRANSACTION_SENDS_PER_SECOND {
-        Err(format!(
-            "either the specified rpc-send-batch-size ({}) or rpc-send-batch-ms ({}) is invalid, \
-             'rpc-send-batch-size * 1000 / rpc-send-batch-ms' must be smaller than ({}) .",
-            rpc_send_batch_size,
-            rpc_send_batch_send_rate_ms,
-            send_transaction_service::MAX_TRANSACTION_SENDS_PER_SECOND
-        ))?;
-    }
-    let rpc_send_transaction_tpu_peers = matches
-        .values_of("rpc_send_transaction_tpu_peer")
-        .map(|values| {
-            values
-                .map(solana_net_utils::parse_host_port)
-                .collect::<Result<Vec<SocketAddr>, String>>()
-        })
-        .transpose()
-        .map_err(|err| {
-            format!("failed to parse rpc send-transaction-service tpu peer address: {err}")
-        })?;
-    let rpc_send_transaction_also_leader = matches.is_present("rpc_send_transaction_also_leader");
-    let leader_forward_count =
-        if rpc_send_transaction_tpu_peers.is_some() && !rpc_send_transaction_also_leader {
-            // rpc-sts is configured to send only to specific tpu peers. disable leader forwards
-            0
-        } else {
-            value_t_or_exit!(matches, "rpc_send_transaction_leader_forward_count", u64)
-        };
 
     let xdp_interface = matches.value_of("retransmit_xdp_interface");
     let xdp_zero_copy = matches.is_present("retransmit_xdp_zero_copy");
@@ -547,18 +525,6 @@ pub fn execute(
         UseSnapshotArchivesAtStartup
     );
 
-    if mark_obsolete_accounts
-        && use_snapshot_archives_at_startup != UseSnapshotArchivesAtStartup::Always
-    {
-        Err(format!(
-            "The --accounts-db-mark-obsolete-accounts option requires \
-             the --use-snapshot-archives-at-startup option to be set to {}. \
-             Current value: {}",
-            UseSnapshotArchivesAtStartup::Always,
-            use_snapshot_archives_at_startup
-        ))?;
-    }
-
     let mut validator_config = ValidatorConfig {
         require_tower: matches.is_present("require_tower"),
         tower_storage,
@@ -601,34 +567,15 @@ pub fn execute(
         generator_config: None,
         contact_debug_interval,
         contact_save_interval: DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS,
-        send_transaction_service_config: send_transaction_service::Config {
-            retry_rate_ms: rpc_send_retry_rate_ms,
-            leader_forward_count,
-            default_max_retries: value_t!(
-                matches,
-                "rpc_send_transaction_default_max_retries",
-                usize
-            )
-            .ok(),
-            service_max_retries: value_t_or_exit!(
-                matches,
-                "rpc_send_transaction_service_max_retries",
-                usize
-            ),
-            batch_send_rate_ms: rpc_send_batch_send_rate_ms,
-            batch_size: rpc_send_batch_size,
-            retry_pool_max_size: value_t_or_exit!(
-                matches,
-                "rpc_send_transaction_retry_pool_max_size",
-                usize
-            ),
-            tpu_peers: rpc_send_transaction_tpu_peers,
-        },
+        send_transaction_service_config: run_args.send_transaction_service_config,
         no_poh_speed_test: matches.is_present("no_poh_speed_test"),
         no_os_memory_stats_reporting: matches.is_present("no_os_memory_stats_reporting"),
         no_os_network_stats_reporting: matches.is_present("no_os_network_stats_reporting"),
         no_os_cpu_stats_reporting: matches.is_present("no_os_cpu_stats_reporting"),
         no_os_disk_stats_reporting: matches.is_present("no_os_disk_stats_reporting"),
+        // The validator needs to open many files, check that the process has
+        // permission to do so in order to fail quickly and give a direct error
+        enforce_ulimit_nofile: true,
         poh_pinned_cpu_core: value_of(matches, "poh_pinned_cpu_core")
             .unwrap_or(poh_service::DEFAULT_PINNED_CPU_CORE),
         poh_hashes_per_batch: value_of(matches, "poh_hashes_per_batch")
@@ -640,7 +587,6 @@ pub fn execute(
         accounts_db_skip_shrink: true,
         accounts_db_force_initial_clean: matches.is_present("no_skip_initial_accounts_db_clean"),
         snapshot_config,
-        tpu_coalesce,
         no_wait_for_vote_to_start_leader: matches.is_present("no_wait_for_vote_to_start_leader"),
         wait_to_vote_slot: None,
         runtime_config: RuntimeConfig {
@@ -679,7 +625,13 @@ pub fn execute(
             BlockProductionMethod
         ),
         block_production_num_workers,
-        transaction_struct: value_t_or_exit!(matches, "transaction_struct", TransactionStructure),
+        block_production_scheduler_config: SchedulerConfig {
+            scheduler_pacing: value_t_or_exit!(
+                matches,
+                "block_production_pacing_fill_time_millis",
+                SchedulerPacing
+            ),
+        },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
         banking_trace_dir_byte_limit: parse_banking_trace_dir_byte_limit(matches),
         validator_exit: Arc::new(RwLock::new(Exit::default())),
@@ -796,8 +748,18 @@ pub fn execute(
         })
         .transpose()?;
 
+    let advertised_ip = matches
+        .value_of("advertised_ip")
+        .map(|advertised_ip| {
+            solana_net_utils::parse_host(advertised_ip)
+                .map_err(|err| format!("failed to parse --advertised-ip: {err}"))
+        })
+        .transpose()?;
+
     let advertised_ip = if let Some(ip) = gossip_host {
         ip
+    } else if let Some(cli_ip) = advertised_ip {
+        cli_ip
     } else if !bind_addresses.active().is_unspecified() && !bind_addresses.active().is_loopback() {
         bind_addresses.active()
     } else if !entrypoint_addrs.is_empty() {
@@ -882,7 +844,7 @@ pub fn execute(
         advertised_ip,
         gossip_port,
         port_range: dynamic_port_range,
-        bind_ip_addrs: Arc::new(bind_addresses),
+        bind_ip_addrs: bind_addresses,
         public_tpu_addr,
         public_tpu_forwards_addr,
         num_tvu_receive_sockets: tvu_receive_threads,
@@ -910,6 +872,7 @@ pub fn execute(
         node.info.remove_tpu_forwards();
         node.info.remove_tvu();
         node.info.remove_serve_repair();
+        node.info.remove_alpenglow();
 
         // A node in this configuration shouldn't be an entrypoint to other nodes
         node.sockets.ip_echo = None;
@@ -985,34 +948,42 @@ pub fn execute(
     // the one pushed by bootstrap.
     node.info.hot_swap_pubkey(identity_keypair.pubkey());
 
-    let tpu_quic_server_config = QuicServerParams {
-        max_connections_per_peer: tpu_max_connections_per_peer.try_into().unwrap(),
-        max_staked_connections: tpu_max_staked_connections.try_into().unwrap(),
-        max_unstaked_connections: tpu_max_unstaked_connections.try_into().unwrap(),
-        max_streams_per_ms,
-        max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
-        coalesce: tpu_coalesce,
-        num_threads: tpu_transaction_receive_threads,
-        ..Default::default()
+    let tpu_quic_server_config = SwQosQuicStreamerConfig {
+        quic_streamer_config: QuicStreamerConfig {
+            max_connections_per_peer: tpu_max_connections_per_peer.try_into().unwrap(),
+            max_staked_connections: tpu_max_staked_connections.try_into().unwrap(),
+            max_unstaked_connections: tpu_max_unstaked_connections.try_into().unwrap(),
+            max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
+            num_threads: tpu_transaction_receive_threads,
+            ..Default::default()
+        },
+        qos_config: SwQosConfig { max_streams_per_ms },
     };
 
-    let tpu_fwd_quic_server_config = QuicServerParams {
-        max_connections_per_peer: tpu_max_connections_per_peer.try_into().unwrap(),
-        max_staked_connections: tpu_max_fwd_staked_connections.try_into().unwrap(),
-        max_unstaked_connections: tpu_max_fwd_unstaked_connections.try_into().unwrap(),
-        max_streams_per_ms,
-        max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
-        coalesce: tpu_coalesce,
-        num_threads: tpu_transaction_forward_receive_threads,
-        ..Default::default()
+    let tpu_fwd_quic_server_config = SwQosQuicStreamerConfig {
+        quic_streamer_config: QuicStreamerConfig {
+            max_connections_per_peer: tpu_max_connections_per_peer.try_into().unwrap(),
+            max_staked_connections: tpu_max_fwd_staked_connections.try_into().unwrap(),
+            max_unstaked_connections: tpu_max_fwd_unstaked_connections.try_into().unwrap(),
+            max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
+            num_threads: tpu_transaction_forward_receive_threads,
+            ..Default::default()
+        },
+        qos_config: SwQosConfig { max_streams_per_ms },
     };
 
-    // Vote shares TPU forward's characteristics, except that we accept 1 connection
-    // per peer and no unstaked connections are accepted.
-    let mut vote_quic_server_config = tpu_fwd_quic_server_config.clone();
-    vote_quic_server_config.max_connections_per_peer = 1;
-    vote_quic_server_config.max_unstaked_connections = 0;
-    vote_quic_server_config.num_threads = tpu_vote_transaction_receive_threads;
+    let vote_quic_server_config = SimpleQosQuicStreamerConfig {
+        quic_streamer_config: QuicStreamerConfig {
+            max_connections_per_peer: 1,
+            max_staked_connections: tpu_max_fwd_staked_connections.try_into().unwrap(),
+            max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
+            num_threads: tpu_vote_transaction_receive_threads,
+            ..Default::default()
+        },
+        qos_config: SimpleQosConfig {
+            max_streams_per_second: MAX_VOTES_PER_SECOND,
+        },
+    };
 
     let validator = match Validator::new(
         node,
@@ -1196,11 +1167,10 @@ fn new_snapshot_config(
         }
     }
 
-    let snapshots_dir = if let Some(snapshots) = matches.value_of("snapshots") {
-        Path::new(snapshots)
-    } else {
-        ledger_path
-    };
+    let snapshots_dir = matches
+        .value_of("snapshots")
+        .map(Path::new)
+        .unwrap_or(ledger_path);
     let snapshots_dir = create_and_canonicalize_directory(snapshots_dir).map_err(|err| {
         format!(
             "failed to create snapshots directory '{}': {err}",
@@ -1226,12 +1196,10 @@ fn new_snapshot_config(
         )
     })?;
 
-    let full_snapshot_archives_dir =
-        if let Some(full_snapshot_archive_path) = matches.value_of("full_snapshot_archive_path") {
-            PathBuf::from(full_snapshot_archive_path)
-        } else {
-            snapshots_dir.clone()
-        };
+    let full_snapshot_archives_dir = matches
+        .value_of("full_snapshot_archive_path")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| snapshots_dir.clone());
     fs::create_dir_all(&full_snapshot_archives_dir).map_err(|err| {
         format!(
             "failed to create full snapshot archives directory '{}': {err}",
@@ -1239,13 +1207,10 @@ fn new_snapshot_config(
         )
     })?;
 
-    let incremental_snapshot_archives_dir = if let Some(incremental_snapshot_archive_path) =
-        matches.value_of("incremental_snapshot_archive_path")
-    {
-        PathBuf::from(incremental_snapshot_archive_path)
-    } else {
-        snapshots_dir.clone()
-    };
+    let incremental_snapshot_archives_dir = matches
+        .value_of("incremental_snapshot_archive_path")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| snapshots_dir.clone());
     fs::create_dir_all(&incremental_snapshot_archives_dir).map_err(|err| {
         format!(
             "failed to create incremental snapshot archives directory '{}': {err}",

@@ -15,6 +15,7 @@ use {
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         parsed_token_accounts::*, rpc_cache::LargestAccountsCache, rpc_health::*,
     },
+    agave_snapshots::{paths as snapshot_paths, snapshot_config::SnapshotConfig},
     base64::{prelude::BASE64_STANDARD, Engine},
     bincode::{config::Options, serialize},
     common::consts::XAND_SHIELD_PROGRAM_ID,
@@ -78,20 +79,18 @@ use {
         commitment::{BlockCommitmentArray, BlockCommitmentCache},
         non_circulating_supply::{calculate_non_circulating_supply, NonCirculatingSupply},
         prioritization_fee_cache::PrioritizationFeeCache,
-        snapshot_config::SnapshotConfig,
-        snapshot_utils,
+        stake_utils,
     },
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_send_transaction_service::send_transaction_service::TransactionInfo,
     solana_signature::Signature,
     solana_signer::Signer,
-    solana_stake_program,
     solana_storage_bigtable::Error as StorageError,
     solana_transaction::{
         sanitized::{MessageHash, SanitizedTransaction, MAX_TX_ACCOUNT_LOCKS},
         versioned::VersionedTransaction,
     },
-    solana_transaction_context::TransactionAccount,
+    solana_transaction_context::transaction_accounts::KeyedAccountSharedData,
     solana_transaction_error::TransactionError,
     solana_transaction_status::{
         map_inner_instructions, BlockEncodingOptions, ConfirmedBlock,
@@ -386,7 +385,7 @@ impl JsonRpcRequestProcessor {
         program_id: &Pubkey,
         filters: Vec<RpcFilterType>,
         sort_results: bool,
-    ) -> ScanResult<Vec<TransactionAccount>> {
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let scan_order = if sort_results {
             ScanOrder::Sorted
         } else {
@@ -580,7 +579,6 @@ impl JsonRpcRequestProcessor {
         );
 
         let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-        let startup_verification_complete = Arc::clone(bank.get_startup_verification_complete());
         let slot = bank.slot();
         let optimistically_confirmed_bank =
             Arc::new(RwLock::new(OptimisticallyConfirmedBank { bank }));
@@ -600,7 +598,6 @@ impl JsonRpcRequestProcessor {
                 blockstore,
                 0,
                 exit,
-                startup_verification_complete,
             )),
             cluster_info,
             genesis_hash,
@@ -712,7 +709,7 @@ impl JsonRpcRequestProcessor {
         let encoding = encoding.unwrap_or(UiAccountEncoding::Binary);
         optimize_filters(&mut filters);
         let keyed_accounts = {
-            if let Some(owner) = get_spl_token_owner_filter(&program_id, &filters) {
+            if let Some(owner) = get_spl_token_owner_filter(&program_id, &filters)? {
                 self.get_filtered_spl_token_accounts_by_owner(
                     Arc::clone(&bank),
                     program_id,
@@ -721,7 +718,7 @@ impl JsonRpcRequestProcessor {
                     sort_results,
                 )
                 .await?
-            } else if let Some(mint) = get_spl_token_mint_filter(&program_id, &filters) {
+            } else if let Some(mint) = get_spl_token_mint_filter(&program_id, &filters)? {
                 self.get_filtered_spl_token_accounts_by_mint(
                     Arc::clone(&bank),
                     program_id,
@@ -2471,7 +2468,7 @@ impl JsonRpcRequestProcessor {
 
     fn get_stake_minimum_delegation(&self, config: RpcContextConfig) -> Result<RpcResponse<u64>> {
         let bank = self.get_bank_with_config(config)?;
-        let stake_minimum_delegation = solana_stake_program::get_minimum_delegation(
+        let stake_minimum_delegation = stake_utils::get_minimum_delegation(
             bank.feature_set
                 .is_active(&agave_feature_set::stake_raise_minimum_delegation_to_1_sol::id()),
         );
@@ -2956,15 +2953,6 @@ pub(crate) fn optimize_filters(filters: &mut [RpcFilterType]) {
     })
 }
 
-fn verify_transaction(transaction: &SanitizedTransaction) -> Result<()> {
-    #[allow(clippy::question_mark)]
-    if transaction.verify().is_err() {
-        return Err(RpcCustomError::TransactionSignatureVerificationFailure.into());
-    }
-
-    Ok(())
-}
-
 pub(crate) fn verify_filters(filters: &[RpcFilterType]) -> Result<()> {
     if filters.len() > MAX_GET_PROGRAM_ACCOUNT_FILTERS {
         return Err(Error::invalid_params(format!(
@@ -3101,14 +3089,16 @@ fn encode_account<T: ReadableAccount>(
 /// owner.
 /// NOTE: `optimize_filters()` should almost always be called before using this method because of
 /// the requirement that `Memcmp::raw_bytes_as_ref().is_some()`.
-fn get_spl_token_owner_filter(program_id: &Pubkey, filters: &[RpcFilterType]) -> Option<Pubkey> {
+fn get_spl_token_owner_filter(
+    program_id: &Pubkey,
+    filters: &[RpcFilterType],
+) -> Result<Option<Pubkey>> {
     if !is_known_spl_token_id(program_id) {
-        return None;
+        return Ok(None);
     }
     let mut data_size_filter: Option<u64> = None;
     let mut memcmp_filter: Option<&[u8]> = None;
     let mut owner_key: Option<Pubkey> = None;
-    let mut incorrect_owner_len: Option<usize> = None;
     let mut token_account_state_filter = false;
     let account_packed_len = TokenAccount::get_packed_len();
     for filter in filters {
@@ -3123,7 +3113,11 @@ fn get_spl_token_owner_filter(program_id: &Pubkey, filters: &[RpcFilterType]) ->
                         if bytes.len() == PUBKEY_BYTES {
                             owner_key = Pubkey::try_from(bytes).ok();
                         } else {
-                            incorrect_owner_len = Some(bytes.len());
+                            return Err(Error::invalid_params(format!(
+                                "Incorrect byte length {} for SPL token owner filter, expected {}",
+                                bytes.len(),
+                                PUBKEY_BYTES
+                            )));
                         }
                     }
                 }
@@ -3135,15 +3129,10 @@ fn get_spl_token_owner_filter(program_id: &Pubkey, filters: &[RpcFilterType]) ->
         || memcmp_filter == Some(&[ACCOUNTTYPE_ACCOUNT])
         || token_account_state_filter
     {
-        if let Some(incorrect_owner_len) = incorrect_owner_len {
-            info!(
-                "Incorrect num bytes ({incorrect_owner_len:?}) provided for spl_token_owner_filter"
-            );
-        }
-        owner_key
+        Ok(owner_key)
     } else {
         debug!("spl_token program filters do not match by-owner index requisites");
-        None
+        Ok(None)
     }
 }
 
@@ -3151,14 +3140,16 @@ fn get_spl_token_owner_filter(program_id: &Pubkey, filters: &[RpcFilterType]) ->
 /// mint.
 /// NOTE: `optimize_filters()` should almost always be called before using this method because of
 /// the requirement that `Memcmp::raw_bytes_as_ref().is_some()`.
-fn get_spl_token_mint_filter(program_id: &Pubkey, filters: &[RpcFilterType]) -> Option<Pubkey> {
+fn get_spl_token_mint_filter(
+    program_id: &Pubkey,
+    filters: &[RpcFilterType],
+) -> Result<Option<Pubkey>> {
     if !is_known_spl_token_id(program_id) {
-        return None;
+        return Ok(None);
     }
     let mut data_size_filter: Option<u64> = None;
     let mut memcmp_filter: Option<&[u8]> = None;
     let mut mint: Option<Pubkey> = None;
-    let mut incorrect_mint_len: Option<usize> = None;
     let mut token_account_state_filter = false;
     let account_packed_len = TokenAccount::get_packed_len();
     for filter in filters {
@@ -3173,7 +3164,11 @@ fn get_spl_token_mint_filter(program_id: &Pubkey, filters: &[RpcFilterType]) -> 
                         if bytes.len() == PUBKEY_BYTES {
                             mint = Pubkey::try_from(bytes).ok();
                         } else {
-                            incorrect_mint_len = Some(bytes.len());
+                            return Err(Error::invalid_params(format!(
+                                "Incorrect byte length {} for SPL token mint filter, expected {}",
+                                bytes.len(),
+                                PUBKEY_BYTES
+                            )));
                         }
                     }
                 }
@@ -3185,15 +3180,10 @@ fn get_spl_token_mint_filter(program_id: &Pubkey, filters: &[RpcFilterType]) -> 
         || memcmp_filter == Some(&[ACCOUNTTYPE_ACCOUNT])
         || token_account_state_filter
     {
-        if let Some(incorrect_mint_len) = incorrect_mint_len {
-            info!(
-                "Incorrect num bytes ({incorrect_mint_len:?}) provided for spl_token_mint_filter"
-            );
-        }
-        mint
+        Ok(mint)
     } else {
         debug!("spl_token program filters do not match by-mint index requisites");
-        None
+        Ok(None)
     }
 }
 
@@ -3422,10 +3412,10 @@ pub mod rpc_minimal {
                 .unwrap();
 
             let full_snapshot_slot =
-                snapshot_utils::get_highest_full_snapshot_archive_slot(full_snapshot_archives_dir)
+                snapshot_paths::get_highest_full_snapshot_archive_slot(full_snapshot_archives_dir)
                     .ok_or(RpcCustomError::NoSnapshot)?;
             let incremental_snapshot_slot =
-                snapshot_utils::get_highest_incremental_snapshot_archive_slot(
+                snapshot_paths::get_highest_incremental_snapshot_archive_slot(
                     incremental_snapshot_archives_dir,
                     full_snapshot_slot,
                 );
@@ -4441,6 +4431,9 @@ pub mod rpc_full {
                 unsanitized_tx,
                 preflight_bank,
                 preflight_bank.get_reserved_account_keys(),
+                preflight_bank
+                    .feature_set
+                    .is_active(&agave_feature_set::static_instruction_limit::id()),
             )?;
 
             // StartXandeum
@@ -4634,9 +4627,9 @@ pub mod rpc_full {
             }
 
             if !skip_preflight {
-                verify_transaction(&transaction)?;
+                let verification_error = transaction.verify().err();
 
-                if !meta.config.skip_preflight_health_check {
+                if verification_error.is_none() && !meta.config.skip_preflight_health_check {
                     match meta.health.check() {
                         RpcHealthStatus::Ok => (),
                         RpcHealthStatus::Unknown => {
@@ -4656,6 +4649,12 @@ pub mod rpc_full {
                     }
                 }
 
+                let simulation_result = if let Some(err) = verification_error {
+                    TransactionSimulationResult::new_error(err)
+                } else {
+                    preflight_bank.simulate_transaction(&transaction, false)
+                };
+
                 if let TransactionSimulationResult {
                     result: Err(err),
                     logs,
@@ -4669,7 +4668,7 @@ pub mod rpc_full {
                     post_balances: _,
                     pre_token_balances: _,
                     post_token_balances: _,
-                } = preflight_bank.simulate_transaction(&transaction, false)
+                } = simulation_result
                 {
                     match err {
                         TransactionError::BlockhashNotFound => {
@@ -4763,11 +4762,25 @@ pub mod rpc_full {
                 });
             }
 
-            let transaction =
-                sanitize_transaction(unsanitized_tx, bank, bank.get_reserved_account_keys())?;
-            if sig_verify {
-                verify_transaction(&transaction)?;
-            }
+            let transaction = sanitize_transaction(
+                unsanitized_tx,
+                bank,
+                bank.get_reserved_account_keys(),
+                bank.feature_set
+                    .is_active(&agave_feature_set::static_instruction_limit::id()),
+            )?;
+
+            let verification_error = if sig_verify {
+                transaction.verify().err()
+            } else {
+                None
+            };
+
+            let simulation_result = if let Some(err) = verification_error {
+                TransactionSimulationResult::new_error(err)
+            } else {
+                bank.simulate_transaction(&transaction, enable_cpi_recording)
+            };
 
             let TransactionSimulationResult {
                 result,
@@ -4782,7 +4795,7 @@ pub mod rpc_full {
                 post_balances,
                 pre_token_balances,
                 post_token_balances,
-            } = bank.simulate_transaction(&transaction, enable_cpi_recording);
+            } = simulation_result;
 
             let account_keys = transaction.message().account_keys();
             let number_of_accounts = account_keys.len();
@@ -5193,6 +5206,7 @@ fn sanitize_transaction(
     transaction: VersionedTransaction,
     address_loader: impl AddressLoader,
     reserved_account_keys: &HashSet<Pubkey>,
+    enable_static_instruction_limit: bool,
 ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
     RuntimeTransaction::try_create(
         transaction,
@@ -5200,6 +5214,7 @@ fn sanitize_transaction(
         None,
         address_loader,
         reserved_account_keys,
+        enable_static_instruction_limit,
     )
     .map_err(|err| Error::invalid_params(format!("invalid transaction: {err}")))
 }
@@ -5311,7 +5326,7 @@ pub mod tests {
         jsonrpc_core::{futures, ErrorCode, MetaIoHandler, Output, Response, Value},
         jsonrpc_core_client::transports::local,
         serde::de::DeserializeOwned,
-        solana_account::{Account, WritableAccount},
+        solana_account::{state_traits::StateMut, Account, WritableAccount},
         solana_accounts_db::accounts_db::{AccountsDbConfig, ACCOUNTS_DB_CONFIG_FOR_TESTING},
         solana_address_lookup_table_interface::{
             self as address_lookup_table,
@@ -5372,10 +5387,10 @@ pub mod tests {
             EncodedConfirmedBlock, EncodedTransaction, EncodedTransactionWithStatusMeta,
             TransactionDetails,
         },
-        solana_vote_interface::state::VoteStateV3,
+        solana_vote_interface::state::VoteStateV4,
         solana_vote_program::{
             vote_instruction,
-            vote_state::{self, TowerSync, VoteInit, VoteStateVersions, MAX_LOCKOUT_HISTORY},
+            vote_state::{TowerSync, VoteInit, VoteStateVersions, MAX_LOCKOUT_HISTORY},
         },
         spl_pod::optional_keys::OptionalNonZeroPubkey,
         spl_token_2022_interface::{
@@ -5798,8 +5813,7 @@ pub mod tests {
                 self.bank_forks
                     .write()
                     .unwrap()
-                    .set_root(*root, None, Some(0))
-                    .unwrap();
+                    .set_root(*root, None, Some(0));
                 let block_time = self
                     .bank_forks
                     .read()
@@ -5830,14 +5844,14 @@ pub mod tests {
             bank
         }
 
-        fn store_vote_account(&self, vote_pubkey: &Pubkey, vote_state: VoteStateV3) {
+        fn store_vote_account(&self, vote_pubkey: &Pubkey, vote_state: VoteStateV4) {
             let bank = self.working_bank();
-            let versioned = VoteStateVersions::new_v3(vote_state);
-            let space = VoteStateV3::size_of();
+            let versioned = VoteStateVersions::new_v4(vote_state);
+            let space = VoteStateV4::size_of();
             let balance = bank.get_minimum_balance_for_rent_exemption(space);
             let mut vote_account =
                 AccountSharedData::new(balance, space, &solana_vote_program::id());
-            vote_state::to(&versioned, &mut vote_account).unwrap();
+            vote_account.set_state(&versioned).unwrap();
             bank.store_account(vote_pubkey, &vote_account);
         }
 
@@ -6905,12 +6919,27 @@ pub mod tests {
         );
         let res = io.handle_request_sync(&req, meta.clone());
         let expected = json!({
-            "jsonrpc":"2.0",
-            "error": {
-                "code": -32003,
-                "message": "Transaction signature verification failure"
+            "jsonrpc": "2.0",
+            "result": {
+                "context": { "slot": 0, "apiVersion": RpcApiVersion::default() },
+                "value": {
+                    "accounts": null,
+                    "err": "SignatureFailure",
+                    "innerInstructions": null,
+                    "loadedAccountsDataSize": 0,
+                    "fee": null,
+                    "loadedAddresses": { "readonly": [], "writable": [] },
+                    "preBalances": null,
+                    "postBalances": null,
+                    "preTokenBalances": null,
+                    "postTokenBalances": null,
+                    "logs": [],
+                    "replacementBlockhash": null,
+                    "returnData": null,
+                    "unitsConsumed": 0,
+                }
             },
-            "id":1
+            "id": 1,
         });
 
         let expected: Response =
@@ -7741,7 +7770,7 @@ pub mod tests {
                 r#"{"jsonrpc":"2.0","error":{"code":-32005,"message":"Node is behind by 42 slots","data":{"numSlotsBehind":42}},"id":1}"#.to_string(),
             )
         );
-        health.stub_set_health_status(None);
+        health.stub_set_health_status(Some(RpcHealthStatus::Ok));
 
         // sendTransaction will fail due to invalid signature
         bad_transaction.signatures[0] = Signature::default();
@@ -7751,12 +7780,36 @@ pub mod tests {
             bs58::encode(serialize(&bad_transaction).unwrap()).into_string()
         );
         let res = io.handle_request_sync(&req, meta.clone());
-        assert_eq!(
-            res,
-            Some(
-                r#"{"jsonrpc":"2.0","error":{"code":-32003,"message":"Transaction signature verification failure"},"id":1}"#.to_string(),
-            )
-        );
+        let expected = json!({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32002,
+                "data": {
+                    "accounts": null,
+                    "err": "SignatureFailure",
+                    "innerInstructions": null,
+                    "loadedAccountsDataSize": 0,
+                    "fee": null,
+                    "loadedAddresses": null,
+                    "preBalances": null,
+                    "postBalances": null,
+                    "preTokenBalances": null,
+                    "postTokenBalances": null,
+                    "logs": [],
+                    "replacementBlockhash": null,
+                    "returnData": null,
+                    "unitsConsumed": 0,
+                },
+                "message": "Transaction simulation failed: Transaction did not pass signature verification",
+            },
+            "id": 1,
+        });
+
+        let expected: Response =
+            serde_json::from_value(expected).expect("expected response deserialization");
+        let result: Response = serde_json::from_str(&res.expect("actual response"))
+            .expect("actual response deserialization");
+        assert_eq!(result, expected);
 
         // sendTransaction will now succeed because skipPreflight=true even though it's a bad
         // transaction
@@ -8457,7 +8510,8 @@ pub mod tests {
 
         // Create a vote account with no stake.
         let alice_vote_keypair = Keypair::new();
-        let alice_vote_state = VoteStateV3::new(
+        let alice_vote_state = VoteStateV4::new(
+            &alice_vote_keypair.pubkey(),
             &VoteInit {
                 node_pubkey: mint_keypair.pubkey(),
                 authorized_voter: alice_vote_keypair.pubkey(),
@@ -9467,6 +9521,7 @@ pub mod tests {
                     RpcFilterType::DataSize(165)
                 ],
             )
+            .unwrap()
             .unwrap(),
             owner
         );
@@ -9480,6 +9535,7 @@ pub mod tests {
                     RpcFilterType::Memcmp(Memcmp::new_raw_bytes(165, vec![ACCOUNTTYPE_ACCOUNT])),
                 ],
             )
+            .unwrap()
             .unwrap(),
             owner
         );
@@ -9493,6 +9549,7 @@ pub mod tests {
                     RpcFilterType::TokenAccountState,
                 ],
             )
+            .unwrap()
             .unwrap(),
             owner
         );
@@ -9505,6 +9562,7 @@ pub mod tests {
                 RpcFilterType::Memcmp(Memcmp::new_raw_bytes(165, vec![ACCOUNTTYPE_ACCOUNT])),
             ],
         )
+        .unwrap()
         .is_none());
 
         // Filtering on mint instead of owner
@@ -9515,6 +9573,7 @@ pub mod tests {
                 RpcFilterType::DataSize(165)
             ],
         )
+        .unwrap()
         .is_none());
 
         // Wrong program id
@@ -9525,6 +9584,7 @@ pub mod tests {
                 RpcFilterType::DataSize(165)
             ],
         )
+        .unwrap()
         .is_none());
         assert!(get_spl_token_owner_filter(
             &Pubkey::new_unique(),
@@ -9533,7 +9593,24 @@ pub mod tests {
                 RpcFilterType::Memcmp(Memcmp::new_raw_bytes(165, vec![ACCOUNTTYPE_ACCOUNT])),
             ],
         )
+        .unwrap()
         .is_none());
+
+        // Test invalid filters
+
+        // Filtering on invalid length pubkey
+        let owner = Pubkey::new_unique();
+        let mut first_half_bytes = owner.to_bytes().to_vec();
+        first_half_bytes.resize(16, 0);
+        assert!(get_spl_token_owner_filter(
+            &spl_generic_token::token::id(),
+            &[
+                RpcFilterType::Memcmp(Memcmp::new_raw_bytes(32, first_half_bytes)),
+                RpcFilterType::DataSize(165)
+            ],
+        )
+        .is_err_and(|err| err.code == ErrorCode::InvalidParams
+            && err.message == "Incorrect byte length 16 for SPL token owner filter, expected 32"));
     }
 
     #[test]
@@ -9548,6 +9625,7 @@ pub mod tests {
                     RpcFilterType::DataSize(165)
                 ],
             )
+            .unwrap()
             .unwrap(),
             mint
         );
@@ -9561,6 +9639,7 @@ pub mod tests {
                     RpcFilterType::Memcmp(Memcmp::new_raw_bytes(165, vec![ACCOUNTTYPE_ACCOUNT])),
                 ],
             )
+            .unwrap()
             .unwrap(),
             mint
         );
@@ -9574,6 +9653,7 @@ pub mod tests {
                     RpcFilterType::TokenAccountState,
                 ],
             )
+            .unwrap()
             .unwrap(),
             mint
         );
@@ -9586,6 +9666,7 @@ pub mod tests {
                 RpcFilterType::Memcmp(Memcmp::new_raw_bytes(165, vec![ACCOUNTTYPE_ACCOUNT])),
             ],
         )
+        .unwrap()
         .is_none());
 
         // Filtering on owner instead of mint
@@ -9596,6 +9677,7 @@ pub mod tests {
                 RpcFilterType::DataSize(165)
             ],
         )
+        .unwrap()
         .is_none());
 
         // Wrong program id
@@ -9606,6 +9688,7 @@ pub mod tests {
                 RpcFilterType::DataSize(165)
             ],
         )
+        .unwrap()
         .is_none());
         assert!(get_spl_token_mint_filter(
             &Pubkey::new_unique(),
@@ -9614,7 +9697,27 @@ pub mod tests {
                 RpcFilterType::Memcmp(Memcmp::new_raw_bytes(165, vec![ACCOUNTTYPE_ACCOUNT])),
             ],
         )
+        .unwrap()
         .is_none());
+
+        // Test invalid filters
+
+        // Filtering on invalid length pubkey
+        let owner = Pubkey::new_unique();
+        let mut first_half_bytes = owner.to_bytes().to_vec();
+        first_half_bytes.resize(16, 0);
+        assert!(get_spl_token_mint_filter(
+            &spl_generic_token::token::id(),
+            &[
+                RpcFilterType::Memcmp(Memcmp::new_raw_bytes(0, first_half_bytes)),
+                RpcFilterType::DataSize(165)
+            ],
+        )
+        .is_err_and(|err| {
+            print!("{err:?}");
+            err.code == ErrorCode::InvalidParams
+                && err.message == "Incorrect byte length 16 for SPL token mint filter, expected 32"
+        }));
     }
 
     #[test]
@@ -9699,7 +9802,7 @@ pub mod tests {
         OptimisticallyConfirmedBankTracker::process_notification(
             (
                 BankNotification::OptimisticallyConfirmed(2),
-                None, /* no work sequence */
+                None, /* no dependency work */
             ),
             &bank_forks,
             &optimistically_confirmed_bank,
@@ -9723,7 +9826,7 @@ pub mod tests {
         OptimisticallyConfirmedBankTracker::process_notification(
             (
                 BankNotification::OptimisticallyConfirmed(1),
-                None, /* no work sequence */
+                None, /* no dependency work */
             ),
             &bank_forks,
             &optimistically_confirmed_bank,
@@ -9747,7 +9850,7 @@ pub mod tests {
         OptimisticallyConfirmedBankTracker::process_notification(
             (
                 BankNotification::OptimisticallyConfirmed(3),
-                None, /* no work sequence */
+                None, /* no dependency work */
             ),
             &bank_forks,
             &optimistically_confirmed_bank,
@@ -9772,7 +9875,7 @@ pub mod tests {
         OptimisticallyConfirmedBankTracker::process_notification(
             (
                 BankNotification::Frozen(bank3),
-                None, /* no work sequence */
+                None, /* no dependency work */
             ),
             &bank_forks,
             &optimistically_confirmed_bank,
@@ -9915,7 +10018,8 @@ pub mod tests {
             sanitize_transaction(
                 unsanitary_versioned_tx,
                 SimpleAddressLoader::Disabled,
-                &ReservedAccountKeys::empty_key_set()
+                &ReservedAccountKeys::empty_key_set(),
+                true,
             )
             .unwrap_err(),
             expect58
@@ -9940,7 +10044,8 @@ pub mod tests {
             sanitize_transaction(
                 versioned_tx,
                 SimpleAddressLoader::Disabled,
-                &ReservedAccountKeys::empty_key_set()
+                &ReservedAccountKeys::empty_key_set(),
+                true,
             )
             .unwrap_err(),
             Error::invalid_params(
@@ -9953,7 +10058,7 @@ pub mod tests {
     fn test_rpc_get_stake_minimum_delegation() {
         let rpc = RpcHandler::start();
         let bank = rpc.working_bank();
-        let expected_stake_minimum_delegation = solana_stake_program::get_minimum_delegation(
+        let expected_stake_minimum_delegation = stake_utils::get_minimum_delegation(
             bank.feature_set
                 .is_active(&agave_feature_set::stake_raise_minimum_delegation_to_1_sol::id()),
         );

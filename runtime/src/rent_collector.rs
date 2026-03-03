@@ -4,7 +4,7 @@ use {
 };
 
 #[cfg_attr(feature = "frozen-abi", derive(solana_frozen_abi_macro::AbiExample))]
-#[derive(Clone, Debug, PartialEq, serde_derive::Deserialize, serde_derive::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct RentCollector {
     pub epoch: Epoch,
     pub epoch_schedule: EpochSchedule,
@@ -44,5 +44,11 @@ impl RentCollector {
             epoch,
             ..self.clone()
         }
+    }
+
+    pub(crate) fn deprecate_rent_exemption_threshold(&mut self) {
+        self.rent.lamports_per_byte_year =
+            (self.rent.lamports_per_byte_year as f64 * self.rent.exemption_threshold) as u64;
+        self.rent.exemption_threshold = 1.0;
     }
 }

@@ -35,6 +35,11 @@ use {
         thread::{self, JoinHandle},
         time::Instant,
     },
+    wincode::{
+        containers::{Elem, Pod, Vec as WincodeVec},
+        len::BincodeLen,
+        SchemaRead, SchemaWrite,
+    },
 };
 
 pub type EntrySender = Sender<Vec<Entry>>;
@@ -49,7 +54,7 @@ pub fn init_poh() {
 fn init(name: &OsStr) {
     static INIT_HOOK: Once = Once::new();
 
-    info!("Loading {:?}", name);
+    info!("Loading {name:?}");
     INIT_HOOK.call_once(|| {
         let path;
         let lib_name = if let Some(perf_libs_path) = solana_perf::perf_libs::locate_perf_libs() {
@@ -90,6 +95,10 @@ pub struct Api<'a> {
         Symbol<'a, unsafe extern "C" fn(hashes: *mut u8, num_hashes: *const u64)>,
 }
 
+const MAX_DATA_SHREDS_PER_SLOT: usize = 32_768;
+pub const MAX_DATA_SHREDS_SIZE: usize = MAX_DATA_SHREDS_PER_SLOT * solana_packet::PACKET_DATA_SIZE;
+pub type MaxDataShredsLen = BincodeLen<MAX_DATA_SHREDS_SIZE>;
+
 /// Each Entry contains three pieces of data. The `num_hashes` field is the number
 /// of hashes performed since the previous entry.  The `hash` field is the result
 /// of hashing `hash` from the previous entry `num_hashes` times.  The `transactions`
@@ -117,17 +126,19 @@ pub struct Api<'a> {
 /// transaction, or read by one or more transactions, but not both.
 /// This enforcement is done via a call to `solana_runtime::accounts::Accounts::lock_accounts()`
 /// with the `txs` argument holding all the `transactions` in the `Entry`.
-#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone, SchemaWrite, SchemaRead)]
 pub struct Entry {
     /// The number of hashes since the previous Entry ID.
     pub num_hashes: u64,
 
     /// The SHA-256 hash `num_hashes` after the previous Entry ID.
+    #[wincode(with = "Pod<Hash>")]
     pub hash: Hash,
 
     /// An unordered list of transactions that were observed before the Entry ID was
     /// generated. They may have been observed before a previous Entry ID but were
     /// pushed back into this list to ensure deterministic interpretation of the ledger.
+    #[wincode(with = "WincodeVec<Elem<crate::wincode::VersionedTransaction>, MaxDataShredsLen>")]
     pub transactions: Vec<VersionedTransaction>,
 }
 
@@ -887,10 +898,8 @@ impl EntrySlice for [Entry] {
             if entry.is_tick() {
                 if *tick_hash_count != hashes_per_tick {
                     warn!(
-                        "invalid tick hash count!: entry: {:#?}, tick_hash_count: {}, hashes_per_tick: {}",
-                        entry,
-                        tick_hash_count,
-                        hashes_per_tick
+                        "invalid tick hash count!: entry: {entry:#?}, tick_hash_count: \
+                         {tick_hash_count}, hashes_per_tick: {hashes_per_tick}"
                     );
                     return false;
                 }
@@ -1078,6 +1087,7 @@ mod tests {
                         None,
                         SimpleAddressLoader::Disabled,
                         &ReservedAccountKeys::empty_key_set(),
+                        true,
                     )
                 }?;
 
@@ -1200,7 +1210,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice1() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1222,7 +1232,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice_with_hashes1() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1249,7 +1259,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice_with_hashes_and_transactions() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1402,11 +1412,11 @@ mod tests {
 
     #[test]
     fn test_poh_verify_fuzz() {
-        solana_logger::setup();
+        agave_logger::setup();
         for _ in 0..100 {
             let mut time = Measure::start("ticks");
             let num_ticks = thread_rng().gen_range(1..100);
-            info!("create {} ticks:", num_ticks);
+            info!("create {num_ticks} ticks:");
             let mut entries = create_random_ticks(num_ticks, 100, Hash::default());
             time.stop();
 
@@ -1417,12 +1427,12 @@ mod tests {
                 entries[modify_idx].hash = hash(&[1, 2, 3]);
             }
 
-            info!("done.. {}", time);
+            info!("done.. {time}");
             let mut time = Measure::start("poh");
             let res = entries.verify(&Hash::default(), &thread_pool_for_tests());
             assert_eq!(res, !modified);
             time.stop();
-            info!("{} {}", time, res);
+            info!("{time} {res}");
         }
     }
 

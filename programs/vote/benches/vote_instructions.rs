@@ -14,12 +14,12 @@ use {
     solana_rent::Rent,
     solana_sdk_ids::{sysvar, vote::id},
     solana_slot_hashes::{SlotHashes, MAX_ENTRIES},
-    solana_transaction_context::TransactionAccount,
+    solana_transaction_context::transaction_accounts::KeyedAccountSharedData,
     solana_vote_program::{
         vote_instruction::VoteInstruction,
         vote_processor::Entrypoint,
         vote_state::{
-            create_account, create_account_with_authorized, TowerSync, Vote, VoteAuthorize,
+            create_v4_account_with_authorized, TowerSync, Vote, VoteAuthorize,
             VoteAuthorizeCheckedWithSeedArgs, VoteAuthorizeWithSeedArgs, VoteInit, VoteStateUpdate,
             VoteStateV3, VoteStateVersions, MAX_LOCKOUT_HISTORY,
         },
@@ -34,7 +34,12 @@ fn create_default_clock_account() -> AccountSharedData {
     account::create_account_shared_data_for_test(&Clock::default())
 }
 
-fn create_accounts() -> (Slot, SlotHashes, Vec<TransactionAccount>, Vec<AccountMeta>) {
+fn create_accounts() -> (
+    Slot,
+    SlotHashes,
+    Vec<KeyedAccountSharedData>,
+    Vec<AccountMeta>,
+) {
     // vote accounts are usually almost full of votes in normal operation
     let num_initial_votes = MAX_LOCKOUT_HISTORY as Slot;
 
@@ -124,11 +129,18 @@ fn create_accounts() -> (Slot, SlotHashes, Vec<TransactionAccount>, Vec<AccountM
 
 fn create_test_account() -> (Pubkey, AccountSharedData) {
     let rent = Rent::default();
-    let balance = VoteStateV3::get_rent_exempt_reserve(&rent);
+    let balance = rent.minimum_balance(VoteStateV3::size_of());
     let vote_pubkey = solana_pubkey::new_rand();
     (
         vote_pubkey,
-        create_account(&vote_pubkey, &solana_pubkey::new_rand(), 0, balance),
+        create_v4_account_with_authorized(
+            &solana_pubkey::new_rand(),
+            &vote_pubkey,
+            &vote_pubkey,
+            None,
+            0,
+            balance,
+        ),
     )
 }
 
@@ -141,10 +153,11 @@ fn create_test_account_with_authorized() -> (Pubkey, Pubkey, Pubkey, AccountShar
         vote_pubkey,
         authorized_voter,
         authorized_withdrawer,
-        create_account_with_authorized(
+        create_v4_account_with_authorized(
             &solana_pubkey::new_rand(),
             &authorized_voter,
             &authorized_withdrawer,
+            None,
             0,
             100,
         ),
@@ -711,10 +724,11 @@ impl BenchAuthorizeWithSeed {
             &withdrawer_owner,
         )
         .unwrap();
-        let vote_account = create_account_with_authorized(
+        let vote_account = create_v4_account_with_authorized(
             &Pubkey::new_unique(),
             &authorized_voter,
             &authorized_withdrawer,
+            None,
             0,
             100,
         );
@@ -799,10 +813,11 @@ impl BenchAuthorizeCheckedWithSeed {
             &withdrawer_owner,
         )
         .unwrap();
-        let vote_account = create_account_with_authorized(
+        let vote_account = create_v4_account_with_authorized(
             &Pubkey::new_unique(),
             &authorized_voter,
             &authorized_withdrawer,
+            None,
             0,
             100,
         );

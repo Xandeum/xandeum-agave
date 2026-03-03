@@ -1,16 +1,18 @@
 use {
-    super::{
-        immutable_deserialized_packet::ImmutableDeserializedPacket,
-        latest_validator_vote_packet::{LatestValidatorVotePacket, VoteSource},
-    },
+    super::latest_validator_vote_packet::{LatestValidatorVote, VoteSource},
+    crate::banking_stage::transaction_scheduler::transaction_state_container::SharedBytes,
     agave_feature_set as feature_set,
+    agave_transaction_view::transaction_view::SanitizedTransactionView,
     ahash::HashMap,
     itertools::Itertools,
     rand::{thread_rng, Rng},
     solana_account::from_account,
     solana_clock::Epoch,
     solana_pubkey::Pubkey,
-    solana_runtime::{bank::Bank, epoch_stakes::VersionedEpochStakes},
+    solana_runtime::{
+        bank::Bank,
+        epoch_stakes::{EpochAuthorizedVoters, VersionedEpochStakes},
+    },
     solana_sysvar::{self as sysvar, slot_hashes::SlotHashes},
     std::{cmp, sync::Arc},
 };
@@ -40,19 +42,31 @@ impl VoteBatchInsertionMetrics {
 
 #[derive(Debug)]
 pub struct VoteStorage {
-    latest_vote_per_vote_pubkey: HashMap<Pubkey, LatestValidatorVotePacket>,
+    latest_vote_per_vote_pubkey: HashMap<Pubkey, LatestValidatorVote>,
     num_unprocessed_votes: usize,
     cached_epoch_stakes: VersionedEpochStakes,
+    /// Authorized voters for the current epoch. This is separate from
+    /// cached_epoch_stakes because stakes are offset by one epoch (we use
+    /// epoch E + 1 for stake in epoch E), but authorized voters must
+    /// match the epoch of the bank slot
+    cached_epoch_authorized_voters: Arc<EpochAuthorizedVoters>,
     deprecate_legacy_vote_ixs: bool,
     current_epoch: Epoch,
 }
 
 impl VoteStorage {
     pub fn new(bank: &Bank) -> Self {
+        let cached_epoch_stakes = bank.current_epoch_stakes().clone();
+        let cached_epoch_authorized_voters = bank
+            .epoch_stakes(bank.epoch())
+            .expect("Current epoch stakes must exist")
+            .epoch_authorized_voters()
+            .clone();
         Self {
             latest_vote_per_vote_pubkey: HashMap::default(),
             num_unprocessed_votes: 0,
-            cached_epoch_stakes: bank.current_epoch_stakes().clone(),
+            cached_epoch_stakes,
+            cached_epoch_authorized_voters,
             current_epoch: bank.epoch(),
             deprecate_legacy_vote_ixs: bank
                 .feature_set
@@ -69,11 +83,14 @@ impl VoteStorage {
             .map(|pubkey| (*pubkey, (1u64, VoteAccount::new_random())))
             .collect();
         let epoch_stakes = VersionedEpochStakes::new_for_tests(vote_accounts, 0);
+        // Authorized voters don't change in tests so it's fine to use the authorized voters from the "wrong" epoch
+        let epoch_authorized_voters = epoch_stakes.epoch_authorized_voters().clone();
 
         Self {
             latest_vote_per_vote_pubkey: HashMap::default(),
             num_unprocessed_votes: 0,
             cached_epoch_stakes: epoch_stakes,
+            cached_epoch_authorized_voters: epoch_authorized_voters,
             current_epoch: 0,
             deprecate_legacy_vote_ixs: true,
         }
@@ -94,13 +111,13 @@ impl VoteStorage {
     pub(crate) fn insert_batch(
         &mut self,
         vote_source: VoteSource,
-        deserialized_packets: impl Iterator<Item = ImmutableDeserializedPacket>,
+        votes: impl Iterator<Item = SanitizedTransactionView<SharedBytes>>,
     ) -> VoteBatchInsertionMetrics {
         let should_deprecate_legacy_vote_ixs = self.deprecate_legacy_vote_ixs;
         self.insert_batch_with_replenish(
-            deserialized_packets.filter_map(|deserialized_packet| {
-                LatestValidatorVotePacket::new_from_immutable(
-                    Arc::new(deserialized_packet),
+            votes.filter_map(|vote| {
+                LatestValidatorVote::new_from_view(
+                    vote,
                     vote_source,
                     should_deprecate_legacy_vote_ixs,
                 )
@@ -113,12 +130,12 @@ impl VoteStorage {
     // Re-insert re-tryable packets.
     pub(crate) fn reinsert_packets(
         &mut self,
-        packets: impl Iterator<Item = Arc<ImmutableDeserializedPacket>>,
+        packets: impl Iterator<Item = SanitizedTransactionView<SharedBytes>>,
     ) {
         let should_deprecate_legacy_vote_ixs = self.deprecate_legacy_vote_ixs;
         self.insert_batch_with_replenish(
             packets.filter_map(|packet| {
-                LatestValidatorVotePacket::new_from_immutable(
+                LatestValidatorVote::new_from_view(
                     packet,
                     VoteSource::Tpu, // incorrect, but this bug has been here w/o issue for a long time.
                     should_deprecate_legacy_vote_ixs,
@@ -129,7 +146,7 @@ impl VoteStorage {
         );
     }
 
-    pub fn drain_unprocessed(&mut self, bank: &Bank) -> Vec<Arc<ImmutableDeserializedPacket>> {
+    pub fn drain_unprocessed(&mut self, bank: &Bank) -> Vec<SanitizedTransactionView<SharedBytes>> {
         let slot_hashes = bank
             .get_account(&sysvar::slot_hashes::id())
             .and_then(|account| from_account::<SlotHashes, _>(&account));
@@ -172,7 +189,16 @@ impl VoteStorage {
             return;
         }
         {
-            self.cached_epoch_stakes = bank.current_epoch_stakes().clone();
+            // Stakes are offset by one epoch
+            let current_epoch_stakes = bank.current_epoch_stakes().clone();
+            // Authorized voters use the same epoch as the leader bank
+            self.cached_epoch_authorized_voters = bank
+                .epoch_stakes(bank.epoch())
+                .map(|stakes| stakes.epoch_authorized_voters().clone())
+                // Should be fine to expect as the current epoch must exist in epoch_stakes,
+                // will cleanup in a follow up
+                .unwrap_or_else(|| current_epoch_stakes.epoch_authorized_voters().clone());
+            self.cached_epoch_stakes = current_epoch_stakes;
             self.current_epoch = bank.epoch();
             self.deprecate_legacy_vote_ixs = bank
                 .feature_set
@@ -200,7 +226,7 @@ impl VoteStorage {
 
     fn insert_batch_with_replenish(
         &mut self,
-        votes: impl Iterator<Item = LatestValidatorVotePacket>,
+        votes: impl Iterator<Item = LatestValidatorVote>,
         should_replenish_taken_votes: bool,
     ) -> VoteBatchInsertionMetrics {
         let mut num_dropped_gossip = 0;
@@ -216,8 +242,7 @@ impl VoteStorage {
             }
 
             if self
-                .cached_epoch_stakes
-                .epoch_authorized_voters()
+                .cached_epoch_authorized_voters
                 .get(&vote.vote_pubkey())
                 .is_none_or(|authorized| authorized != &vote.authorized_voter_pubkey())
             {
@@ -243,9 +268,9 @@ impl VoteStorage {
     /// Otherwise returns None
     fn update_latest_vote(
         &mut self,
-        vote: LatestValidatorVotePacket,
+        vote: LatestValidatorVote,
         should_replenish_taken_votes: bool,
-    ) -> Option<LatestValidatorVotePacket> {
+    ) -> Option<LatestValidatorVote> {
         let vote_pubkey = vote.vote_pubkey();
         // Grab write-lock to insert new vote.
         match self.latest_vote_per_vote_pubkey.entry(vote_pubkey) {
@@ -274,8 +299,8 @@ impl VoteStorage {
     /// We directly compare as options to prioritize votes for same slot with timestamp as
     /// Some > None
     fn allow_update(
-        vote: &LatestValidatorVotePacket,
-        latest_vote: &LatestValidatorVotePacket,
+        vote: &LatestValidatorVote,
+        latest_vote: &LatestValidatorVote,
         should_replenish_taken_votes: bool,
     ) -> bool {
         let slot = vote.slot();
@@ -317,10 +342,7 @@ impl VoteStorage {
     }
 
     /// Check if `vote` can land in our fork based on `slot_hashes`
-    fn is_valid_for_our_fork(
-        vote: &LatestValidatorVotePacket,
-        slot_hashes: &Option<SlotHashes>,
-    ) -> bool {
+    fn is_valid_for_our_fork(vote: &LatestValidatorVote, slot_hashes: &Option<SlotHashes>) -> bool {
         let Some(slot_hashes) = slot_hashes else {
             // When slot hashes is not present we do not filter
             return true;
@@ -347,7 +369,7 @@ impl VoteStorage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use {
         super::*,
         solana_clock::UnixTimestamp,
@@ -359,10 +381,45 @@ mod tests {
         solana_signer::Signer,
         solana_vote::vote_transaction::new_tower_sync_transaction,
         solana_vote_program::vote_state::TowerSync,
-        std::{error::Error, sync::Arc},
+        std::sync::Arc,
     };
 
-    fn packet_from_slots(
+    /// Create a VoteAccount with a specific authorized voter for the given epoch
+    fn vote_account_with_authorized_voter(
+        vote_pubkey: &Pubkey,
+        authorized_voter: &Pubkey,
+        epoch: solana_clock::Epoch,
+    ) -> solana_vote::vote_account::VoteAccount {
+        use {
+            solana_account::AccountSharedData,
+            solana_vote_program::vote_state::{VoteInit, VoteStateV4, VoteStateVersions},
+        };
+
+        let vote_init = VoteInit {
+            node_pubkey: Pubkey::new_unique(),
+            authorized_voter: *authorized_voter,
+            authorized_withdrawer: Pubkey::new_unique(),
+            commission: 0,
+        };
+        let clock = solana_clock::Clock {
+            slot: 0,
+            epoch_start_timestamp: 0,
+            epoch,
+            leader_schedule_epoch: epoch,
+            unix_timestamp: 0,
+        };
+        let vote_state = VoteStateV4::new(vote_pubkey, &vote_init, &clock);
+        let account = AccountSharedData::new_data(
+            1_000_000,
+            &VoteStateVersions::new_v4(vote_state),
+            &solana_sdk_ids::vote::id(),
+        )
+        .unwrap();
+
+        solana_vote::vote_account::VoteAccount::try_from(account).unwrap()
+    }
+
+    pub(crate) fn packet_from_slots(
         slots: Vec<(u64, u32)>,
         keypairs: &ValidatorVoteKeypairs,
         timestamp: Option<UnixTimestamp>,
@@ -391,13 +448,44 @@ mod tests {
         vote_source: VoteSource,
         keypairs: &ValidatorVoteKeypairs,
         timestamp: Option<UnixTimestamp>,
-    ) -> LatestValidatorVotePacket {
+    ) -> LatestValidatorVote {
         let packet = packet_from_slots(slots, keypairs, timestamp);
-        LatestValidatorVotePacket::new(packet.as_ref(), vote_source, true).unwrap()
+        LatestValidatorVote::new(packet.as_ref(), vote_source, true).unwrap()
+    }
+
+    /// Create a vote packet with a custom authorized voter keypair
+    fn packet_from_slots_with_authorized_voter(
+        slots: Vec<(u64, u32)>,
+        keypairs: &ValidatorVoteKeypairs,
+        authorized_voter: &Keypair,
+        timestamp: Option<UnixTimestamp>,
+    ) -> BytesPacket {
+        let mut vote = TowerSync::from(slots);
+        vote.timestamp = timestamp;
+        let vote_tx = new_tower_sync_transaction(
+            vote,
+            Hash::new_unique(),
+            &keypairs.node_keypair,
+            &keypairs.vote_keypair,
+            authorized_voter,
+            None,
+        );
+        let mut packet = BytesPacket::from_data(None, vote_tx).unwrap();
+        packet
+            .meta_mut()
+            .flags
+            .set(PacketFlags::SIMPLE_VOTE_TX, true);
+
+        packet
+    }
+
+    fn to_sanitized_view(packet: BytesPacket) -> SanitizedTransactionView<SharedBytes> {
+        SanitizedTransactionView::try_new_sanitized(Arc::new(packet.buffer().to_vec()), false)
+            .unwrap()
     }
 
     #[test]
-    fn test_reinsert_packets() -> Result<(), Box<dyn Error>> {
+    fn test_reinsert_packets() {
         let keypair = ValidatorVoteKeypairs::new_rand();
         let genesis_config =
             genesis_utils::create_genesis_config_with_vote_accounts(100, &[&keypair], vec![200])
@@ -406,10 +494,7 @@ mod tests {
 
         let vote = packet_from_slots(vec![(0, 1)], &keypair, None);
         let mut vote_storage = VoteStorage::new(&bank);
-        vote_storage.insert_batch(
-            VoteSource::Tpu,
-            std::iter::once(ImmutableDeserializedPacket::new(vote.as_ref())?),
-        );
+        vote_storage.insert_batch(VoteSource::Tpu, std::iter::once(to_sanitized_view(vote)));
         assert_eq!(1, vote_storage.len());
 
         // Drain all packets, then re-insert.
@@ -418,8 +503,6 @@ mod tests {
 
         // All packets should remain in the transaction storage
         assert_eq!(1, vote_storage.len());
-
-        Ok(())
     }
 
     #[test]
@@ -571,20 +654,24 @@ mod tests {
         );
 
         // Same votes with smaller timestamps should not override
-        let vote_a = from_slots(
-            vec![(0, 5), (1, 4), (3, 3), (10, 1)],
-            VoteSource::Gossip,
-            &keypair_a,
-            Some(2),
-        );
-        let vote_b = from_slots(
-            vec![(0, 5), (4, 2), (9, 1)],
-            VoteSource::Gossip,
-            &keypair_b,
-            Some(3),
-        );
-        vote_storage.update_latest_vote(vote_a.clone(), false /* should replenish */);
-        vote_storage.update_latest_vote(vote_b.clone(), false /* should replenish */);
+        let vote_a = || {
+            from_slots(
+                vec![(0, 5), (1, 4), (3, 3), (10, 1)],
+                VoteSource::Gossip,
+                &keypair_a,
+                Some(2),
+            )
+        };
+        let vote_b = || {
+            from_slots(
+                vec![(0, 5), (4, 2), (9, 1)],
+                VoteSource::Gossip,
+                &keypair_b,
+                Some(3),
+            )
+        };
+        vote_storage.update_latest_vote(vote_a(), false /* should replenish */);
+        vote_storage.update_latest_vote(vote_b(), false /* should replenish */);
 
         assert_eq!(2, vote_storage.len());
         assert_eq!(
@@ -605,13 +692,13 @@ mod tests {
         assert_eq!(0, vote_storage.len());
 
         // Same votes with same timestamps should not replenish without flag
-        vote_storage.update_latest_vote(vote_a.clone(), false /* should replenish */);
-        vote_storage.update_latest_vote(vote_b.clone(), false /* should replenish */);
+        vote_storage.update_latest_vote(vote_a(), false /* should replenish */);
+        vote_storage.update_latest_vote(vote_b(), false /* should replenish */);
         assert_eq!(0, vote_storage.len());
 
         // Same votes with same timestamps should replenish with the flag
-        vote_storage.update_latest_vote(vote_a, true /* should replenish */);
-        vote_storage.update_latest_vote(vote_b, true /* should replenish */);
+        vote_storage.update_latest_vote(vote_a(), true /* should replenish */);
+        vote_storage.update_latest_vote(vote_b(), true /* should replenish */);
         assert_eq!(0, vote_storage.len());
     }
 
@@ -661,6 +748,161 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_batch_authorized_voter() {
+        // Test that votes are only accepted when signed by the correct authorized voter.
+        let keypair = ValidatorVoteKeypairs::new_rand();
+        let unauthorized_keypair = solana_keypair::Keypair::new();
+
+        let genesis_config =
+            genesis_utils::create_genesis_config_with_vote_accounts(100, &[&keypair], vec![200])
+                .genesis_config;
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let mut vote_storage = VoteStorage::new(&bank);
+
+        // Vote signed by the correct authorized voter (vote_keypair) should be accepted
+        let correct_vote = packet_from_slots_with_authorized_voter(
+            vec![(0, 1)],
+            &keypair,
+            &keypair.vote_keypair,
+            None,
+        );
+        vote_storage.insert_batch(
+            VoteSource::Tpu,
+            std::iter::once(to_sanitized_view(correct_vote)),
+        );
+        assert_eq!(1, vote_storage.len());
+        assert_eq!(
+            Some(0),
+            vote_storage.get_latest_vote_slot(keypair.vote_keypair.pubkey())
+        );
+
+        // Vote signed by an unauthorized keypair should be filtered out
+        let unauthorized_vote = packet_from_slots_with_authorized_voter(
+            vec![(1, 1)],
+            &keypair,
+            &unauthorized_keypair,
+            None,
+        );
+        vote_storage.insert_batch(
+            VoteSource::Tpu,
+            std::iter::once(to_sanitized_view(unauthorized_vote)),
+        );
+        // Should still be 1 (unauthorized vote was filtered)
+        assert_eq!(1, vote_storage.len());
+        // Slot should still be 0 (the authorized vote), not 1 (the unauthorized one)
+        assert_eq!(
+            Some(0),
+            vote_storage.get_latest_vote_slot(keypair.vote_keypair.pubkey())
+        );
+
+        // Update with a valid vote for a later slot - should succeed
+        let correct_vote_2 = packet_from_slots_with_authorized_voter(
+            vec![(2, 1)],
+            &keypair,
+            &keypair.vote_keypair,
+            None,
+        );
+        vote_storage.insert_batch(
+            VoteSource::Tpu,
+            std::iter::once(to_sanitized_view(correct_vote_2)),
+        );
+        assert_eq!(1, vote_storage.len());
+        assert_eq!(
+            Some(2),
+            vote_storage.get_latest_vote_slot(keypair.vote_keypair.pubkey())
+        );
+    }
+
+    /// Test that authorized voters are checked against the current epoch, not the next epoch.
+    /// This verifies that cache_epoch_boundary_info uses epoch_stakes(bank.epoch()) for
+    /// authorized voters, not current_epoch_stakes() which returns epoch E+1.
+    #[test]
+    fn test_authorized_voter_uses_current_epoch_not_next() {
+        let keypair = ValidatorVoteKeypairs::new_rand();
+        let vote_pubkey = keypair.vote_keypair.pubkey();
+
+        // Create two different authorized voters: one for epoch 1, one for epoch 2
+        let epoch1_authorized_voter_keypair = keypair.node_keypair.insecure_clone();
+        let epoch1_authorized_voter = epoch1_authorized_voter_keypair.pubkey();
+        let epoch2_authorized_voter_keypair = Keypair::new();
+        let epoch2_authorized_voter = epoch2_authorized_voter_keypair.pubkey();
+
+        // Create vote accounts with different authorized voters for different epochs
+        let vote_account_epoch1 =
+            vote_account_with_authorized_voter(&vote_pubkey, &epoch1_authorized_voter, 1);
+        let vote_account_epoch2 =
+            vote_account_with_authorized_voter(&vote_pubkey, &epoch2_authorized_voter, 2);
+
+        // Create epoch stakes for epochs 1 and 2
+        let epoch1_stakes = VersionedEpochStakes::new_for_tests(
+            [(vote_pubkey, (100, vote_account_epoch1))]
+                .into_iter()
+                .collect(),
+            1, // leader_schedule_epoch
+        );
+        let epoch2_stakes = VersionedEpochStakes::new_for_tests(
+            [(vote_pubkey, (100, vote_account_epoch2))]
+                .into_iter()
+                .collect(),
+            2, // leader_schedule_epoch
+        );
+
+        // Create a bank in epoch 1 with custom epoch stakes
+        let genesis_config =
+            genesis_utils::create_genesis_config_with_vote_accounts(100, &[&keypair], vec![200])
+                .genesis_config;
+        let bank_0 = Bank::new_for_tests(&genesis_config);
+        let mut bank = Bank::new_from_parent(
+            Arc::new(bank_0),
+            &Pubkey::new_unique(),
+            MINIMUM_SLOTS_PER_EPOCH, // This puts us in epoch 1
+        );
+        assert_eq!(bank.epoch(), 1);
+
+        // Set custom epoch stakes: epoch 1 has epoch1_authorized_voter, epoch 2 has epoch2_authorized_voter
+        bank.set_epoch_stakes_for_test(1, epoch1_stakes);
+        bank.set_epoch_stakes_for_test(2, epoch2_stakes);
+
+        let mut vote_storage = VoteStorage::new(&bank);
+
+        // Vote signed by epoch 1's authorized voter (vote_keypair) should be accepted
+        let epoch1_vote = packet_from_slots_with_authorized_voter(
+            vec![(MINIMUM_SLOTS_PER_EPOCH, 1)],
+            &keypair,
+            &epoch1_authorized_voter_keypair,
+            None,
+        );
+        vote_storage.insert_batch(
+            VoteSource::Tpu,
+            std::iter::once(to_sanitized_view(epoch1_vote)),
+        );
+        assert_eq!(
+            1,
+            vote_storage.len(),
+            "Vote with epoch 1 authorized voter should be accepted"
+        );
+
+        // Vote signed by epoch 2's authorized voter should be REJECTED
+        // If we were incorrectly using current_epoch_stakes() (epoch 2), this would be accepted
+        let wrong_epoch_vote = packet_from_slots_with_authorized_voter(
+            vec![(MINIMUM_SLOTS_PER_EPOCH + 1, 1)],
+            &keypair,
+            &epoch2_authorized_voter_keypair, // This won't match epoch 1's authorized voter
+            None,
+        );
+        vote_storage.insert_batch(
+            VoteSource::Tpu,
+            std::iter::once(to_sanitized_view(wrong_epoch_vote)),
+        );
+        // Should still be 1 - the vote with wrong authorized voter was rejected
+        assert_eq!(
+            1,
+            vote_storage.len(),
+            "Vote with wrong authorized voter should be rejected"
+        );
+    }
+
+    #[test]
     fn test_insert_batch_unstaked() {
         let keypair_a = ValidatorVoteKeypairs::new_rand();
         let keypair_b = ValidatorVoteKeypairs::new_rand();
@@ -673,18 +915,20 @@ mod tests {
         let vote_b = packet_from_slots(vec![(vote_b_slot, 1)], &keypair_b, None);
         let vote_c = packet_from_slots(vec![(vote_c_slot, 1)], &keypair_c, None);
         let vote_d = packet_from_slots(vec![(4, 1)], &keypair_d, None);
-        let votes = vec![
-            ImmutableDeserializedPacket::new(vote_a.as_ref()).unwrap(),
-            ImmutableDeserializedPacket::new(vote_b.as_ref()).unwrap(),
-            ImmutableDeserializedPacket::new(vote_c.as_ref()).unwrap(),
-            ImmutableDeserializedPacket::new(vote_d.as_ref()).unwrap(),
-        ];
+        let votes = || {
+            vec![
+                to_sanitized_view(vote_a.clone()),
+                to_sanitized_view(vote_b.clone()),
+                to_sanitized_view(vote_c.clone()),
+                to_sanitized_view(vote_d.clone()),
+            ]
+        };
 
         let bank_0 = Bank::new_for_tests(&GenesisConfig::default());
         let mut vote_storage = VoteStorage::new(&bank_0);
 
         // Insert batch should filter out all votes as they are unstaked
-        vote_storage.insert_batch(VoteSource::Tpu, votes.clone().into_iter());
+        vote_storage.insert_batch(VoteSource::Tpu, votes().into_iter());
         assert!(vote_storage.is_empty());
 
         // Bank in same epoch should not update stakes
@@ -699,7 +943,7 @@ mod tests {
         );
         assert_eq!(bank.epoch(), 0);
         vote_storage.cache_epoch_boundary_info(&bank);
-        vote_storage.insert_batch(VoteSource::Tpu, votes.clone().into_iter());
+        vote_storage.insert_batch(VoteSource::Tpu, votes().into_iter());
         assert!(vote_storage.is_empty());
 
         // Bank in next epoch should update stakes
@@ -714,7 +958,7 @@ mod tests {
         );
         assert_eq!(bank.epoch(), 1);
         vote_storage.cache_epoch_boundary_info(&bank);
-        vote_storage.insert_batch(VoteSource::Gossip, votes.clone().into_iter());
+        vote_storage.insert_batch(VoteSource::Gossip, votes().into_iter());
         assert_eq!(vote_storage.len(), 1);
         assert_eq!(
             vote_storage.get_latest_vote_slot(keypair_b.vote_keypair.pubkey()),
@@ -734,7 +978,7 @@ mod tests {
         assert_eq!(bank.epoch(), 2);
         vote_storage.cache_epoch_boundary_info(&bank);
         assert_eq!(vote_storage.len(), 0);
-        vote_storage.insert_batch(VoteSource::Tpu, votes.into_iter());
+        vote_storage.insert_batch(VoteSource::Tpu, votes().into_iter());
         assert_eq!(vote_storage.len(), 1);
         assert_eq!(
             vote_storage.get_latest_vote_slot(keypair_c.vote_keypair.pubkey()),

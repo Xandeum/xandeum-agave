@@ -24,7 +24,7 @@ use {
         message_address_table_lookup::SVMMessageAddressTableLookup, svm_message::SVMMessage,
     },
     solana_transaction::sanitized::SanitizedTransaction,
-    solana_transaction_context::TransactionAccount,
+    solana_transaction_context::transaction_accounts::KeyedAccountSharedData,
     solana_transaction_error::TransactionResult as Result,
     std::{
         cmp::Reverse,
@@ -242,7 +242,7 @@ impl Accounts {
         &self,
         slot: Slot,
         program_id: Option<&Pubkey>,
-    ) -> Vec<TransactionAccount> {
+    ) -> Vec<KeyedAccountSharedData> {
         self.scan_slot(slot, |stored_account| {
             program_id
                 .map(|program_id| program_id == stored_account.owner())
@@ -307,7 +307,7 @@ impl Accounts {
     }
 
     fn load_while_filtering<F: Fn(&AccountSharedData) -> bool>(
-        collector: &mut Vec<TransactionAccount>,
+        collector: &mut Vec<KeyedAccountSharedData>,
         some_account_tuple: Option<(&Pubkey, AccountSharedData, Slot)>,
         filter: F,
     ) {
@@ -325,7 +325,7 @@ impl Accounts {
         bank_id: BankId,
         program_id: &Pubkey,
         config: &ScanConfig,
-    ) -> ScanResult<Vec<TransactionAccount>> {
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let mut collector = Vec::new();
         self.accounts_db
             .scan_accounts(
@@ -348,7 +348,7 @@ impl Accounts {
         program_id: &Pubkey,
         filter: F,
         config: &ScanConfig,
-    ) -> ScanResult<Vec<TransactionAccount>> {
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let mut collector = Vec::new();
         self.accounts_db
             .scan_accounts(
@@ -388,9 +388,9 @@ impl Accounts {
     }
 
     fn maybe_abort_scan(
-        result: ScanResult<Vec<TransactionAccount>>,
+        result: ScanResult<Vec<KeyedAccountSharedData>>,
         config: &ScanConfig,
-    ) -> ScanResult<Vec<TransactionAccount>> {
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         if config.is_aborted() {
             ScanResult::Err(ScanError::Aborted(
                 "The accumulated scan results exceeded the limit".to_string(),
@@ -408,7 +408,7 @@ impl Accounts {
         filter: F,
         config: &ScanConfig,
         byte_limit_for_scan: Option<usize>,
-    ) -> ScanResult<Vec<TransactionAccount>> {
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let sum = AtomicUsize::default();
         let config = config.recreate_with_abort();
         let mut collector = Vec::new();
@@ -841,7 +841,7 @@ mod tests {
                 ..Message::default()
             };
 
-            let txs = vec![new_sanitized_tx(&[&keypair], message, Hash::default())];
+            let txs = [new_sanitized_tx(&[&keypair], message, Hash::default())];
             let results = accounts.lock_accounts(
                 txs.iter(),
                 vec![Ok(()); txs.len()].into_iter(),
@@ -868,7 +868,7 @@ mod tests {
                 ..Message::default()
             };
 
-            let txs = vec![new_sanitized_tx(&[&keypair], message, Hash::default())];
+            let txs = [new_sanitized_tx(&[&keypair], message, Hash::default())];
             let results = accounts.lock_accounts(
                 txs.iter(),
                 vec![Ok(()); txs.len()].into_iter(),
@@ -943,7 +943,7 @@ mod tests {
             instructions,
         );
         let tx1 = new_sanitized_tx(&[&keypair1], message, Hash::default());
-        let txs = vec![tx0, tx1];
+        let txs = [tx0, tx1];
         let results1 = accounts.lock_accounts(
             txs.iter(),
             vec![Ok(()); txs.len()].into_iter(),
@@ -1042,7 +1042,7 @@ mod tests {
         let accounts_clone = accounts_arc.clone();
         let exit_clone = exit.clone();
         thread::spawn(move || loop {
-            let txs = vec![writable_tx.clone()];
+            let txs = [writable_tx.clone()];
             let results = accounts_clone.clone().lock_accounts(
                 txs.iter(),
                 vec![Ok(()); txs.len()].into_iter(),
@@ -1061,7 +1061,7 @@ mod tests {
         });
         let counter_clone = counter;
         for _ in 0..5 {
-            let txs = vec![readonly_tx.clone()];
+            let txs = [readonly_tx.clone()];
             let results = accounts_arc.clone().lock_accounts(
                 txs.iter(),
                 vec![Ok(()); txs.len()].into_iter(),
@@ -1200,7 +1200,7 @@ mod tests {
             instructions,
         );
         let tx2 = new_sanitized_tx(&[&keypair3], message, Hash::default());
-        let txs = vec![tx0, tx1, tx2];
+        let txs = [tx0, tx1, tx2];
 
         let qos_results = vec![
             Ok(()),
@@ -1329,7 +1329,7 @@ mod tests {
 
     #[test]
     fn huge_clean() {
-        solana_logger::setup();
+        agave_logger::setup();
         let accounts_db = AccountsDb::new_single_for_tests();
         let accounts = Accounts::new(Arc::new(accounts_db));
         let mut old_pubkey = Pubkey::default();

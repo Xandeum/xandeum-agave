@@ -139,9 +139,13 @@ impl TransactionStatusService {
                     costs,
                     transaction_indexes,
                 },
-                work_sequence,
+                work_id,
             )) => {
-                let mut status_and_memos_batch = blockstore.get_write_batch()?;
+                let mut status_and_memos_batch = if enable_rpc_transaction_history {
+                    Some(blockstore.get_write_batch()?)
+                } else {
+                    None
+                };
 
                 for (
                     transaction,
@@ -223,13 +227,13 @@ impl TransactionStatusService {
                         transaction_status_meta.return_data.take();
                     }
 
-                    if enable_rpc_transaction_history {
+                    if let Some(batch) = status_and_memos_batch.as_mut() {
                         if let Some(memos) = extract_and_fmt_memos(transaction.message()) {
                             blockstore.add_transaction_memos_to_batch(
                                 transaction.signature(),
                                 slot,
                                 memos,
-                                &mut status_and_memos_batch,
+                                batch,
                             )?;
                         }
 
@@ -246,18 +250,18 @@ impl TransactionStatusService {
                             keys_with_writable,
                             transaction_status_meta,
                             transaction_index,
-                            &mut status_and_memos_batch,
+                            batch,
                         )?;
                     }
                 }
 
-                if enable_rpc_transaction_history {
-                    blockstore.write_batch(status_and_memos_batch)?;
+                if let Some(batch) = status_and_memos_batch {
+                    blockstore.write_batch(batch)?;
                 }
 
                 if let Some(dependency_tracker) = dependency_tracker.as_ref() {
-                    if let Some(work_sequence) = work_sequence {
-                        dependency_tracker.mark_this_and_all_previous_work_processed(work_sequence);
+                    if let Some(work_id) = work_id {
+                        dependency_tracker.mark_this_and_all_previous_work_processed(work_id);
                     }
                 }
             }
@@ -463,6 +467,7 @@ pub(crate) mod tests {
             executed_units: 0,
             fee_details: FeeDetails::default(),
             loaded_account_stats: TransactionLoadedAccountsStats::default(),
+            fee_payer_post_balance: 0,
         });
 
         let balances = TransactionBalancesSet {
@@ -529,7 +534,7 @@ pub(crate) mod tests {
         transaction_status_sender
             .send(TransactionStatusMessage::Batch((
                 transaction_status_batch,
-                None, /* No work sequence */
+                None, /* No work id */
             )))
             .unwrap();
 
@@ -593,6 +598,7 @@ pub(crate) mod tests {
             executed_units: 0,
             fee_details: FeeDetails::default(),
             loaded_account_stats: TransactionLoadedAccountsStats::default(),
+            fee_payer_post_balance: 0,
         });
 
         let balances = TransactionBalancesSet {
@@ -633,11 +639,11 @@ pub(crate) mod tests {
             Some(dependency_tracker.clone()),
             exit.clone(),
         );
-        let work_sequence = 345;
+        let work_id = 345;
         transaction_status_sender
             .send(TransactionStatusMessage::Batch((
                 transaction_status_batch,
-                Some(work_sequence),
+                Some(work_id),
             )))
             .unwrap();
         transaction_status_service.quiesce_and_join_for_tests(exit);

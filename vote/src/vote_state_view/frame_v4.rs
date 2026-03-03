@@ -123,6 +123,7 @@ impl VoteStateFrameV4 {
 mod tests {
     use {
         super::*,
+        serde::{Deserialize, Serialize},
         solana_vote_interface::{
             authorized_voters::AuthorizedVoters,
             state::{LandedVote, Lockout, VoteStateV4, BLS_PUBLIC_KEY_COMPRESSED_SIZE},
@@ -130,6 +131,7 @@ mod tests {
         std::collections::VecDeque,
     };
 
+    #[allow(clippy::large_enum_variant)]
     #[derive(Debug, Clone, Deserialize, Serialize)]
     enum TestVoteStateVersions {
         V0_23_5,

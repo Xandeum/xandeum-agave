@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![deny(clippy::arithmetic_side_effects)]
 #![deny(clippy::indexing_slicing)]
 
@@ -55,9 +64,9 @@ thread_local! {
     pub static MEMORY_POOL: RefCell<VmMemoryPool> = RefCell::new(VmMemoryPool::new());
 }
 
-fn morph_into_deployment_environment_v1(
-    from: Arc<BuiltinProgram<InvokeContext>>,
-) -> Result<BuiltinProgram<InvokeContext>, ElfError> {
+fn morph_into_deployment_environment_v1<'a>(
+    from: Arc<BuiltinProgram<InvokeContext<'a, 'a>>>,
+) -> Result<BuiltinProgram<InvokeContext<'a, 'a>>, ElfError> {
     let mut config = from.get_config().clone();
     config.reject_broken_elfs = true;
     // Once the tests are being build using a toolchain which supports the newer SBPF versions,
@@ -85,7 +94,7 @@ pub fn load_program_from_bytes(
     loader_key: &Pubkey,
     account_size: usize,
     deployment_slot: Slot,
-    program_runtime_environment: Arc<BuiltinProgram<InvokeContext<'static>>>,
+    program_runtime_environment: Arc<BuiltinProgram<InvokeContext<'static, 'static>>>,
     reloading: bool,
 ) -> Result<ProgramCacheEntry, InstructionError> {
     let effective_slot = deployment_slot.saturating_add(DELAY_VISIBILITY_SLOT_OFFSET);
@@ -186,18 +195,17 @@ pub fn deploy_program(
 #[macro_export]
 macro_rules! deploy_program {
     ($invoke_context:expr, $program_id:expr, $loader_key:expr, $account_size:expr, $programdata:expr, $deployment_slot:expr $(,)?) => {
-        let environments = $invoke_context
-            .get_environments_for_slot($deployment_slot.saturating_add(
-                solana_program_runtime::loaded_programs::DELAY_VISIBILITY_SLOT_OFFSET,
-            ))
-            .map_err(|_err| {
-                // This will never fail since the epoch schedule is already configured.
-                InstructionError::ProgramEnvironmentSetupFailure
-            })?;
+        assert_eq!(
+            $deployment_slot,
+            $invoke_context.program_cache_for_tx_batch.slot()
+        );
         let load_program_metrics = $crate::deploy_program(
             $invoke_context.get_log_collector(),
             $invoke_context.program_cache_for_tx_batch,
-            environments.program_runtime_v1.clone(),
+            $invoke_context
+                .get_program_runtime_environments_for_deployment()
+                .program_runtime_v1
+                .clone(),
             $program_id,
             $loader_key,
             $account_size,
@@ -250,13 +258,13 @@ pub fn calculate_heap_cost(heap_size: u32, heap_cost: u64) -> u64 {
 /// Only used in macro, do not use directly!
 #[cfg_attr(feature = "svm-internal", qualifiers(pub))]
 fn create_vm<'a, 'b>(
-    program: &'a Executable<InvokeContext<'b>>,
+    program: &'a Executable<InvokeContext<'b, 'b>>,
     regions: Vec<MemoryRegion>,
     accounts_metadata: Vec<SerializedAccountMetadata>,
-    invoke_context: &'a mut InvokeContext<'b>,
+    invoke_context: &'a mut InvokeContext<'b, 'b>,
     stack: &mut [u8],
     heap: &mut [u8],
-) -> Result<EbpfVm<'a, InvokeContext<'b>>, Box<dyn std::error::Error>> {
+) -> Result<EbpfVm<'a, InvokeContext<'b, 'b>>, Box<dyn std::error::Error>> {
     let stack_size = stack.len();
     let heap_size = heap.len();
     let memory_mapping = create_memory_mapping(
@@ -268,12 +276,11 @@ fn create_vm<'a, 'b>(
         invoke_context
             .get_feature_set()
             .stricter_abi_and_runtime_constraints,
-        invoke_context.account_data_direct_mapping,
+        invoke_context.get_feature_set().account_data_direct_mapping,
     )?;
     invoke_context.set_syscall_context(SyscallContext {
         allocator: BpfAllocator::new(heap_size as u64),
         accounts_metadata,
-        trace_log: Vec::new(),
     })?;
     Ok(EbpfVm::new(
         program.get_loader().clone(),
@@ -358,7 +365,7 @@ fn create_memory_mapping<'a, 'b, C: ContextObject>(
 declare_builtin_function!(
     Entrypoint,
     fn rust(
-        invoke_context: &mut InvokeContext,
+        invoke_context: &mut InvokeContext<'static, 'static>,
         _arg0: u64,
         _arg1: u64,
         _arg2: u64,
@@ -375,8 +382,8 @@ mod migration_authority {
 }
 
 #[cfg_attr(feature = "svm-internal", qualifiers(pub))]
-pub(crate) fn process_instruction_inner(
-    invoke_context: &mut InvokeContext,
+pub(crate) fn process_instruction_inner<'a>(
+    invoke_context: &mut InvokeContext<'a, 'a>,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let log_collector = invoke_context.get_log_collector();
     let transaction_context = &invoke_context.transaction_context;
@@ -1440,15 +1447,16 @@ fn common_close_account(
 
 #[cfg_attr(feature = "svm-internal", qualifiers(pub))]
 fn execute<'a, 'b: 'a>(
-    executable: &'a Executable<InvokeContext<'static>>,
-    invoke_context: &'a mut InvokeContext<'b>,
+    executable: &'a Executable<InvokeContext<'static, 'static>>,
+    invoke_context: &'a mut InvokeContext<'b, 'b>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // We dropped the lifetime tracking in the Executor by setting it to 'static,
     // thus we need to reintroduce the correct lifetime of InvokeContext here again.
     let executable = unsafe {
-        mem::transmute::<&'a Executable<InvokeContext<'static>>, &'a Executable<InvokeContext<'b>>>(
-            executable,
-        )
+        mem::transmute::<
+            &'a Executable<InvokeContext<'static, 'static>>,
+            &'a Executable<InvokeContext<'b, 'b>>,
+        >(executable)
     };
     let log_collector = invoke_context.get_log_collector();
     let transaction_context = &invoke_context.transaction_context;
@@ -1463,17 +1471,22 @@ fn execute<'a, 'b: 'a>(
     let stricter_abi_and_runtime_constraints = invoke_context
         .get_feature_set()
         .stricter_abi_and_runtime_constraints;
+    let account_data_direct_mapping = invoke_context.get_feature_set().account_data_direct_mapping;
     let mask_out_rent_epoch_in_vm_serialization = invoke_context
         .get_feature_set()
         .mask_out_rent_epoch_in_vm_serialization;
+    let provide_instruction_data_offset_in_vm_r2 = invoke_context
+        .get_feature_set()
+        .provide_instruction_data_offset_in_vm_r2;
 
     let mut serialize_time = Measure::start("serialize");
-    let (parameter_bytes, regions, accounts_metadata) = serialization::serialize_parameters(
-        &instruction_context,
-        stricter_abi_and_runtime_constraints,
-        invoke_context.account_data_direct_mapping,
-        mask_out_rent_epoch_in_vm_serialization,
-    )?;
+    let (parameter_bytes, regions, accounts_metadata, instruction_data_offset) =
+        serialization::serialize_parameters(
+            &instruction_context,
+            stricter_abi_and_runtime_constraints,
+            account_data_direct_mapping,
+            mask_out_rent_epoch_in_vm_serialization,
+        )?;
     serialize_time.stop();
 
     // save the account addresses so in case we hit an AccessViolation error we
@@ -1508,7 +1521,13 @@ fn execute<'a, 'b: 'a>(
 
         vm.context_object_pointer.execute_time = Some(Measure::start("execute"));
         vm.registers[1] = ebpf::MM_INPUT_START;
+
+        // SIMD-0321: Provide offset to instruction data in VM register 2.
+        if provide_instruction_data_offset_in_vm_r2 {
+            vm.registers[2] = instruction_data_offset as u64;
+        }
         let (compute_units_consumed, result) = vm.execute_program(executable, !use_jit);
+        let register_trace = std::mem::take(&mut vm.register_trace);
         MEMORY_POOL.with_borrow_mut(|memory_pool| {
             memory_pool.put_stack(stack);
             memory_pool.put_heap(heap);
@@ -1516,6 +1535,7 @@ fn execute<'a, 'b: 'a>(
             debug_assert!(memory_pool.heap_len() <= MAX_INSTRUCTION_STACK_DEPTH);
         });
         drop(vm);
+        invoke_context.insert_register_trace(register_trace);
         if let Some(execute_time) = invoke_context.execute_time.as_mut() {
             execute_time.stop();
             invoke_context.timings.execute_us += execute_time.as_us();
@@ -1539,7 +1559,14 @@ fn execute<'a, 'b: 'a>(
                 Err(Box::new(error) as Box<dyn std::error::Error>)
             }
             ProgramResult::Err(mut error) => {
-                if !matches!(error, EbpfError::SyscallError(_)) {
+                // Don't clean me up!!
+                // This feature is active on all networks, but we still toggle
+                // it off during fuzzing.
+                if invoke_context
+                    .get_feature_set()
+                    .deplete_cu_meter_on_vm_failure
+                    && !matches!(error, EbpfError::SyscallError(_))
+                {
                     // when an exception is thrown during the execution of a
                     // Basic Block (e.g., a null memory dereference or other
                     // faults), determining the exact number of CUs consumed
@@ -1631,13 +1658,14 @@ fn execute<'a, 'b: 'a>(
         invoke_context: &mut InvokeContext,
         parameter_bytes: &[u8],
         stricter_abi_and_runtime_constraints: bool,
+        account_data_direct_mapping: bool,
     ) -> Result<(), InstructionError> {
         serialization::deserialize_parameters(
             &invoke_context
                 .transaction_context
                 .get_current_instruction_context()?,
             stricter_abi_and_runtime_constraints,
-            invoke_context.account_data_direct_mapping,
+            account_data_direct_mapping,
             parameter_bytes,
             &invoke_context.get_syscall_context()?.accounts_metadata,
         )
@@ -1649,6 +1677,7 @@ fn execute<'a, 'b: 'a>(
             invoke_context,
             parameter_bytes.as_slice(),
             stricter_abi_and_runtime_constraints,
+            account_data_direct_mapping,
         )
         .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
     });
@@ -1668,7 +1697,6 @@ mod test_utils {
     use {
         super::*, agave_syscalls::create_program_runtime_environment_v1,
         solana_account::ReadableAccount, solana_loader_v4_interface::state::LoaderV4State,
-        solana_program_runtime::loaded_programs::DELAY_VISIBILITY_SLOT_OFFSET,
         solana_sdk_ids::loader_v4,
     };
 
@@ -1724,9 +1752,6 @@ mod test_utils {
                     program_runtime_environment.clone(),
                     false,
                 ) {
-                    invoke_context
-                        .program_cache_for_tx_batch
-                        .set_slot_for_tests(DELAY_VISIBILITY_SLOT_OFFSET);
                     invoke_context
                         .program_cache_for_tx_batch
                         .store_modified_entry(*pubkey, Arc::new(loaded_program));
@@ -3070,7 +3095,7 @@ mod tests {
                 ),
             ],
             vec![programdata_meta.clone(), new_upgrade_authority_meta.clone()],
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
 
         // Case: new authority not in instruction
@@ -3087,7 +3112,7 @@ mod tests {
                 ),
             ],
             vec![programdata_meta.clone(), upgrade_authority_meta.clone()],
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
 
         // Case: present authority did not sign
@@ -3470,7 +3495,7 @@ mod tests {
             &instruction,
             transaction_accounts.clone(),
             vec![buffer_meta.clone(), new_authority_meta.clone()],
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
 
         // Case: Missing new authority
@@ -3480,7 +3505,7 @@ mod tests {
             &instruction,
             transaction_accounts.clone(),
             vec![buffer_meta.clone(), authority_meta.clone()],
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
 
         // Case: wrong present authority
@@ -3965,6 +3990,9 @@ mod tests {
         invoke_context
             .program_cache_for_tx_batch
             .replenish(program_id, Arc::new(program));
+        invoke_context
+            .program_cache_for_tx_batch
+            .set_slot_for_tests(2);
 
         assert_matches!(
             deploy_test_program(&mut invoke_context, program_id,),
@@ -4004,6 +4032,9 @@ mod tests {
         invoke_context
             .program_cache_for_tx_batch
             .replenish(program_id, Arc::new(program));
+        invoke_context
+            .program_cache_for_tx_batch
+            .set_slot_for_tests(2);
 
         let program_id2 = Pubkey::new_unique();
         assert_matches!(

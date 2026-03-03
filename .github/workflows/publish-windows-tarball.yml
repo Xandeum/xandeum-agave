@@ -68,7 +68,7 @@ jobs:
 
       - name: Upload Artifacts
         if: ${{ steps.build.outputs.channel != '' || steps.build.outputs.tag != '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: windows-artifact
           path: windows-release/
@@ -79,13 +79,13 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Download
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: windows-artifact
           path: ./windows-release
 
       - name: Setup crediential
-        uses: "google-github-actions/auth@v2"
+        uses: "google-github-actions/auth@v3"
         with:
           credentials_json: "${{ secrets.GCS_RELEASE_BUCKET_WRITER_CREDIENTIAL }}"
 
@@ -99,7 +99,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Download
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: windows-artifact
           path: ./windows-release/

@@ -14,6 +14,12 @@ use {
             LastVotedForkSlotsRecord, State as RestartState, WenRestartProgress,
         },
     },
+    agave_snapshots::{
+        paths::{
+            get_highest_full_snapshot_archive_slot, get_highest_incremental_snapshot_archive_slot,
+        },
+        snapshot_archive_info::SnapshotArchiveInfoGetter,
+    },
     anyhow::Result,
     log::*,
     prost::Message,
@@ -35,15 +41,11 @@ use {
         accounts_background_service::AbsStatus,
         bank::Bank,
         bank_forks::BankForks,
-        snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_bank_utils::{
             bank_to_full_snapshot_archive, bank_to_incremental_snapshot_archive,
         },
         snapshot_controller::SnapshotController,
-        snapshot_utils::{
-            get_highest_full_snapshot_archive_slot, get_highest_incremental_snapshot_archive_slot,
-            purge_all_bank_snapshots,
-        },
+        snapshot_utils::purge_all_bank_snapshots,
     },
     solana_shred_version::compute_shred_version,
     solana_svm_timings::ExecuteTimings,
@@ -515,18 +517,6 @@ pub(crate) fn generate_snapshot(
     while abs_status.is_running() {
         std::thread::yield_now();
     }
-    // Similar to waiting for ABS to stop, we also wait for the initial startup
-    // verification to complete.  The startup verification runs in the background
-    // and verifies the snapshot's accounts are correct.  We only want a
-    // single accounts hash calculation to run at a time, and since snapshot
-    // creation below will calculate the accounts hash, we wait for the startup
-    // verification to complete before proceeding.
-    new_root_bank
-        .rc
-        .accounts
-        .accounts_db
-        .verify_accounts_hash_in_bg
-        .join_background_thread();
 
     let snapshot_config = snapshot_controller.snapshot_config();
     let mut directory = &snapshot_config.full_snapshot_archives_dir;
@@ -1421,9 +1411,14 @@ pub(crate) fn write_wen_restart_records(
 mod tests {
     use {
         crate::wen_restart::{tests::wen_restart_proto::LastVotedForkSlotsAggregateFinal, *},
+        agave_snapshots::{
+            paths::build_incremental_snapshot_archive_path,
+            snapshot_config::{SnapshotConfig, SnapshotUsage},
+            snapshot_hash::SnapshotHash,
+        },
         crossbeam_channel::unbounded,
-        solana_accounts_db::hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
         solana_entry::entry::create_ticks,
+        solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
         solana_gossip::{
             cluster_info::ClusterInfo,
             contact_info::ContactInfo,
@@ -1447,16 +1442,13 @@ mod tests {
                 create_genesis_config_with_vote_accounts, GenesisConfigInfo, ValidatorVoteKeypairs,
             },
             snapshot_bank_utils::bank_to_full_snapshot_archive,
-            snapshot_config::{SnapshotConfig, SnapshotUsage},
-            snapshot_hash::SnapshotHash,
-            snapshot_utils::build_incremental_snapshot_archive_path,
         },
         solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
         solana_time_utils::timestamp,
         solana_vote::vote_account::VoteAccount,
         solana_vote_interface::state::{TowerSync, Vote},
-        solana_vote_program::vote_state::create_account_with_authorized,
+        solana_vote_program::vote_state::create_v4_account_with_authorized,
         std::{fs::remove_file, sync::Arc, thread::Builder},
         tempfile::TempDir,
     };
@@ -1964,7 +1956,7 @@ mod tests {
 
     #[test]
     fn test_wen_restart_divergence_across_epoch_boundary() {
-        solana_logger::setup();
+        agave_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let test_state = wen_restart_test_init(&ledger_path);
         let last_vote_slot = test_state.last_voted_fork_slots[0];
@@ -1997,10 +1989,11 @@ mod tests {
                     authorized_voter,
                     (
                         stake,
-                        VoteAccount::try_from(create_account_with_authorized(
+                        VoteAccount::try_from(create_v4_account_with_authorized(
                             &node_id,
                             &authorized_voter,
                             &node_id,
+                            None,
                             0,
                             100,
                         ))
@@ -2137,7 +2130,7 @@ mod tests {
 
     #[test]
     fn test_wen_restart_initialize() {
-        solana_logger::setup();
+        agave_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let test_state = wen_restart_test_init(&ledger_path);
         let last_vote_bankhash = Hash::new_unique();
@@ -2699,7 +2692,7 @@ mod tests {
 
     #[test]
     fn test_increment_and_write_wen_restart_records() {
-        solana_logger::setup();
+        agave_logger::setup();
         let my_dir = TempDir::new().unwrap();
         let mut wen_restart_proto_path = my_dir.path().to_path_buf();
         wen_restart_proto_path.push("wen_restart_status.proto");
@@ -2936,7 +2929,7 @@ mod tests {
 
     #[test]
     fn test_find_heaviest_fork_failures() {
-        solana_logger::setup();
+        agave_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let exit = Arc::new(AtomicBool::new(false));
         let test_state = wen_restart_test_init(&ledger_path);
@@ -3203,7 +3196,7 @@ mod tests {
 
     #[test]
     fn test_generate_snapshot() {
-        solana_logger::setup();
+        agave_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let test_state = wen_restart_test_init(&ledger_path);
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();

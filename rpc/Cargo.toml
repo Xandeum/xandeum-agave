@@ -17,6 +17,7 @@ crate-type = ["lib"]
 name = "solana_rpc"
 
 [features]
+agave-unstable-api = []
 dev-context-only-utils = [
     "solana-ledger/dev-context-only-utils",
     "solana-rpc/dev-context-only-utils",
@@ -24,6 +25,7 @@ dev-context-only-utils = [
 
 [dependencies]
 agave-feature-set = { workspace = true }
+agave-snapshots = { workspace = true }
 base64 = { workspace = true }
 bincode = { workspace = true }
 bs58 = { workspace = true }
@@ -40,7 +42,6 @@ log = { workspace = true }
 rayon = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
-serde_derive = { workspace = true }
 serde_json = { workspace = true }
 soketto = { workspace = true }
 solana-account = { workspace = true }
@@ -78,7 +79,6 @@ solana-send-transaction-service = { workspace = true }
 solana-signature = { workspace = true }
 solana-signer = { workspace = true }
 solana-slot-history = { workspace = true }
-solana-stake-program = { workspace = true }
 solana-storage-bigtable = { workspace = true }
 solana-streamer = { workspace = true }
 solana-svm = { workspace = true }
@@ -132,7 +132,6 @@ solana-sdk-ids = { workspace = true }
 solana-send-transaction-service = { workspace = true, features = ["dev-context-only-utils"] }
 solana-sha256-hasher = { workspace = true }
 solana-stake-interface = { workspace = true }
-solana-stake-program = { workspace = true }
 solana-svm-log-collector = { workspace = true }
 solana-vote-interface = { workspace = true }
 spl-pod = { workspace = true }

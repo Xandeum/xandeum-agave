@@ -36,8 +36,11 @@ impl<D: TransactionData> TransactionView<false, D> {
     }
 
     /// Sanitizes the transaction view, returning a sanitized view on success.
-    pub fn sanitize(self) -> Result<SanitizedTransactionView<D>> {
-        sanitize(&self)?;
+    pub fn sanitize(
+        self,
+        enable_static_instruction_limit: bool,
+    ) -> Result<SanitizedTransactionView<D>> {
+        sanitize(&self, enable_static_instruction_limit)?;
         Ok(SanitizedTransactionView {
             data: self.data,
             frame: self.frame,
@@ -47,9 +50,9 @@ impl<D: TransactionData> TransactionView<false, D> {
 
 impl<D: TransactionData> TransactionView<true, D> {
     /// Creates a new `TransactionView`, running sanitization checks.
-    pub fn try_new_sanitized(data: D) -> Result<Self> {
+    pub fn try_new_sanitized(data: D, enable_static_instruction_limit: bool) -> Result<Self> {
         let unsanitized_view = TransactionView::try_new_unsanitized(data)?;
-        unsanitized_view.sanitize()
+        unsanitized_view.sanitize(enable_static_instruction_limit)
     }
 }
 
@@ -140,7 +143,7 @@ impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
 
     /// Return an iterator over the instructions in the transaction.
     #[inline]
-    pub fn instructions_iter(&self) -> InstructionsIterator {
+    pub fn instructions_iter(&self) -> InstructionsIterator<'_> {
         let data = self.data();
         // SAFETY: `frame` was created from `data`.
         unsafe { self.frame.instructions_iter(data) }
@@ -148,7 +151,7 @@ impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
 
     /// Return an iterator over the address table lookups in the transaction.
     #[inline]
-    pub fn address_table_lookup_iter(&self) -> AddressTableLookupIterator {
+    pub fn address_table_lookup_iter(&self) -> AddressTableLookupIterator<'_> {
         let data = self.data();
         // SAFETY: `frame` was created from `data`.
         unsafe { self.frame.address_table_lookup_iter(data) }
@@ -178,7 +181,7 @@ impl<D: TransactionData> TransactionView<true, D> {
     /// Return an iterator over the instructions paired with their program ids.
     pub fn program_instructions_iter(
         &self,
-    ) -> impl Iterator<Item = (&Pubkey, SVMInstruction)> + Clone {
+    ) -> impl Iterator<Item = (&Pubkey, SVMInstruction<'_>)> + Clone {
         self.instructions_iter().map(|ix| {
             let program_id_index = usize::from(ix.program_id_index);
             let program_id = &self.static_account_keys()[program_id_index];

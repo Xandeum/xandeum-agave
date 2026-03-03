@@ -1,5 +1,6 @@
 use {
     crate::rent_calculator::{check_rent_state, get_account_rent_state, RentState},
+    solana_account::ReadableAccount,
     solana_rent::Rent,
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction_context::{IndexOfAccount, TransactionContext},
@@ -24,7 +25,11 @@ impl TransactionAccountStateInfo {
                         .accounts()
                         .try_borrow(i as IndexOfAccount)
                     {
-                        Some(get_account_rent_state(rent, &account))
+                        Some(get_account_rent_state(
+                            rent,
+                            account.lamports(),
+                            account.data().len(),
+                        ))
                     } else {
                         None
                     };

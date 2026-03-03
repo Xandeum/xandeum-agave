@@ -1,18 +1,32 @@
 use {
-    solana_fee_structure::FeeDetails, solana_program_entrypoint::HEAP_LENGTH, std::num::NonZeroU32,
+    solana_fee_structure::FeeDetails, solana_program_entrypoint::HEAP_LENGTH,
+    solana_transaction_context::MAX_INSTRUCTION_TRACE_LENGTH, std::num::NonZeroU32,
 };
 
 /// Max instruction stack depth. This is the maximum nesting of instructions that can happen during
 /// a transaction.
 pub const MAX_INSTRUCTION_STACK_DEPTH: usize = 5;
-/// Max instruction stack depth with SIMD-0296 enabled. Allows 8 nested CPIs.
-pub const MAX_INSTRUCTION_STACK_DEPTH_SIMD_0296: usize = 9;
+/// Max instruction stack depth with SIMD-0268 enabled. Allows 8 nested CPIs.
+pub const MAX_INSTRUCTION_STACK_DEPTH_SIMD_0268: usize = 9;
 
-fn get_max_instruction_stack_depth(simd_0296_active: bool) -> usize {
-    if simd_0296_active {
-        MAX_INSTRUCTION_STACK_DEPTH_SIMD_0296
+fn get_max_instruction_stack_depth(simd_0268_active: bool) -> usize {
+    if simd_0268_active {
+        MAX_INSTRUCTION_STACK_DEPTH_SIMD_0268
     } else {
         MAX_INSTRUCTION_STACK_DEPTH
+    }
+}
+
+//Default CPI invocation cost
+pub const DEFAULT_INVOCATION_COST: u64 = 1000;
+//CPI Invocation cost with SIMD-0339 active
+pub const INVOKE_UNITS_COST_SIMD_0339: u64 = 946;
+
+fn get_invoke_unit_cost(simd_0339_active: bool) -> u64 {
+    if simd_0339_active {
+        INVOKE_UNITS_COST_SIMD_0339
+    } else {
+        DEFAULT_INVOCATION_COST
     }
 }
 
@@ -65,16 +79,16 @@ pub struct SVMTransactionExecutionBudget {
 #[cfg(feature = "dev-context-only-utils")]
 impl Default for SVMTransactionExecutionBudget {
     fn default() -> Self {
-        Self::new_with_defaults(/* simd_0296_active */ false)
+        Self::new_with_defaults(/* simd_0268_active */ false)
     }
 }
 
 impl SVMTransactionExecutionBudget {
-    pub fn new_with_defaults(simd_0296_active: bool) -> Self {
+    pub fn new_with_defaults(simd_0268_active: bool) -> Self {
         SVMTransactionExecutionBudget {
             compute_unit_limit: u64::from(MAX_COMPUTE_UNIT_LIMIT),
-            max_instruction_stack_depth: get_max_instruction_stack_depth(simd_0296_active),
-            max_instruction_trace_length: 64,
+            max_instruction_stack_depth: get_max_instruction_stack_depth(simd_0268_active),
+            max_instruction_trace_length: MAX_INSTRUCTION_TRACE_LENGTH,
             sha256_max_slices: 20_000,
             max_call_depth: MAX_CALL_DEPTH,
             stack_frame_size: STACK_FRAME_SIZE,
@@ -175,10 +189,16 @@ pub struct SVMTransactionExecutionCost {
 
 impl Default for SVMTransactionExecutionCost {
     fn default() -> Self {
-        Self {
+        Self::new_with_defaults(/* simd_0339_active */ false)
+    }
+}
+
+impl SVMTransactionExecutionCost {
+    pub fn new_with_defaults(simd_0339_active: bool) -> Self {
+        SVMTransactionExecutionCost {
             log_64_units: 100,
             create_program_address_units: 1500,
-            invoke_units: 1000,
+            invoke_units: get_invoke_unit_cost(simd_0339_active),
             sha256_base_cost: 85,
             sha256_byte_cost: 1,
             log_pubkey_units: 100,
@@ -215,9 +235,7 @@ impl Default for SVMTransactionExecutionCost {
             alt_bn128_g2_decompress: 13610,
         }
     }
-}
 
-impl SVMTransactionExecutionCost {
     /// Returns cost of the Poseidon hash function for the given number of
     /// inputs is determined by the following quadratic function:
     ///

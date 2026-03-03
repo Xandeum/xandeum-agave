@@ -1,7 +1,17 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #[derive(Clone, Copy, Default)]
 pub struct SVMFeatureSet {
     pub move_precompile_verification_to_svm: bool,
     pub stricter_abi_and_runtime_constraints: bool,
+    pub account_data_direct_mapping: bool,
     pub enable_bpf_loader_set_authority_checked_ix: bool,
     pub enable_loader_v4: bool,
     pub deplete_cu_meter_on_vm_failure: bool,
@@ -36,6 +46,11 @@ pub struct SVMFeatureSet {
     pub disable_zk_elgamal_proof_program: bool,
     pub reenable_zk_elgamal_proof_program: bool,
     pub raise_cpi_nesting_limit_to_8: bool,
+    pub provide_instruction_data_offset_in_vm_r2: bool,
+    pub increase_cpi_account_info_limit: bool,
+    pub vote_state_v4: bool,
+    pub poseidon_enforce_padding: bool,
+    pub fix_alt_bn128_pairing_length_check: bool,
 }
 
 impl SVMFeatureSet {
@@ -43,6 +58,7 @@ impl SVMFeatureSet {
         Self {
             move_precompile_verification_to_svm: true,
             stricter_abi_and_runtime_constraints: true,
+            account_data_direct_mapping: true,
             enable_bpf_loader_set_authority_checked_ix: true,
             enable_loader_v4: true,
             deplete_cu_meter_on_vm_failure: true,
@@ -77,6 +93,11 @@ impl SVMFeatureSet {
             disable_zk_elgamal_proof_program: true,
             reenable_zk_elgamal_proof_program: true,
             raise_cpi_nesting_limit_to_8: true,
+            provide_instruction_data_offset_in_vm_r2: true,
+            increase_cpi_account_info_limit: true,
+            vote_state_v4: true,
+            poseidon_enforce_padding: true,
+            fix_alt_bn128_pairing_length_check: true,
         }
     }
 }

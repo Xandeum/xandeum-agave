@@ -1,7 +1,8 @@
 use {
+    agave_logger::redirect_stderr_to_file,
     agave_validator::{
-        admin_rpc_service, cli, dashboard::Dashboard, ledger_lockfile, lock_ledger,
-        println_name_value,
+        admin_rpc_service, cli, commands::FromClapArgMatches, dashboard::Dashboard,
+        ledger_lockfile, lock_ledger, println_name_value,
     },
     clap::{crate_name, value_t, value_t_or_exit, values_t_or_exit},
     crossbeam_channel::unbounded,
@@ -16,10 +17,9 @@ use {
     solana_clock::Slot,
     solana_core::consensus::tower_storage::FileTowerStorage,
     solana_epoch_schedule::EpochSchedule,
-    solana_faucet::faucet::run_local_faucet_with_port,
+    solana_faucet::faucet::{run_faucet, Faucet},
     solana_inflation::Inflation,
     solana_keypair::{read_keypair_file, write_keypair_file, Keypair},
-    solana_logger::redirect_stderr_to_file,
     solana_native_token::sol_str_to_lamports,
     solana_pubkey::Pubkey,
     solana_rent::Rent,
@@ -38,7 +38,8 @@ use {
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         process::exit,
-        sync::{Arc, RwLock},
+        sync::{Arc, Mutex, RwLock},
+        thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
 };
@@ -117,13 +118,7 @@ fn main() {
         let _ = fs::remove_file(&validator_log_symlink);
         symlink::symlink_file(&validator_log_with_timestamp, &validator_log_symlink).unwrap();
 
-        Some(
-            ledger_path
-                .join(validator_log_with_timestamp)
-                .into_os_string()
-                .into_string()
-                .unwrap(),
-        )
+        Some(ledger_path.join(validator_log_with_timestamp))
     } else {
         None
     };
@@ -154,8 +149,8 @@ fn main() {
         });
 
     let rpc_port = value_t_or_exit!(matches, "rpc_port", u16);
-    let enable_vote_subscription = matches.is_present("rpc_pubsub_enable_vote_subscription");
-    let enable_block_subscription = matches.is_present("rpc_pubsub_enable_block_subscription");
+    let pub_sub_config =
+        PubSubConfig::from_clap_arg_match(&matches).unwrap_or(PubSubConfig::default_for_tests());
     let faucet_port = value_t_or_exit!(matches, "faucet_port", u16);
     let ticks_per_slot = value_t!(matches, "ticks_per_slot", u64).ok();
     let slots_per_epoch = value_t!(matches, "slots_per_epoch", Slot).ok();
@@ -362,14 +357,19 @@ fn main() {
         .and_then(sol_str_to_lamports);
 
     let (sender, receiver) = unbounded();
-    run_local_faucet_with_port(
-        faucet_keypair,
-        sender,
-        Some(faucet_time_slice_secs),
-        faucet_per_time_cap,
-        faucet_per_request_cap,
-        faucet_addr.port(),
-    );
+    thread::spawn(move || {
+        let faucet = Arc::new(Mutex::new(Faucet::new(
+            faucet_keypair,
+            Some(faucet_time_slice_secs),
+            faucet_per_time_cap,
+            faucet_per_request_cap,
+        )));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(run_faucet(faucet, faucet_addr, Some(sender)));
+    });
     let _ = receiver.recv().expect("run faucet").unwrap_or_else(|err| {
         println!("Error: failed to start faucet: {err}");
         exit(1);
@@ -468,11 +468,7 @@ fn main() {
             faucet_pubkey,
             AccountSharedData::new(faucet_lamports, 0, &system_program::id()),
         )
-        .pubsub_config(PubSubConfig {
-            enable_vote_subscription,
-            enable_block_subscription,
-            ..PubSubConfig::default()
-        })
+        .pubsub_config(pub_sub_config)
         .rpc_port(rpc_port)
         .add_upgradeable_programs_with_path(&upgradeable_programs_to_load)
         .add_accounts_from_json_files(&accounts_to_load)
