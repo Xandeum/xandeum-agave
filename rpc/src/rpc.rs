@@ -293,7 +293,7 @@ impl RpcMetrics {
     pub fn record_success(&self, duration: Duration) {
         self.successful_requests.fetch_add(1, Ordering::Relaxed);
         self.active_requests.fetch_sub(1, Ordering::Relaxed);
-        
+
         let mut times = self.response_times.lock().unwrap();
         times.push(duration);
         // Keep only last 1000 response times
@@ -610,7 +610,9 @@ impl JsonRpcRequestProcessor {
             max_complete_transaction_status_slot: Arc::new(AtomicU64::default()),
             prioritization_fee_cache: Arc::new(PrioritizationFeeCache::default()),
             runtime: service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj),
-            to_dock_push_socket: Arc::new(Mutex::new(zmq::Context::new().socket(zmq::PUSH).unwrap())),
+            to_dock_push_socket: Arc::new(Mutex::new(
+                zmq::Context::new().socket(zmq::PUSH).unwrap(),
+            )),
             transaction_results: Arc::new(Mutex::new(HashMap::new())),
             responses: Arc::new(Mutex::new(HashMap::new())),
             request_id_counter: Arc::new(AtomicU64::new(0)),
@@ -2500,21 +2502,27 @@ impl JsonRpcRequestProcessor {
         let timeout = Instant::now() + Duration::from_secs(timeout_secs);
         const POLL_INTERVAL: Duration = Duration::from_millis(10);
         let mut poll_count = 0;
-        
+
         loop {
             poll_count += 1;
-            
+
             // Check if response has arrived
             if let Some(response) = self.responses.lock().unwrap().remove(&request_id) {
                 let elapsed = start_time.elapsed();
-                info!("Found response for request_id: {} in {:?} after {} polls", request_id, elapsed, poll_count);
+                info!(
+                    "Found response for request_id: {} in {:?} after {} polls",
+                    request_id, elapsed, poll_count
+                );
                 self.metrics.record_success(elapsed);
                 return Ok(response);
             }
-            
+
             // Check timeout
             if Instant::now() > timeout {
-                error!("Timeout waiting for response for request_id: {} after {} polls", request_id, poll_count);
+                error!(
+                    "Timeout waiting for response for request_id: {} after {} polls",
+                    request_id, poll_count
+                );
                 self.metrics.record_timeout();
                 return Err(Error {
                     code: ErrorCode::InternalError,
@@ -2522,12 +2530,15 @@ impl JsonRpcRequestProcessor {
                     data: None,
                 });
             }
-            
+
             // Log every 100 polls
             if poll_count % 100 == 0 {
-                debug!("Still polling for request_id: {}, poll count: {}", request_id, poll_count);
+                debug!(
+                    "Still polling for request_id: {}, poll count: {}",
+                    request_id, poll_count
+                );
             }
-            
+
             // Sleep briefly before next poll
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -2535,34 +2546,43 @@ impl JsonRpcRequestProcessor {
 
     pub fn get_xandeum_result(&self, signature: String) -> Result<TxResponse> {
         info!("Processing getXandeumResult for signature: {}", signature);
-        
+
         // Use a read-write pattern to minimize lock time
         let result = {
             let results = self.transaction_results.lock().unwrap();
             results.get(&signature).cloned()
         };
-        
+
         match result {
             Some(tx_result) => {
                 info!("Found transaction result for signature: {}", signature);
                 Ok(tx_result)
-            },
+            }
             None => {
                 // If not found immediately, wait a short time for pending transactions
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                
+
                 let results = self.transaction_results.lock().unwrap();
                 match results.get(&signature) {
                     Some(tx_result) => {
-                        info!("Found transaction result for signature: {} (after delay)", signature);
+                        info!(
+                            "Found transaction result for signature: {} (after delay)",
+                            signature
+                        );
                         Ok(tx_result.clone())
-                    },
+                    }
                     None => {
-                        error!("Transaction result not found for signature: {}. Cache size: {}", 
-                               signature, results.len());
+                        error!(
+                            "Transaction result not found for signature: {}. Cache size: {}",
+                            signature,
+                            results.len()
+                        );
                         Err(Error {
                             code: ErrorCode::InvalidParams,
-                            message: format!("Transaction result not found for signature: {}", signature),
+                            message: format!(
+                                "Transaction result not found for signature: {}",
+                                signature
+                            ),
                             data: None,
                         })
                     }
@@ -2573,24 +2593,30 @@ impl JsonRpcRequestProcessor {
 
     pub async fn get_metadata(&self, param_str: String) -> Result<ResponseWrapper> {
         info!("Processing getMetadata for path: {}", param_str);
-        
+
         // Check if we're in async context
         let in_runtime = tokio::runtime::Handle::try_current().is_ok();
         info!("In tokio runtime: {}", in_runtime);
-        
+
         let start_time = Instant::now();
         self.metrics.record_request();
-        
+
         // Log metrics periodically
         if self.metrics.total_requests.load(Ordering::Relaxed) % 100 == 0 {
             info!("{}", self.metrics.get_stats());
         }
-        
+
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
-        info!("Generated request_id: {} (as u64) for get_metadata", request_id);
-        
-        info!("Creating request for getMetadata with request_id: {} for path: {}", request_id, param_str);
-        
+        info!(
+            "Generated request_id: {} (as u64) for get_metadata",
+            request_id
+        );
+
+        info!(
+            "Creating request for getMetadata with request_id: {} for path: {}",
+            request_id, param_str
+        );
+
         let request = Request {
             op: Opcode::GetMetadata as i32,
             pubkey: Vec::new(),
@@ -2614,17 +2640,21 @@ impl JsonRpcRequestProcessor {
         // Send request with retries
         const MAX_SEND_ATTEMPTS: u32 = 3;
         let mut sent = false;
-        
+
         for attempt in 0..MAX_SEND_ATTEMPTS {
             let send_result = {
                 // Acquire lock, send, and immediately drop the lock before await
                 let socket = self.to_dock_push_socket.lock().unwrap();
                 socket.send(&request_bytes, zmq::DONTWAIT)
             };
-            
+
             match send_result {
                 Ok(()) => {
-                    info!("Request {} sent successfully (attempt {})", request_id, attempt + 1);
+                    info!(
+                        "Request {} sent successfully (attempt {})",
+                        request_id,
+                        attempt + 1
+                    );
                     sent = true;
                     break;
                 }
@@ -2640,9 +2670,12 @@ impl JsonRpcRequestProcessor {
                 }
             }
         }
-        
-        info!("Send loop completed for request_id: {}, sent: {}", request_id, sent);
-        
+
+        info!(
+            "Send loop completed for request_id: {}, sent: {}",
+            request_id, sent
+        );
+
         if !sent {
             self.metrics.record_send_failure();
             return Err(Error {
@@ -2653,7 +2686,10 @@ impl JsonRpcRequestProcessor {
         }
 
         // Use simple polling instead of channels
-        info!("Starting to poll for response for request_id: {}", request_id);
+        info!(
+            "Starting to poll for response for request_id: {}",
+            request_id
+        );
         self.poll_for_response(request_id, start_time, 30).await
     }
 
@@ -2661,7 +2697,7 @@ impl JsonRpcRequestProcessor {
         info!("Processing isExist for path: {}", param_str);
         let start_time = Instant::now();
         self.metrics.record_request();
-        
+
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
         info!("Generated request_id: {} for is_exist", request_id);
 
@@ -2687,17 +2723,21 @@ impl JsonRpcRequestProcessor {
         // Send request with retries
         const MAX_SEND_ATTEMPTS: u32 = 3;
         let mut sent = false;
-        
+
         for attempt in 0..MAX_SEND_ATTEMPTS {
             let send_result = {
                 // Acquire lock, send, and immediately drop the lock before await
                 let socket = self.to_dock_push_socket.lock().unwrap();
                 socket.send(&request_bytes, zmq::DONTWAIT)
             };
-            
+
             match send_result {
                 Ok(()) => {
-                    log::debug!("Request {} sent successfully (attempt {})", request_id, attempt + 1);
+                    log::debug!(
+                        "Request {} sent successfully (attempt {})",
+                        request_id,
+                        attempt + 1
+                    );
                     sent = true;
                     break;
                 }
@@ -2713,7 +2753,7 @@ impl JsonRpcRequestProcessor {
                 }
             }
         }
-        
+
         if !sent {
             self.metrics.record_send_failure();
             return Err(Error {
@@ -2724,7 +2764,10 @@ impl JsonRpcRequestProcessor {
         }
 
         // Use polling instead of channels
-        info!("Starting to poll for response for request_id: {}", request_id);
+        info!(
+            "Starting to poll for response for request_id: {}",
+            request_id
+        );
         self.poll_for_response(request_id, start_time, 30).await
     }
 
@@ -2732,10 +2775,10 @@ impl JsonRpcRequestProcessor {
         info!("Processing listDirs for path: {}", param_str);
         let start_time = Instant::now();
         self.metrics.record_request();
-        
+
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
         info!("Generated request_id: {} for list_dirs", request_id);
-        
+
         let request = Request {
             op: Opcode::ListDirs as i32,
             pubkey: Vec::new(),
@@ -2758,17 +2801,21 @@ impl JsonRpcRequestProcessor {
         // Send request with retries
         const MAX_SEND_ATTEMPTS: u32 = 3;
         let mut sent = false;
-        
+
         for attempt in 0..MAX_SEND_ATTEMPTS {
             let send_result = {
                 // Acquire lock, send, and immediately drop the lock before await
                 let socket = self.to_dock_push_socket.lock().unwrap();
                 socket.send(&request_bytes, zmq::DONTWAIT)
             };
-            
+
             match send_result {
                 Ok(()) => {
-                    log::debug!("Request {} sent successfully (attempt {})", request_id, attempt + 1);
+                    log::debug!(
+                        "Request {} sent successfully (attempt {})",
+                        request_id,
+                        attempt + 1
+                    );
                     sent = true;
                     break;
                 }
@@ -2784,7 +2831,7 @@ impl JsonRpcRequestProcessor {
                 }
             }
         }
-        
+
         if !sent {
             self.metrics.record_send_failure();
             return Err(Error {
@@ -2795,7 +2842,10 @@ impl JsonRpcRequestProcessor {
         }
 
         // Use polling instead of channels
-        info!("Starting to poll for response for request_id: {}", request_id);
+        info!(
+            "Starting to poll for response for request_id: {}",
+            request_id
+        );
         self.poll_for_response(request_id, start_time, 30).await
     }
 
@@ -2803,10 +2853,10 @@ impl JsonRpcRequestProcessor {
         info!("Processing listDirsOwner for path: {}", param_str);
         let start_time = Instant::now();
         self.metrics.record_request();
-        
+
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
         info!("Generated request_id: {} for list_dirs_owner", request_id);
-        
+
         let request = Request {
             op: Opcode::ListDirsOwner as i32,
             pubkey: Vec::new(),
@@ -2829,17 +2879,21 @@ impl JsonRpcRequestProcessor {
         // Send request with retries
         const MAX_SEND_ATTEMPTS: u32 = 3;
         let mut sent = false;
-        
+
         for attempt in 0..MAX_SEND_ATTEMPTS {
             let send_result = {
                 // Acquire lock, send, and immediately drop the lock before await
                 let socket = self.to_dock_push_socket.lock().unwrap();
                 socket.send(&request_bytes, zmq::DONTWAIT)
             };
-            
+
             match send_result {
                 Ok(()) => {
-                    log::debug!("Request {} sent successfully (attempt {})", request_id, attempt + 1);
+                    log::debug!(
+                        "Request {} sent successfully (attempt {})",
+                        request_id,
+                        attempt + 1
+                    );
                     sent = true;
                     break;
                 }
@@ -2855,7 +2909,7 @@ impl JsonRpcRequestProcessor {
                 }
             }
         }
-        
+
         if !sent {
             self.metrics.record_send_failure();
             return Err(Error {
@@ -2866,7 +2920,10 @@ impl JsonRpcRequestProcessor {
         }
 
         // Use polling instead of channels
-        info!("Starting to poll for response for request_id: {}", request_id);
+        info!(
+            "Starting to poll for response for request_id: {}",
+            request_id
+        );
         self.poll_for_response(request_id, start_time, 30).await
     }
 
@@ -2874,10 +2931,10 @@ impl JsonRpcRequestProcessor {
         info!("Processing find for path: {}", param_str);
         let start_time = Instant::now();
         self.metrics.record_request();
-        
+
         let request_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
         info!("Generated request_id: {} for find", request_id);
-        
+
         let request = Request {
             op: Opcode::Find as i32,
             pubkey: Vec::new(),
@@ -2900,17 +2957,21 @@ impl JsonRpcRequestProcessor {
         // Send request with retries
         const MAX_SEND_ATTEMPTS: u32 = 3;
         let mut sent = false;
-        
+
         for attempt in 0..MAX_SEND_ATTEMPTS {
             let send_result = {
                 // Acquire lock, send, and immediately drop the lock before await
                 let socket = self.to_dock_push_socket.lock().unwrap();
                 socket.send(&request_bytes, zmq::DONTWAIT)
             };
-            
+
             match send_result {
                 Ok(()) => {
-                    log::debug!("Request {} sent successfully (attempt {})", request_id, attempt + 1);
+                    log::debug!(
+                        "Request {} sent successfully (attempt {})",
+                        request_id,
+                        attempt + 1
+                    );
                     sent = true;
                     break;
                 }
@@ -2926,7 +2987,7 @@ impl JsonRpcRequestProcessor {
                 }
             }
         }
-        
+
         if !sent {
             self.metrics.record_send_failure();
             return Err(Error {
@@ -2937,7 +2998,10 @@ impl JsonRpcRequestProcessor {
         }
 
         // Use polling instead of channels
-        info!("Starting to poll for response for request_id: {}", request_id);
+        info!(
+            "Starting to poll for response for request_id: {}",
+            request_id
+        );
         self.poll_for_response(request_id, start_time, 30).await
     }
 }
@@ -3318,13 +3382,29 @@ pub mod rpc_minimal {
         #[rpc(meta, name = "getXandeumResult")]
         fn get_xandeum_result(&self, meta: Self::Metadata, params: String) -> Result<TxResponse>;
         #[rpc(meta, name = "getMetadata")]
-        fn get_metadata(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        fn get_metadata(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>>;
         #[rpc(meta, name = "isExist")]
-        fn is_exist(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        fn is_exist(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>>;
         #[rpc(meta, name = "listDirs")]
-        fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        fn list_dirs(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>>;
         #[rpc(meta, name = "listDirsOwner")]
-        fn list_dirs_owner(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        fn list_dirs_owner(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>>;
         #[rpc(meta, name = "find")]
         fn find(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
     }
@@ -3496,8 +3576,12 @@ pub mod rpc_minimal {
             Ok(h)
         }
 
-        fn get_metadata(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
-            Box::pin(async move { 
+        fn get_metadata(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>> {
+            Box::pin(async move {
                 info!("MinimalImpl::get_metadata called with params: {}", params);
                 let result = meta.get_metadata(params).await;
                 match &result {
@@ -3508,15 +3592,27 @@ pub mod rpc_minimal {
             })
         }
 
-        fn is_exist(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+        fn is_exist(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>> {
             Box::pin(async move { meta.is_exist(params).await })
         }
 
-        fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+        fn list_dirs(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>> {
             Box::pin(async move { meta.list_dirs(params).await })
         }
 
-        fn list_dirs_owner(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+        fn list_dirs_owner(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>> {
             Box::pin(async move { meta.list_dirs_owner(params).await })
         }
 
@@ -4031,7 +4127,10 @@ pub mod rpc_accounts_scan {
 // (rpc_minimal should also be provided by an API node)
 pub mod rpc_full {
     use {
-        super::*, solana_message::{SanitizedVersionedMessage, VersionedMessage}, solana_transaction_status::parse_ui_inner_instructions, xandeum_protos::types::{Opcode, Request}
+        super::*,
+        solana_message::{SanitizedVersionedMessage, VersionedMessage},
+        solana_transaction_status::parse_ui_inner_instructions,
+        xandeum_protos::types::{Opcode, Request},
     };
     #[rpc]
     pub trait Full {
@@ -4189,13 +4288,29 @@ pub mod rpc_full {
         #[rpc(meta, name = "getXandeumResult")]
         fn get_xandeum_result(&self, meta: Self::Metadata, params: String) -> Result<TxResponse>;
         #[rpc(meta, name = "getMetadata")]
-        fn get_metadata(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        fn get_metadata(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>>;
         #[rpc(meta, name = "isExist")]
-        fn is_exist(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        fn is_exist(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>>;
         #[rpc(meta, name = "listDirs")]
-        fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        fn list_dirs(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>>;
         #[rpc(meta, name = "listDirsOwner")]
-        fn list_dirs_owner(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
+        fn list_dirs_owner(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>>;
         #[rpc(meta, name = "find")]
         fn find(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>>;
     }
@@ -4400,6 +4515,8 @@ pub mod rpc_full {
             config: Option<RpcSendTransactionConfig>,
         ) -> Result<String> {
             debug!("send_transaction rpc request received");
+            debug!("ttttttttttttttttttttttttttttttttttttt");
+
             let RpcSendTransactionConfig {
                 skip_preflight,
                 preflight_commitment,
@@ -4436,177 +4553,6 @@ pub mod rpc_full {
                     .is_active(&agave_feature_set::static_instruction_limit::id()),
             )?;
 
-            // StartXandeum
-            let msg = transaction.message();
-            let xand_shield_pubkey =
-                Pubkey::from_str(XAND_SHIELD_PROGRAM_ID).expect("Invalid XAND_SHIELD_PROGRAM_ID");
-
-            let xand_shield_index = match msg {
-                SanitizedMessage::Legacy(ref legacy_msg) => {
-                    // LegacyMessage: use legacy_msg.message directly (no parentheses)
-                    legacy_msg
-                        .message
-                        .account_keys
-                        .iter()
-                        .position(|key| key == &xand_shield_pubkey)
-                }
-                SanitizedMessage::V0(ref v0_msg) => {
-                    // V0: v0_msg.message is a v0::Message with fields directly available
-                    v0_msg
-                        .message
-                        .account_keys
-                        .iter()
-                        .position(|key| key == &xand_shield_pubkey)
-                }
-            };
-            // Checking if the Transaction is Xtransaction or not
-            if let Some(xand_shield_pos) = xand_shield_index {
-                let instructions = match msg {
-                    SanitizedMessage::Legacy(legacy_msg) => &legacy_msg.message.instructions,
-                    SanitizedMessage::V0(v0_msg) => &v0_msg.message.instructions,
-                };
-
-                let has_xand_shield_ix = instructions
-                    .iter()
-                    .any(|ix| ix.program_id_index as usize == xand_shield_pos);
-
-                if has_xand_shield_ix {
-                    let poke_instructions: Vec<_> = instructions
-                        .iter()
-                        .filter(|ix| ix.program_id_index as usize == xand_shield_pos)
-                        .filter(|ix| {
-                            ix.data
-                                .split_first()
-                                .map(|(&op, _)| op == 4)
-                                .unwrap_or(false)
-                        })
-                        .collect();
-
-                    if !poke_instructions.is_empty() {
-                        debug!("Found X Instruction with Poke opcode");
-                        let tx_hash = unsanitized_tx_clone
-                            .signatures
-                            .get(0)
-                            .map(|sig| sig.to_string())
-                            .unwrap_or_else(|| {
-                                warn!("Transaction has no signatures, using default");
-                                "no-signature".to_string()
-                            });
-
-                        for ix in poke_instructions {
-                            if ix.accounts.len() != 2 {
-                                log::error!(
-                                    "Poke instruction must have exactly 2 accounts, skipping"
-                                );
-                                continue;
-                            }
-
-                            let signers: Vec<&Pubkey> = ix
-                                .accounts
-                                .iter()
-                                .filter_map(|&index| {
-                                    if msg.is_signer(index as usize) {
-                                        Some(&msg.static_account_keys()[index as usize])
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-
-                            if signers.len() != 1 {
-                                log::error!(
-                                    "Poke instruction must have exactly 1 signer, skipping"
-                                );
-                                continue;
-                            }
-
-                            let signer = signers[0];
-                            let pda = &msg.static_account_keys()[ix.accounts[1] as usize];
-
-                            // Fetch PDA account data
-                            let pda_data = match preflight_bank.get_account(pda) {
-                                Some(account) => account.data_clone(),
-                                None => {
-                                    log::error!("PDA account {} not found, skipping", pda);
-                                    continue;
-                                }
-                            };
-
-                            match ix.data.split_first() {
-                                Some((op, instruction_data)) => {
-                                    if *op != 4 {
-                                        continue; // Safety check
-                                    }
-                                    let mut request_data = instruction_data.to_vec();
-                                    request_data.extend_from_slice(&pda_data); // Append PDA data
-
-                                    let req = Request {
-                                        op: Opcode::Poke as i32,
-                                        pubkey: signer.to_bytes().to_vec(),
-                                        data: request_data,
-                                        signature: tx_hash.clone(),
-                                    };
-
-                                    if let Ok(req_bytes) = bincode::serialize(&req) {
-                                        match meta.to_dock_push_socket.lock() {
-                                            Ok(socket) => {
-                                                match socket.send(req_bytes, zmq::DONTWAIT) {
-                                                    Ok(()) => log::debug!(
-                                                        "Request sent to docks successfully."
-                                                    ),
-                                                    Err(zmq::Error::EAGAIN) => {
-                                                        log::info!("No Receiver, Skipping")
-                                                    }
-                                                    Err(e) => {
-                                                        log::error!(
-                                                            "Failed to send request to docks: {:?}",
-                                                            e
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log::error!("Failed to lock todock socket: {:?}", e)
-                                            }
-                                        }
-                                    } else {
-                                        log::error!("Failed to serialize request.");
-                                    }
-                                }
-                                None => {
-                                    log::warn!("Poke instruction has empty data, skipping");
-                                    continue;
-                                }
-                            }
-                        }
-
-                        let signature = unsanitized_tx_clone.signatures[0].to_string();
-                        return Ok(signature);
-                    } else {
-                        debug!("Found X Instruction without Poke opcode");
-                        if let Ok(tx_bytes) = bincode::serialize(&unsanitized_tx_clone) {
-                            match meta.to_dock_push_socket.lock() {
-                                Ok(socket) => match socket.send(tx_bytes, zmq::DONTWAIT) {
-                                    Ok(()) => {
-                                        log::debug!("Transaction sent to docks successfully.")
-                                    }
-                                    Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
-                                    Err(e) => {
-                                        log::error!("Failed to send transaction to docks: {:?}", e)
-                                    }
-                                },
-                                Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
-                            }
-                        } else {
-                            log::error!("Failed to serialize transaction.");
-                        }
-
-                        let signature = unsanitized_tx_clone.signatures[0].to_string();
-                        return Ok(signature);
-                    }
-                }
-            }
-            // EndXandeum
             let blockhash = *transaction.message().recent_blockhash();
             let message_hash = *transaction.message_hash();
             let signature = *transaction.signature();
@@ -4701,8 +4647,187 @@ pub mod rpc_full {
                 }
             }
 
-            _send_transaction(
-                meta,
+           
+
+            // StartXandeum
+            let msg = transaction.message();
+            let xand_shield_pubkey =
+                Pubkey::from_str(XAND_SHIELD_PROGRAM_ID).expect("Invalid XAND_SHIELD_PROGRAM_ID");
+
+            let xand_shield_index = match msg {
+                SanitizedMessage::Legacy(ref legacy_msg) => {
+                    // LegacyMessage: use legacy_msg.message directly (no parentheses)
+                    legacy_msg
+                        .message
+                        .account_keys
+                        .iter()
+                        .position(|key| key == &xand_shield_pubkey)
+                }
+                SanitizedMessage::V0(ref v0_msg) => {
+                    // V0: v0_msg.message is a v0::Message with fields directly available
+                    v0_msg
+                        .message
+                        .account_keys
+                        .iter()
+                        .position(|key| key == &xand_shield_pubkey)
+                }
+            };
+            // Checking if the Transaction is Xtransaction or not
+            if let Some(xand_shield_pos) = xand_shield_index {
+                info!("Xandeum transaction detected");
+                let instructions = match msg {
+                    SanitizedMessage::Legacy(legacy_msg) => &legacy_msg.message.instructions,
+                    SanitizedMessage::V0(v0_msg) => &v0_msg.message.instructions,
+                };
+
+                let has_xand_shield_ix = instructions
+                    .iter()
+                    .any(|ix| ix.program_id_index as usize == xand_shield_pos);
+
+                if has_xand_shield_ix {
+                    let poke_instructions: Vec<_> = instructions
+                        .iter()
+                        .filter(|ix| ix.program_id_index as usize == xand_shield_pos)
+                        .filter(|ix| {
+                            // check if the instruction call is for storage tx first
+                            ix.data.first() == Some(&0)  
+                                && ix.data.get(1).map(|&op| op == 4).unwrap_or(false)
+                        })
+                        .collect();
+
+                    if !poke_instructions.is_empty() {
+                        debug!("Found X Instruction with Poke opcode");
+                        let tx_hash = unsanitized_tx_clone
+                            .signatures
+                            .get(0)
+                            .map(|sig| sig.to_string())
+                            .unwrap_or_else(|| {
+                                warn!("Transaction has no signatures, using default");
+                                "no-signature".to_string()
+                            });
+
+                        for ix in poke_instructions {
+                            if ix.accounts.len() != 2 {
+                                log::error!(
+                                    "Poke instruction must have exactly 2 accounts, skipping"
+                                );
+                                continue;
+                            }
+
+                            let signers: Vec<&Pubkey> = ix
+                                .accounts
+                                .iter()
+                                .filter_map(|&index| {
+                                    if msg.is_signer(index as usize) {
+                                        Some(&msg.static_account_keys()[index as usize])
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                            if signers.len() != 1 {
+                                log::error!(
+                                    "Poke instruction must have exactly 1 signer, skipping"
+                                );
+                                continue;
+                            }
+
+                            let signer = signers[0];
+                            let pda = &msg.static_account_keys()[ix.accounts[2] as usize];
+
+                            // Fetch PDA account data
+                            let pda_data = match preflight_bank.get_account(pda) {
+                                Some(account) => account.data_clone(),
+                                None => {
+                                    log::error!("PDA account {} not found, skipping", pda);
+                                    continue;
+                                }
+                            };
+
+                            match ix.data.get(1) {
+                                Some(&op) => {
+                                    if op != 4 {
+                                        continue; // Safety check
+                                    }
+                                    let instruction_data = &ix.data[2..];
+                                    let mut request_data = instruction_data.to_vec();
+                                    request_data.extend_from_slice(&pda_data); // Append PDA data
+
+                                    let req = Request {
+                                        op: Opcode::Poke as i32,
+                                        pubkey: signer.to_bytes().to_vec(),
+                                        data: request_data,
+                                        signature: tx_hash.clone(),
+                                    };
+                                    info!("Sending request to docks : {:?}",req);
+
+                                    if let Ok(req_bytes) = bincode::serialize(&req) {
+                                        match meta.to_dock_push_socket.lock() {
+                                            Ok(socket) => {
+                                                match socket.send(req_bytes, zmq::DONTWAIT) {
+                                                    Ok(()) => log::debug!(
+                                                        "Request sent to docks successfully."
+                                                    ),
+                                                    Err(zmq::Error::EAGAIN) => {
+                                                        log::info!("No Receiver, Skipping")
+                                                    }
+                                                    Err(e) => {
+                                                        log::error!(
+                                                            "Failed to send request to docks: {:?}",
+                                                            e
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::error!("Failed to lock todock socket: {:?}", e)
+                                            }
+                                        }
+                                    } else {
+                                        log::error!("Failed to serialize request.");
+                                    }
+                                }
+                                None => {
+                                    log::warn!("Poke instruction has empty data, skipping");
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // let signature = unsanitized_tx_clone.signatures[0].to_string();
+                        // return Ok(signature);
+                    } else {
+                        debug!("Found X Instruction without Poke opcode");
+                        if let Ok(tx_bytes) = bincode::serialize(&unsanitized_tx_clone) {
+                            match meta.to_dock_push_socket.lock() {
+                                Ok(socket) => match socket.send(tx_bytes, zmq::DONTWAIT) {
+                                    Ok(()) => {
+                                        log::debug!("Transaction sent to docks successfully.")
+                                    }
+                                    Err(zmq::Error::EAGAIN) => log::info!("No Receiver, Skipping"),
+                                    Err(e) => {
+                                        log::error!("Failed to send transaction to docks: {:?}", e)
+                                    }
+                                },
+                                Err(e) => log::error!("Failed to lock todock socket: {:?}", e),
+                            }
+                        } else {
+                            log::error!("Failed to serialize transaction.");
+                        }
+
+                        // let signature = unsanitized_tx_clone.signatures[0].to_string();
+                        // return Ok(signature);
+                    }
+                } else {
+                    info!("No Xandeum tx detected")
+                }
+
+            }
+            // EndXandeum
+
+            let res = _send_transaction(
+                meta.clone(),
                 message_hash,
                 signature,
                 blockhash,
@@ -4710,7 +4835,9 @@ pub mod rpc_full {
                 last_valid_block_height,
                 durable_nonce_info,
                 max_retries,
-            )
+            );
+            info!("resssssss : {:?}",res);
+            res
         }
 
         fn simulate_transaction(
@@ -5086,27 +5213,42 @@ pub mod rpc_full {
             Ok(h)
         }
 
-        fn get_metadata(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+        fn get_metadata(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>> {
             info!("Received GetMetadata with params : {:?}", params);
             Box::pin(async move { meta.get_metadata(params).await })
         }
 
-        fn is_exist(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+        fn is_exist(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>> {
             Box::pin(async move { meta.is_exist(params).await })
         }
 
-        fn list_dirs(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+        fn list_dirs(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>> {
             Box::pin(async move { meta.list_dirs(params).await })
         }
 
-        fn list_dirs_owner(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
+        fn list_dirs_owner(
+            &self,
+            meta: Self::Metadata,
+            params: String,
+        ) -> BoxFuture<Result<ResponseWrapper>> {
             Box::pin(async move { meta.list_dirs_owner(params).await })
         }
 
         fn find(&self, meta: Self::Metadata, params: String) -> BoxFuture<Result<ResponseWrapper>> {
             Box::pin(async move { meta.find(params).await })
         }
-
     }
 }
 
