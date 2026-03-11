@@ -9,10 +9,9 @@ use {
     log::*,
     parking_lot::RwLock,
     solana_derivation_path::{DerivationPath, DerivationPathError},
-    solana_sdk::{
-        pubkey::Pubkey,
-        signature::{Signature, SignerError},
-    },
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
+    solana_signer::SignerError,
     std::{
         rc::Rc,
         time::{Duration, Instant},
@@ -26,7 +25,7 @@ const HID_USB_DEVICE_CLASS: u8 = 0;
 /// Remote wallet error.
 #[derive(Error, Debug, Clone)]
 pub enum RemoteWalletError {
-    #[error("hidapi error")]
+    #[error("hidapi error: {0}")]
     Hid(String),
 
     #[error("device type mismatch")]
@@ -117,7 +116,12 @@ impl RemoteWalletManager {
         let mut detected_devices = vec![];
         let mut errors = vec![];
         for device_info in devices.filter(|&device_info| {
-            is_valid_hid_device(device_info.usage_page(), device_info.interface_number())
+            #[cfg(not(any(feature = "linux-static-libusb", feature = "linux-shared-libusb")))]
+            let is_valid_hid_device =
+                is_valid_hid_device(device_info.usage_page(), device_info.interface_number());
+            #[cfg(any(feature = "linux-static-libusb", feature = "linux-shared-libusb"))]
+            let is_valid_hid_device = true; // libusb backend does not provide DeviceInfo::usage_page()
+            is_valid_hid_device
                 && is_valid_ledger(device_info.vendor_id(), device_info.product_id())
         }) {
             match usb.open_path(device_info.path()) {
@@ -128,7 +132,7 @@ impl RemoteWalletManager {
                         Ok(info) => {
                             ledger.pretty_path = info.get_pretty_path();
                             let path = device_info.path().to_str().unwrap().to_string();
-                            trace!("Found device: {:?}", info);
+                            trace!("Found device: {info:?}");
                             detected_devices.push(Device {
                                 path,
                                 info,
@@ -136,12 +140,12 @@ impl RemoteWalletManager {
                             })
                         }
                         Err(err) => {
-                            error!("Error connecting to ledger device to read info: {}", err);
+                            error!("Error connecting to ledger device to read info: {err}");
                             errors.push(err)
                         }
                     }
                 }
-                Err(err) => error!("Error connecting to ledger device to read info: {}", err),
+                Err(err) => error!("Error connecting to ledger device to read info: {err}"),
             }
         }
 
@@ -199,7 +203,7 @@ impl RemoteWalletManager {
         while start_time.elapsed() <= *max_polling_duration {
             if let Ok(num_devices) = self.update_devices() {
                 let plural = if num_devices == 1 { "" } else { "s" };
-                trace!("{} Remote Wallet{} found", num_devices, plural);
+                trace!("{num_devices} Remote Wallet{plural} found");
                 return true;
             }
         }
@@ -336,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_parse_locator() {
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
         let locator = Locator {
             manufacturer: Manufacturer::Ledger,
             pubkey: Some(pubkey),
@@ -369,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_remote_wallet_info_matches() {
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
         let info = RemoteWalletInfo {
             manufacturer: Manufacturer::Ledger,
             model: "Nano S".to_string(),
@@ -391,7 +395,7 @@ mod tests {
         assert!(info.matches(&test_info));
         test_info.host_device_path = "/host/device/path".to_string();
         assert!(info.matches(&test_info));
-        let another_pubkey = solana_sdk::pubkey::new_rand();
+        let another_pubkey = solana_pubkey::new_rand();
         test_info.pubkey = another_pubkey;
         assert!(!info.matches(&test_info));
         test_info.pubkey = pubkey;
@@ -400,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_get_pretty_path() {
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
         let pubkey_str = pubkey.to_string();
         let remote_wallet_info = RemoteWalletInfo {
             model: "nano-s".to_string(),

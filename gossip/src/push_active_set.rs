@@ -3,7 +3,8 @@ use {
     indexmap::IndexMap,
     rand::Rng,
     solana_bloom::bloom::{Bloom, ConcurrentBloom},
-    solana_sdk::{native_token::LAMPORTS_PER_SOL, pubkey::Pubkey},
+    solana_native_token::LAMPORTS_PER_SOL,
+    solana_pubkey::Pubkey,
     std::collections::HashMap,
 };
 
@@ -31,13 +32,10 @@ impl PushActiveSet {
         &'a self,
         pubkey: &'a Pubkey, // This node.
         origin: &'a Pubkey, // CRDS value owner.
-        // If true forces gossip push even if the node has pruned the origin.
-        should_force_push: impl FnMut(&Pubkey) -> bool + 'a,
         stakes: &HashMap<Pubkey, u64>,
     ) -> impl Iterator<Item = &'a Pubkey> + 'a {
         let stake = stakes.get(pubkey).min(stakes.get(origin));
-        self.get_entry(stake)
-            .get_nodes(pubkey, origin, should_force_push)
+        self.get_entry(stake).get_nodes(pubkey, origin)
     }
 
     // Prunes origins for the given gossip node.
@@ -113,8 +111,6 @@ impl PushActiveSetEntry {
         &'a self,
         pubkey: &'a Pubkey, // This node.
         origin: &'a Pubkey, // CRDS value owner.
-        // If true forces gossip push even if the node has pruned the origin.
-        mut should_force_push: impl FnMut(&Pubkey) -> bool + 'a,
     ) -> impl Iterator<Item = &'a Pubkey> + 'a {
         let pubkey_eq_origin = pubkey == origin;
         self.0
@@ -122,9 +118,7 @@ impl PushActiveSetEntry {
             .filter(move |(node, bloom_filter)| {
                 // Bloom filter can return false positive for origin == pubkey
                 // but a node should always be able to push its own values.
-                !bloom_filter.contains(origin)
-                    || (pubkey_eq_origin && &pubkey != node)
-                    || should_force_push(node)
+                !bloom_filter.contains(origin) || (pubkey_eq_origin && &pubkey != node)
             })
             .map(|(node, _bloom_filter)| node)
     }
@@ -149,8 +143,8 @@ impl PushActiveSetEntry {
     ) {
         debug_assert_eq!(nodes.len(), weights.len());
         debug_assert!(weights.iter().all(|&weight| weight != 0u64));
-        let shuffle = WeightedShuffle::new("rotate-active-set", weights).shuffle(rng);
-        for node in shuffle.map(|k| &nodes[k]) {
+        let mut weighted_shuffle = WeightedShuffle::<u64>::new("rotate-active-set", weights);
+        for node in weighted_shuffle.shuffle(rng).map(|k| &nodes[k]) {
             // We intend to discard the oldest/first entry in the index-map.
             if self.0.len() > size {
                 break;
@@ -233,37 +227,37 @@ mod tests {
         let other = &nodes[5];
         let origin = &nodes[17];
         assert!(active_set
-            .get_nodes(&pubkey, origin, |_| false, &stakes)
+            .get_nodes(&pubkey, origin, &stakes)
             .eq([13, 5, 18, 16, 0].into_iter().map(|k| &nodes[k])));
         assert!(active_set
-            .get_nodes(&pubkey, other, |_| false, &stakes)
+            .get_nodes(&pubkey, other, &stakes)
             .eq([13, 18, 16, 0].into_iter().map(|k| &nodes[k])));
         active_set.prune(&pubkey, &nodes[5], &[*origin], &stakes);
         active_set.prune(&pubkey, &nodes[3], &[*origin], &stakes);
         active_set.prune(&pubkey, &nodes[16], &[*origin], &stakes);
         assert!(active_set
-            .get_nodes(&pubkey, origin, |_| false, &stakes)
+            .get_nodes(&pubkey, origin, &stakes)
             .eq([13, 18, 0].into_iter().map(|k| &nodes[k])));
         assert!(active_set
-            .get_nodes(&pubkey, other, |_| false, &stakes)
+            .get_nodes(&pubkey, other, &stakes)
             .eq([13, 18, 16, 0].into_iter().map(|k| &nodes[k])));
         active_set.rotate(&mut rng, 7, CLUSTER_SIZE, &nodes, &stakes);
         assert!(active_set.0.iter().all(|entry| entry.0.len() == 7));
         assert!(active_set
-            .get_nodes(&pubkey, origin, |_| false, &stakes)
+            .get_nodes(&pubkey, origin, &stakes)
             .eq([18, 0, 7, 15, 11].into_iter().map(|k| &nodes[k])));
         assert!(active_set
-            .get_nodes(&pubkey, other, |_| false, &stakes)
+            .get_nodes(&pubkey, other, &stakes)
             .eq([18, 16, 0, 7, 15, 11].into_iter().map(|k| &nodes[k])));
         let origins = [*origin, *other];
         active_set.prune(&pubkey, &nodes[18], &origins, &stakes);
         active_set.prune(&pubkey, &nodes[0], &origins, &stakes);
         active_set.prune(&pubkey, &nodes[15], &origins, &stakes);
         assert!(active_set
-            .get_nodes(&pubkey, origin, |_| false, &stakes)
+            .get_nodes(&pubkey, origin, &stakes)
             .eq([7, 11].into_iter().map(|k| &nodes[k])));
         assert!(active_set
-            .get_nodes(&pubkey, other, |_| false, &stakes)
+            .get_nodes(&pubkey, other, &stakes)
             .eq([16, 7, 11].into_iter().map(|k| &nodes[k])));
     }
 
@@ -286,11 +280,10 @@ mod tests {
         assert!(entry.0.keys().eq(keys));
         for (pubkey, origin) in iproduct!(&nodes, &nodes) {
             if !keys.contains(&origin) {
-                assert!(entry.get_nodes(pubkey, origin, |_| false).eq(keys));
+                assert!(entry.get_nodes(pubkey, origin).eq(keys));
             } else {
-                assert!(entry.get_nodes(pubkey, origin, |_| true).eq(keys));
                 assert!(entry
-                    .get_nodes(pubkey, origin, |_| false)
+                    .get_nodes(pubkey, origin)
                     .eq(keys.into_iter().filter(|&key| key != origin)));
             }
         }
@@ -299,9 +292,8 @@ mod tests {
             assert!(filter.contains(node));
         }
         for (pubkey, origin) in iproduct!(&nodes, keys) {
-            assert!(entry.get_nodes(pubkey, origin, |_| true).eq(keys));
             assert!(entry
-                .get_nodes(pubkey, origin, |_| false)
+                .get_nodes(pubkey, origin)
                 .eq(keys.into_iter().filter(|&node| node != origin)));
         }
         // Assert that prune excludes node from get.
@@ -310,8 +302,7 @@ mod tests {
         entry.prune(&nodes[14], origin);
         entry.prune(&nodes[19], origin);
         for pubkey in &nodes {
-            assert!(entry.get_nodes(pubkey, origin, |_| true).eq(keys));
-            assert!(entry.get_nodes(pubkey, origin, |_| false).eq(keys
+            assert!(entry.get_nodes(pubkey, origin).eq(keys
                 .into_iter()
                 .filter(|&&node| pubkey == origin || (node != nodes[11] && node != nodes[14]))));
         }

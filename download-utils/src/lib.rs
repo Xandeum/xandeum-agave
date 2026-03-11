@@ -1,13 +1,23 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 pub use solana_file_download::DownloadProgressRecord;
 use {
-    log::*,
-    solana_file_download::{download_file, DownloadProgressCallbackOption},
-    solana_runtime::{
-        snapshot_hash::SnapshotHash,
-        snapshot_package::SnapshotKind,
-        snapshot_utils::{self, ArchiveFormat},
+    agave_snapshots::{
+        paths as snapshot_paths, snapshot_hash::SnapshotHash, ArchiveFormat, SnapshotKind,
+        ZstdConfig,
     },
-    solana_sdk::{clock::Slot, genesis_config::DEFAULT_GENESIS_ARCHIVE},
+    log::*,
+    solana_clock::Slot,
+    solana_file_download::{download_file, DownloadProgressCallbackOption},
+    solana_genesis_config::DEFAULT_GENESIS_ARCHIVE,
+    solana_runtime::snapshot_utils,
     std::{
         fs,
         net::SocketAddr,
@@ -60,28 +70,27 @@ pub fn download_snapshot_archive(
     );
 
     let snapshot_archives_remote_dir =
-        snapshot_utils::build_snapshot_archives_remote_dir(match snapshot_kind {
+        snapshot_paths::build_snapshot_archives_remote_dir(match snapshot_kind {
             SnapshotKind::FullSnapshot => full_snapshot_archives_dir,
             SnapshotKind::IncrementalSnapshot(_) => incremental_snapshot_archives_dir,
         });
     fs::create_dir_all(&snapshot_archives_remote_dir).unwrap();
 
     for archive_format in [
-        ArchiveFormat::TarZstd,
-        ArchiveFormat::TarGzip,
-        ArchiveFormat::TarBzip2,
+        ArchiveFormat::TarZstd {
+            config: ZstdConfig::default(),
+        },
         ArchiveFormat::TarLz4,
-        ArchiveFormat::Tar,
     ] {
         let destination_path = match snapshot_kind {
-            SnapshotKind::FullSnapshot => snapshot_utils::build_full_snapshot_archive_path(
+            SnapshotKind::FullSnapshot => snapshot_paths::build_full_snapshot_archive_path(
                 &snapshot_archives_remote_dir,
                 desired_snapshot_hash.0,
                 &desired_snapshot_hash.1,
                 archive_format,
             ),
             SnapshotKind::IncrementalSnapshot(base_slot) => {
-                snapshot_utils::build_incremental_snapshot_archive_path(
+                snapshot_paths::build_incremental_snapshot_archive_path(
                     &snapshot_archives_remote_dir,
                     base_slot,
                     desired_snapshot_hash.0,
@@ -106,7 +115,7 @@ pub fn download_snapshot_archive(
             progress_notify_callback,
         ) {
             Ok(()) => return Ok(()),
-            Err(err) => info!("{}", err),
+            Err(err) => info!("{err}"),
         }
     }
     Err(format!(

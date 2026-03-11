@@ -6,7 +6,9 @@ use {
         transaction_version::TransactionVersion,
     },
     core::fmt::{Debug, Formatter},
-    solana_sdk::{hash::Hash, pubkey::Pubkey, signature::Signature},
+    solana_hash::Hash,
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
     solana_svm_transaction::instruction::SVMInstruction,
 };
 
@@ -34,8 +36,11 @@ impl<D: TransactionData> TransactionView<false, D> {
     }
 
     /// Sanitizes the transaction view, returning a sanitized view on success.
-    pub fn sanitize(self) -> Result<SanitizedTransactionView<D>> {
-        sanitize(&self)?;
+    pub fn sanitize(
+        self,
+        enable_static_instruction_limit: bool,
+    ) -> Result<SanitizedTransactionView<D>> {
+        sanitize(&self, enable_static_instruction_limit)?;
         Ok(SanitizedTransactionView {
             data: self.data,
             frame: self.frame,
@@ -45,9 +50,9 @@ impl<D: TransactionData> TransactionView<false, D> {
 
 impl<D: TransactionData> TransactionView<true, D> {
     /// Creates a new `TransactionView`, running sanitization checks.
-    pub fn try_new_sanitized(data: D) -> Result<Self> {
+    pub fn try_new_sanitized(data: D, enable_static_instruction_limit: bool) -> Result<Self> {
         let unsanitized_view = TransactionView::try_new_unsanitized(data)?;
-        unsanitized_view.sanitize()
+        unsanitized_view.sanitize(enable_static_instruction_limit)
     }
 }
 
@@ -138,7 +143,7 @@ impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
 
     /// Return an iterator over the instructions in the transaction.
     #[inline]
-    pub fn instructions_iter(&self) -> InstructionsIterator {
+    pub fn instructions_iter(&self) -> InstructionsIterator<'_> {
         let data = self.data();
         // SAFETY: `frame` was created from `data`.
         unsafe { self.frame.instructions_iter(data) }
@@ -146,7 +151,7 @@ impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
 
     /// Return an iterator over the address table lookups in the transaction.
     #[inline]
-    pub fn address_table_lookup_iter(&self) -> AddressTableLookupIterator {
+    pub fn address_table_lookup_iter(&self) -> AddressTableLookupIterator<'_> {
         let data = self.data();
         // SAFETY: `frame` was created from `data`.
         unsafe { self.frame.address_table_lookup_iter(data) }
@@ -164,12 +169,19 @@ impl<const SANITIZED: bool, D: TransactionData> TransactionView<SANITIZED, D> {
     pub fn message_data(&self) -> &[u8] {
         &self.data()[usize::from(self.frame.message_offset())..]
     }
+
+    #[inline]
+    pub fn into_inner_data(self) -> D {
+        self.data
+    }
 }
 
 // Implementation that relies on sanitization checks having been run.
 impl<D: TransactionData> TransactionView<true, D> {
     /// Return an iterator over the instructions paired with their program ids.
-    pub fn program_instructions_iter(&self) -> impl Iterator<Item = (&Pubkey, SVMInstruction)> {
+    pub fn program_instructions_iter(
+        &self,
+    ) -> impl Iterator<Item = (&Pubkey, SVMInstruction<'_>)> + Clone {
         self.instructions_iter().map(|ix| {
             let program_id_index = usize::from(ix.program_id_index);
             let program_id = &self.static_account_keys()[program_id_index];
@@ -205,6 +217,19 @@ impl<D: TransactionData> TransactionView<true, D> {
             .wrapping_add(self.total_writable_lookup_accounts())
             .wrapping_add(self.total_readonly_lookup_accounts())
     }
+
+    /// Return the number of requested writable keys.
+    #[inline]
+    pub fn num_requested_write_locks(&self) -> u64 {
+        u64::from(
+            u16::from(
+                (self.num_static_account_keys())
+                    .wrapping_sub(self.num_readonly_signed_static_accounts())
+                    .wrapping_sub(self.num_readonly_unsigned_static_accounts()),
+            )
+            .wrapping_add(self.total_writable_lookup_accounts()),
+        )
+    }
 }
 
 // Manual implementation of `Debug` - avoids bound on `D`.
@@ -226,13 +251,11 @@ impl<const SANITIZED: bool, D: TransactionData> Debug for TransactionView<SANITI
 mod tests {
     use {
         super::*,
-        solana_sdk::{
-            message::{Message, VersionedMessage},
-            pubkey::Pubkey,
-            signature::Signature,
-            system_instruction::{self},
-            transaction::VersionedTransaction,
-        },
+        solana_message::{Message, VersionedMessage},
+        solana_pubkey::Pubkey,
+        solana_signature::Signature,
+        solana_system_interface::instruction as system_instruction,
+        solana_transaction::versioned::VersionedTransaction,
     };
 
     fn verify_transaction_view_frame(tx: &VersionedTransaction) {

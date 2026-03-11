@@ -1,43 +1,45 @@
 use {
+    agave_logger::redirect_stderr_to_file,
     agave_validator::{
-        admin_rpc_service, cli, dashboard::Dashboard, ledger_lockfile, lock_ledger,
-        println_name_value, redirect_stderr_to_file,
+        admin_rpc_service, cli, commands::FromClapArgMatches, dashboard::Dashboard,
+        ledger_lockfile, lock_ledger, println_name_value,
     },
     clap::{crate_name, value_t, value_t_or_exit, values_t_or_exit},
     crossbeam_channel::unbounded,
     itertools::Itertools,
     log::*,
+    solana_account::AccountSharedData,
     solana_accounts_db::accounts_index::{AccountIndex, AccountSecondaryIndexes},
     solana_clap_utils::{
         input_parsers::{pubkey_of, pubkeys_of, value_of},
         input_validators::normalize_to_url_if_moniker,
     },
+    solana_clock::Slot,
     solana_core::consensus::tower_storage::FileTowerStorage,
-    solana_faucet::faucet::run_local_faucet_with_port,
+    solana_epoch_schedule::EpochSchedule,
+    solana_faucet::faucet::{run_faucet, Faucet},
+    solana_inflation::Inflation,
+    solana_keypair::{read_keypair_file, write_keypair_file, Keypair},
+    solana_native_token::sol_str_to_lamports,
+    solana_pubkey::Pubkey,
+    solana_rent::Rent,
     solana_rpc::{
         rpc::{JsonRpcConfig, RpcBigtableConfig},
         rpc_pubsub_service::PubSubConfig,
     },
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        account::AccountSharedData,
-        clock::Slot,
-        epoch_schedule::EpochSchedule,
-        native_token::sol_to_lamports,
-        pubkey::Pubkey,
-        rent::Rent,
-        signature::{read_keypair_file, write_keypair_file, Keypair, Signer},
-        system_program,
-    },
+    solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
+    solana_system_interface::program as system_program,
     solana_test_validator::*,
     std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         fs, io,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         process::exit,
-        sync::{Arc, RwLock},
+        sync::{Arc, Mutex, RwLock},
+        thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
 };
@@ -116,13 +118,7 @@ fn main() {
         let _ = fs::remove_file(&validator_log_symlink);
         symlink::symlink_file(&validator_log_with_timestamp, &validator_log_symlink).unwrap();
 
-        Some(
-            ledger_path
-                .join(validator_log_with_timestamp)
-                .into_os_string()
-                .into_string()
-                .unwrap(),
-        )
+        Some(ledger_path.join(validator_log_with_timestamp))
     } else {
         None
     };
@@ -153,12 +149,14 @@ fn main() {
         });
 
     let rpc_port = value_t_or_exit!(matches, "rpc_port", u16);
-    let enable_vote_subscription = matches.is_present("rpc_pubsub_enable_vote_subscription");
-    let enable_block_subscription = matches.is_present("rpc_pubsub_enable_block_subscription");
+    let pub_sub_config =
+        PubSubConfig::from_clap_arg_match(&matches).unwrap_or(PubSubConfig::default_for_tests());
     let faucet_port = value_t_or_exit!(matches, "faucet_port", u16);
     let ticks_per_slot = value_t!(matches, "ticks_per_slot", u64).ok();
     let slots_per_epoch = value_t!(matches, "slots_per_epoch", Slot).ok();
+    let inflation_fixed = value_t!(matches, "inflation_fixed", f64).ok();
     let gossip_host = matches.value_of("gossip_host").map(|gossip_host| {
+        warn!("--gossip-host is deprecated. Use --bind-address instead.");
         solana_net_utils::parse_host(gossip_host).unwrap_or_else(|err| {
             eprintln!("Failed to parse --gossip-host: {err}");
             exit(1);
@@ -171,12 +169,24 @@ fn main() {
             exit(1);
         })
     });
-    let bind_address = matches.value_of("bind_address").map(|bind_address| {
-        solana_net_utils::parse_host(bind_address).unwrap_or_else(|err| {
-            eprintln!("Failed to parse --bind-address: {err}");
-            exit(1);
-        })
+    let bind_address = solana_net_utils::parse_host(
+        matches
+            .value_of("bind_address")
+            .expect("Bind address has default value"),
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("Failed to parse --bind-address: {err}");
+        exit(1);
     });
+
+    let advertised_ip = if let Some(ip) = gossip_host {
+        ip
+    } else if !bind_address.is_unspecified() && !bind_address.is_loopback() {
+        bind_address
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    };
+
     let compute_unit_limit = value_t!(matches, "compute_unit_limit", u64).ok();
 
     let faucet_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), faucet_port);
@@ -211,7 +221,7 @@ fn main() {
 
             upgradeable_programs_to_load.push(UpgradeableProgramInfo {
                 program_id: address,
-                loader: solana_sdk::bpf_loader_upgradeable::id(),
+                loader: solana_sdk_ids::bpf_loader_upgradeable::id(),
                 upgrade_authority: Pubkey::default(),
                 program_path,
             });
@@ -240,7 +250,7 @@ fn main() {
 
             upgradeable_programs_to_load.push(UpgradeableProgramInfo {
                 program_id: address,
-                loader: solana_sdk::bpf_loader_upgradeable::id(),
+                loader: solana_sdk_ids::bpf_loader_upgradeable::id(),
                 upgrade_authority: upgrade_authority_address,
                 program_path,
             });
@@ -281,6 +291,10 @@ fn main() {
             .map(|v| v.into_iter().collect())
             .unwrap_or_default();
 
+    let alt_accounts_to_clone: HashSet<_> = pubkeys_of(&matches, "deep_clone_address_lookup_table")
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default();
+
     let clone_feature_set = matches.is_present("clone_feature_set");
 
     let warp_slot = if matches.is_present("warp_slot") {
@@ -305,7 +319,10 @@ fn main() {
         None
     };
 
-    let faucet_lamports = sol_to_lamports(value_of(&matches, "faucet_sol").unwrap());
+    let faucet_lamports = matches
+        .value_of("faucet_sol")
+        .and_then(sol_str_to_lamports)
+        .unwrap();
     let faucet_keypair_file = ledger_path.join("faucet-keypair.json");
     if !faucet_keypair_file.exists() {
         write_keypair_file(&Keypair::new(), faucet_keypair_file.to_str().unwrap()).unwrap_or_else(
@@ -332,22 +349,27 @@ fn main() {
     let faucet_pubkey = faucet_keypair.pubkey();
 
     let faucet_time_slice_secs = value_t_or_exit!(matches, "faucet_time_slice_secs", u64);
-    let faucet_per_time_cap = value_t!(matches, "faucet_per_time_sol_cap", f64)
-        .ok()
-        .map(sol_to_lamports);
-    let faucet_per_request_cap = value_t!(matches, "faucet_per_request_sol_cap", f64)
-        .ok()
-        .map(sol_to_lamports);
+    let faucet_per_time_cap = matches
+        .value_of("faucet_per_time_sol_cap")
+        .and_then(sol_str_to_lamports);
+    let faucet_per_request_cap = matches
+        .value_of("faucet_per_request_sol_cap")
+        .and_then(sol_str_to_lamports);
 
     let (sender, receiver) = unbounded();
-    run_local_faucet_with_port(
-        faucet_keypair,
-        sender,
-        Some(faucet_time_slice_secs),
-        faucet_per_time_cap,
-        faucet_per_request_cap,
-        faucet_addr.port(),
-    );
+    thread::spawn(move || {
+        let faucet = Arc::new(Mutex::new(Faucet::new(
+            faucet_keypair,
+            Some(faucet_time_slice_secs),
+            faucet_per_time_cap,
+            faucet_per_request_cap,
+        )));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(run_faucet(faucet, faucet_addr, Some(sender)));
+    });
     let _ = receiver.recv().expect("run faucet").unwrap_or_else(|err| {
         println!("Error: failed to start faucet: {err}");
         exit(1);
@@ -363,6 +385,7 @@ fn main() {
             ("mint_address", "--mint"),
             ("ticks_per_slot", "--ticks-per-slot"),
             ("slots_per_epoch", "--slots-per-epoch"),
+            ("inflation_fixed", "--inflation-fixed"),
             ("faucet_sol", "--faucet-sol"),
             ("deactivate_feature", "--deactivate-feature"),
         ] {
@@ -402,6 +425,7 @@ fn main() {
             start_progress: genesis.start_progress.clone(),
             start_time: std::time::SystemTime::now(),
             validator_exit: genesis.validator_exit.clone(),
+            validator_exit_backpressure: HashMap::default(),
             authorized_voter_keypairs: genesis.authorized_voter_keypairs.clone(),
             staked_nodes_overrides: genesis.staked_nodes_overrides.clone(),
             post_init: admin_service_post_init,
@@ -410,14 +434,11 @@ fn main() {
         },
     );
     let dashboard = if output == Output::Dashboard {
-        Some(
-            Dashboard::new(
-                &ledger_path,
-                Some(&validator_log_symlink),
-                Some(&mut genesis.validator_exit.write().unwrap()),
-            )
-            .unwrap(),
-        )
+        Some(Dashboard::new(
+            &ledger_path,
+            Some(&validator_log_symlink),
+            Some(&mut genesis.validator_exit.write().unwrap()),
+        ))
     } else {
         None
     };
@@ -447,11 +468,7 @@ fn main() {
             faucet_pubkey,
             AccountSharedData::new(faucet_lamports, 0, &system_program::id()),
         )
-        .pubsub_config(PubSubConfig {
-            enable_vote_subscription,
-            enable_block_subscription,
-            ..PubSubConfig::default()
-        })
+        .pubsub_config(pub_sub_config)
         .rpc_port(rpc_port)
         .add_upgradeable_programs_with_path(&upgradeable_programs_to_load)
         .add_accounts_from_json_files(&accounts_to_load)
@@ -484,6 +501,18 @@ fn main() {
             false,
         ) {
             println!("Error: clone_accounts failed: {e}");
+            exit(1);
+        }
+    }
+
+    if !alt_accounts_to_clone.is_empty() {
+        if let Err(e) = genesis.deep_clone_address_lookup_table_accounts(
+            alt_accounts_to_clone,
+            cluster_rpc_client
+                .as_ref()
+                .expect("--deep-clone-address-lookup-table requires --json-rpc-url argument"),
+        ) {
+            println!("Error: alt_accounts_to_clone failed: {e}");
             exit(1);
         }
     }
@@ -542,9 +571,11 @@ fn main() {
         genesis.rent = Rent::with_slots_per_epoch(slots_per_epoch);
     }
 
-    if let Some(gossip_host) = gossip_host {
-        genesis.gossip_host(gossip_host);
+    if let Some(inflation_fixed) = inflation_fixed {
+        genesis.inflation(Inflation::new_fixed(inflation_fixed));
     }
+
+    genesis.gossip_host(advertised_ip);
 
     if let Some(gossip_port) = gossip_port {
         genesis.gossip_port(gossip_port);
@@ -554,9 +585,7 @@ fn main() {
         genesis.port_range(dynamic_port_range);
     }
 
-    if let Some(bind_address) = bind_address {
-        genesis.bind_ip_addr(bind_address);
-    }
+    genesis.bind_ip_addr(bind_address);
 
     if matches.is_present("geyser_plugin_config") {
         genesis.geyser_plugin_config_files = Some(

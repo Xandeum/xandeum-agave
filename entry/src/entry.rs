@@ -10,40 +10,42 @@ use {
     rand::{thread_rng, Rng},
     rayon::{prelude::*, ThreadPool},
     serde::{Deserialize, Serialize},
+    solana_hash::Hash,
     solana_measure::measure::Measure,
     solana_merkle_tree::MerkleTree,
     solana_metrics::*,
+    solana_packet::Meta,
     solana_perf::{
         cuda_runtime::PinnedVec,
-        packet::{Packet, PacketBatch, PacketBatchRecycler, PACKETS_PER_BATCH},
+        packet::{Packet, PacketBatch, PacketBatchRecycler, PinnedPacketBatch, PACKETS_PER_BATCH},
         perf_libs,
         recycler::Recycler,
         sigverify,
     },
-    solana_rayon_threadlimit::get_max_thread_count,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
-    solana_sdk::{
-        hash::Hash,
-        packet::Meta,
-        transaction::{
-            Result, Transaction, TransactionError, TransactionVerificationMode,
-            VersionedTransaction,
-        },
+    solana_transaction::{
+        versioned::VersionedTransaction, Transaction, TransactionVerificationMode,
     },
+    solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::{
         cmp,
         ffi::OsStr,
         iter::repeat_with,
-        sync::{Arc, Mutex, Once},
+        sync::{Arc, Mutex, Once, OnceLock},
         thread::{self, JoinHandle},
         time::Instant,
+    },
+    wincode::{
+        containers::{Elem, Pod, Vec as WincodeVec},
+        len::BincodeLen,
+        SchemaRead, SchemaWrite,
     },
 };
 
 pub type EntrySender = Sender<Vec<Entry>>;
 pub type EntryReceiver = Receiver<Vec<Entry>>;
 
-static mut API: Option<Container<Api>> = None;
+static API: OnceLock<Container<Api>> = OnceLock::new();
 
 pub fn init_poh() {
     init(OsStr::new("libpoh-simd.so"));
@@ -52,24 +54,24 @@ pub fn init_poh() {
 fn init(name: &OsStr) {
     static INIT_HOOK: Once = Once::new();
 
-    info!("Loading {:?}", name);
-    unsafe {
-        INIT_HOOK.call_once(|| {
-            let path;
-            let lib_name = if let Some(perf_libs_path) = solana_perf::perf_libs::locate_perf_libs()
-            {
-                solana_perf::perf_libs::append_to_ld_library_path(
-                    perf_libs_path.to_str().unwrap_or("").to_string(),
-                );
-                path = perf_libs_path.join(name);
-                path.as_os_str()
-            } else {
-                name
-            };
+    info!("Loading {name:?}");
+    INIT_HOOK.call_once(|| {
+        let path;
+        let lib_name = if let Some(perf_libs_path) = solana_perf::perf_libs::locate_perf_libs() {
+            solana_perf::perf_libs::append_to_ld_library_path(
+                perf_libs_path.to_str().unwrap_or("").to_string(),
+            );
+            path = perf_libs_path.join(name);
+            path.as_os_str()
+        } else {
+            name
+        };
 
-            API = Container::load(lib_name).ok();
-        })
-    }
+        match unsafe { Container::load(lib_name) } {
+            Ok(api) => _ = API.set(api),
+            Err(err) => error!("Unable to load {lib_name:?}: {err}"),
+        }
+    })
 }
 
 pub fn api() -> Option<&'static Container<Api<'static>>> {
@@ -79,10 +81,10 @@ pub fn api() -> Option<&'static Container<Api<'static>>> {
             if std::env::var("TEST_PERF_LIBS").is_ok() {
                 init_poh()
             }
-        })
+        });
     }
 
-    unsafe { API.as_ref() }
+    API.get()
 }
 
 #[derive(SymBorApi)]
@@ -92,6 +94,10 @@ pub struct Api<'a> {
     pub poh_verify_many_simd_avx2:
         Symbol<'a, unsafe extern "C" fn(hashes: *mut u8, num_hashes: *const u64)>,
 }
+
+const MAX_DATA_SHREDS_PER_SLOT: usize = 32_768;
+pub const MAX_DATA_SHREDS_SIZE: usize = MAX_DATA_SHREDS_PER_SLOT * solana_packet::PACKET_DATA_SIZE;
+pub type MaxDataShredsLen = BincodeLen<MAX_DATA_SHREDS_SIZE>;
 
 /// Each Entry contains three pieces of data. The `num_hashes` field is the number
 /// of hashes performed since the previous entry.  The `hash` field is the result
@@ -114,23 +120,25 @@ pub struct Api<'a> {
 /// * For TPU: `solana_core::banking_stage::BankingStage::process_and_record_transactions()`
 /// * For TVU: `solana_core::replay_stage::ReplayStage::replay_blockstore_into_bank()`
 ///
+/// Until SIMD83 is activated:
 /// All transactions in the `transactions` field have to follow the read/write locking restrictions
 /// with regard to the accounts they reference. A single account can be either written by a single
 /// transaction, or read by one or more transactions, but not both.
-///
 /// This enforcement is done via a call to `solana_runtime::accounts::Accounts::lock_accounts()`
 /// with the `txs` argument holding all the `transactions` in the `Entry`.
-#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone, SchemaWrite, SchemaRead)]
 pub struct Entry {
     /// The number of hashes since the previous Entry ID.
     pub num_hashes: u64,
 
     /// The SHA-256 hash `num_hashes` after the previous Entry ID.
+    #[wincode(with = "Pod<Hash>")]
     pub hash: Hash,
 
     /// An unordered list of transactions that were observed before the Entry ID was
     /// generated. They may have been observed before a previous Entry ID but were
     /// pushed back into this list to ensure deterministic interpretation of the ledger.
+    #[wincode(with = "WincodeVec<Elem<crate::wincode::VersionedTransaction>, MaxDataShredsLen>")]
     pub transactions: Vec<VersionedTransaction>,
 }
 
@@ -492,10 +500,7 @@ fn start_verify_transactions_gpu<Tx: TransactionWithMeta + Send + Sync + 'static
 ) -> Result<EntrySigVerificationState<Tx>> {
     let verify_func = {
         move |versioned_tx: VersionedTransaction| -> Result<Tx> {
-            verify(
-                versioned_tx,
-                TransactionVerificationMode::HashAndVerifyPrecompiles,
-            )
+            verify(versioned_tx, TransactionVerificationMode::HashOnly)
         }
     };
 
@@ -524,7 +529,7 @@ fn start_verify_transactions_gpu<Tx: TransactionWithMeta + Send + Sync + 'static
             .par_chunks(PACKETS_PER_BATCH)
             .map(|transaction_chunk| {
                 let num_transactions = transaction_chunk.len();
-                let mut packet_batch = PacketBatch::new_with_recycler(
+                let mut packet_batch = PinnedPacketBatch::new_with_recycler(
                     &verify_recyclers.packet_recycler,
                     num_transactions,
                     "entry-sig-verify",
@@ -549,7 +554,7 @@ fn start_verify_transactions_gpu<Tx: TransactionWithMeta + Send + Sync + 'static
                         Packet::populate_packet(packet, None, &tx).is_ok()
                     });
                 if res {
-                    Ok(packet_batch)
+                    Ok(PacketBatch::from(packet_batch))
                 } else {
                     Err(TransactionError::SanitizeFailure)
                 }
@@ -684,7 +689,7 @@ impl EntrySlice for [Entry] {
         simd_len: usize,
         thread_pool: &ThreadPool,
     ) -> EntryVerificationState {
-        use solana_sdk::hash::HASH_BYTES;
+        use solana_hash::HASH_BYTES;
         let now = Instant::now();
         let genesis = [Entry {
             num_hashes: 0,
@@ -692,7 +697,7 @@ impl EntrySlice for [Entry] {
             transactions: vec![],
         }];
 
-        let aligned_len = ((self.len() + simd_len - 1) / simd_len) * simd_len;
+        let aligned_len = self.len().div_ceil(simd_len) * simd_len;
         let mut hashes_bytes = vec![0u8; HASH_BYTES * aligned_len];
         genesis
             .iter()
@@ -893,10 +898,8 @@ impl EntrySlice for [Entry] {
             if entry.is_tick() {
                 if *tick_hash_count != hashes_per_tick {
                     warn!(
-                        "invalid tick hash count!: entry: {:#?}, tick_hash_count: {}, hashes_per_tick: {}",
-                        entry,
-                        tick_hash_count,
-                        hashes_per_tick
+                        "invalid tick hash count!: entry: {entry:#?}, tick_hash_count: \
+                         {tick_hash_count}, hashes_per_tick: {hashes_per_tick}"
                     );
                     return false;
                 }
@@ -964,9 +967,10 @@ pub fn thread_pool_for_tests() -> ThreadPool {
         .expect("new rayon threadpool")
 }
 
+#[cfg(feature = "dev-context-only-utils")]
 pub fn thread_pool_for_benches() -> ThreadPool {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(get_max_thread_count())
+        .num_threads(num_cpus::get())
         .thread_name(|i| format!("solEntryBnch{i:02}"))
         .build()
         .expect("new rayon threadpool")
@@ -976,19 +980,21 @@ pub fn thread_pool_for_benches() -> ThreadPool {
 mod tests {
     use {
         super::*,
+        agave_reserved_account_keys::ReservedAccountKeys,
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_message::SimpleAddressLoader,
         solana_perf::test_tx::{test_invalid_tx, test_tx},
+        solana_pubkey::Pubkey,
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
-        solana_sdk::{
-            hash::{hash, Hash},
-            pubkey::Pubkey,
-            reserved_account_keys::ReservedAccountKeys,
-            signature::{Keypair, Signer},
-            system_transaction,
-            transaction::{
-                MessageHash, Result, SanitizedTransaction, SimpleAddressLoader,
-                VersionedTransaction,
-            },
+        solana_sha256_hasher::hash,
+        solana_signer::Signer,
+        solana_system_transaction as system_transaction,
+        solana_transaction::{
+            sanitized::{MessageHash, SanitizedTransaction},
+            versioned::VersionedTransaction,
         },
+        solana_transaction_error::TransactionResult as Result,
     };
 
     #[test]
@@ -1081,6 +1087,7 @@ mod tests {
                         None,
                         SimpleAddressLoader::Disabled,
                         &ReservedAccountKeys::empty_key_set(),
+                        true,
                     )
                 }?;
 
@@ -1142,7 +1149,7 @@ mod tests {
     fn test_transaction_signing() {
         let thread_pool = thread_pool_for_tests();
 
-        use solana_sdk::signature::Signature;
+        use solana_signature::Signature;
         let zero = Hash::default();
 
         let keypair = Keypair::new();
@@ -1203,7 +1210,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice1() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1225,7 +1232,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice_with_hashes1() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1252,7 +1259,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice_with_hashes_and_transactions() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1405,11 +1412,11 @@ mod tests {
 
     #[test]
     fn test_poh_verify_fuzz() {
-        solana_logger::setup();
+        agave_logger::setup();
         for _ in 0..100 {
             let mut time = Measure::start("ticks");
             let num_ticks = thread_rng().gen_range(1..100);
-            info!("create {} ticks:", num_ticks);
+            info!("create {num_ticks} ticks:");
             let mut entries = create_random_ticks(num_ticks, 100, Hash::default());
             time.stop();
 
@@ -1420,12 +1427,12 @@ mod tests {
                 entries[modify_idx].hash = hash(&[1, 2, 3]);
             }
 
-            info!("done.. {}", time);
+            info!("done.. {time}");
             let mut time = Measure::start("poh");
             let res = entries.verify(&Hash::default(), &thread_pool_for_tests());
             assert_eq!(res, !modified);
             time.stop();
-            info!("{} {}", time, res);
+            info!("{time} {res}");
         }
     }
 

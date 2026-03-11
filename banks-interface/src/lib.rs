@@ -1,20 +1,31 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![allow(deprecated)]
 
 use {
-    serde_derive::{Deserialize, Serialize},
-    solana_sdk::{
-        account::Account,
-        clock::Slot,
-        commitment_config::CommitmentLevel,
-        hash::Hash,
-        inner_instruction::InnerInstructions,
-        message::Message,
-        pubkey::Pubkey,
-        signature::Signature,
-        transaction::{self, TransactionError, VersionedTransaction},
-        transaction_context::TransactionReturnData,
-    },
+    serde::{Deserialize, Serialize},
+    solana_account::Account,
+    solana_clock::Slot,
+    solana_commitment_config::CommitmentLevel,
+    solana_hash::Hash,
+    solana_message::{inner_instruction::InnerInstructions, Message},
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
+    solana_transaction::versioned::VersionedTransaction,
+    solana_transaction_context::TransactionReturnData,
+    solana_transaction_error::TransactionError,
 };
+
+mod transaction {
+    pub use solana_transaction_error::TransactionResult as Result;
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransactionConfirmationStatus {
@@ -36,6 +47,7 @@ pub struct TransactionStatus {
 pub struct TransactionSimulationDetails {
     pub logs: Vec<String>,
     pub units_consumed: u64,
+    pub loaded_accounts_data_size: u32,
     pub return_data: Option<TransactionReturnData>,
     pub inner_instructions: Option<Vec<InnerInstructions>>,
 }

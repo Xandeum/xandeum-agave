@@ -1,5 +1,7 @@
 use {
-    solana_sdk::{clock::Slot, commitment_config::CommitmentLevel},
+    serde::{Deserialize, Serialize},
+    solana_clock::Slot,
+    solana_commitment_config::CommitmentLevel,
     solana_vote_program::vote_state::MAX_LOCKOUT_HISTORY,
     std::collections::HashMap,
 };

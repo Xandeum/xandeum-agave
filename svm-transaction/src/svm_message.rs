@@ -3,21 +3,38 @@ use {
         instruction::SVMInstruction, message_address_table_lookup::SVMMessageAddressTableLookup,
     },
     core::fmt::Debug,
-    solana_sdk::{
-        hash::Hash, message::AccountKeys, nonce::NONCED_TX_MARKER_IX_INDEX, pubkey::Pubkey,
-        system_program,
-    },
+    solana_hash::Hash,
+    solana_message::AccountKeys,
+    solana_pubkey::Pubkey,
+    solana_sdk_ids::{ed25519_program, secp256k1_program, secp256r1_program, system_program},
 };
 
 mod sanitized_message;
 mod sanitized_transaction;
+// inlined to avoid solana-nonce dep
+#[cfg(test)]
+static_assertions::const_assert_eq!(
+    NONCED_TX_MARKER_IX_INDEX,
+    solana_nonce::NONCED_TX_MARKER_IX_INDEX
+);
+const NONCED_TX_MARKER_IX_INDEX: u8 = 0;
 
 // - Debug to support legacy logging
 pub trait SVMMessage: Debug {
-    /// Returns the total number of signatures in the message.
-    /// This includes required transaction signatures as well as any
-    /// pre-compile signatures that are attached in instructions.
-    fn num_total_signatures(&self) -> u64;
+    /// Return the number of transaction-level signatures in the message.
+    fn num_transaction_signatures(&self) -> u64;
+    /// Return the number of ed25519 precompile signatures in the message.
+    fn num_ed25519_signatures(&self) -> u64 {
+        default_precompile_signature_count(&ed25519_program::ID, self.program_instructions_iter())
+    }
+    /// Return the number of secp256k1 precompile signatures in the message.
+    fn num_secp256k1_signatures(&self) -> u64 {
+        default_precompile_signature_count(&secp256k1_program::ID, self.program_instructions_iter())
+    }
+    /// Return the number of secp256r1 precompile signatures in the message.
+    fn num_secp256r1_signatures(&self) -> u64 {
+        default_precompile_signature_count(&secp256r1_program::ID, self.program_instructions_iter())
+    }
 
     /// Returns the number of requested write-locks in this message.
     /// This does not consider if write-locks are demoted.
@@ -30,14 +47,19 @@ pub trait SVMMessage: Debug {
     fn num_instructions(&self) -> usize;
 
     /// Return an iterator over the instructions in the message.
-    fn instructions_iter(&self) -> impl Iterator<Item = SVMInstruction>;
+    fn instructions_iter(&self) -> impl Iterator<Item = SVMInstruction<'_>>;
 
     /// Return an iterator over the instructions in the message, paired with
     /// the pubkey of the program.
-    fn program_instructions_iter(&self) -> impl Iterator<Item = (&Pubkey, SVMInstruction)>;
+    fn program_instructions_iter(
+        &self,
+    ) -> impl Iterator<Item = (&Pubkey, SVMInstruction<'_>)> + Clone;
+
+    /// Return the list of static account keys.
+    fn static_account_keys(&self) -> &[Pubkey];
 
     /// Return the account keys.
-    fn account_keys(&self) -> AccountKeys;
+    fn account_keys(&self) -> AccountKeys<'_>;
 
     /// Return the fee-payer
     fn fee_payer(&self) -> &Pubkey;
@@ -64,7 +86,7 @@ pub trait SVMMessage: Debug {
     }
 
     /// If the message uses a durable nonce, return the pubkey of the nonce account
-    fn get_durable_nonce(&self) -> Option<&Pubkey> {
+    fn get_durable_nonce(&self, require_static_nonce_account: bool) -> Option<&Pubkey> {
         let account_keys = self.account_keys();
         self.instructions_iter()
             .nth(usize::from(NONCED_TX_MARKER_IX_INDEX))
@@ -87,7 +109,9 @@ pub trait SVMMessage: Debug {
             .and_then(|ix| {
                 ix.accounts.first().and_then(|idx| {
                     let index = usize::from(*idx);
-                    if !self.is_writable(index) {
+                    if (require_static_nonce_account && index >= self.static_account_keys().len())
+                        || !self.is_writable(index)
+                    {
                         None
                     } else {
                         account_keys.get(index)
@@ -116,5 +140,17 @@ pub trait SVMMessage: Debug {
     fn num_lookup_tables(&self) -> usize;
 
     /// Get message address table lookups used in the message
-    fn message_address_table_lookups(&self) -> impl Iterator<Item = SVMMessageAddressTableLookup>;
+    fn message_address_table_lookups(
+        &self,
+    ) -> impl Iterator<Item = SVMMessageAddressTableLookup<'_>>;
+}
+
+fn default_precompile_signature_count<'a>(
+    precompile: &Pubkey,
+    instructions: impl Iterator<Item = (&'a Pubkey, SVMInstruction<'a>)>,
+) -> u64 {
+    instructions
+        .filter(|(program_id, _)| *program_id == precompile)
+        .map(|(_, ix)| u64::from(ix.data.first().copied().unwrap_or(0)))
+        .sum()
 }

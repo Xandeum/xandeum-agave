@@ -1,9 +1,18 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 
-extern crate serde_derive;
 pub use self::legacy::{LegacyVersion1, LegacyVersion2};
 use {
-    serde_derive::{Deserialize, Serialize},
+    rand::{thread_rng, Rng},
+    serde::{Deserialize, Serialize},
     solana_sanitize::Sanitize,
     solana_serde_varint as serde_varint,
     std::{convert::TryInto, fmt},
@@ -15,11 +24,12 @@ extern crate solana_frozen_abi_macro;
 mod legacy;
 
 #[derive(Debug, Eq, PartialEq)]
-enum ClientId {
+pub enum ClientId {
     SolanaLabs,
     JitoLabs,
     Firedancer,
     Agave,
+    Xandeum,
     // If new variants are added, update From<u16> and TryFrom<ClientId>.
     Unknown(u16),
 }
@@ -44,7 +54,7 @@ impl Version {
         semver::Version::new(self.major as u64, self.minor as u64, self.patch as u64)
     }
 
-    fn client(&self) -> ClientId {
+    pub fn client(&self) -> ClientId {
         ClientId::from(self.client)
     }
 }
@@ -56,22 +66,24 @@ fn compute_commit(sha1: Option<&'static str>) -> Option<u32> {
 impl Default for Version {
     fn default() -> Self {
         let feature_set =
-            u32::from_le_bytes(solana_feature_set::ID.as_ref()[..4].try_into().unwrap());
+            u32::from_le_bytes(agave_feature_set::ID.as_ref()[..4].try_into().unwrap());
         Self {
             major: env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap(),
             minor: env!("CARGO_PKG_VERSION_MINOR").parse().unwrap(),
             patch: env!("CARGO_PKG_VERSION_PATCH").parse().unwrap(),
-            commit: compute_commit(option_env!("CI_COMMIT")).unwrap_or_default(),
+            commit: compute_commit(option_env!("CI_COMMIT"))
+                .or(compute_commit(option_env!("AGAVE_GIT_COMMIT_HASH")))
+                .unwrap_or_else(|| thread_rng().gen::<u32>()),
             feature_set,
             // Other client implementations need to modify this line.
-            client: u16::try_from(ClientId::Agave).unwrap(),
+            client: u16::try_from(ClientId::Xandeum).unwrap(),
         }
     }
 }
 
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch,)
+        write!(f, "{}.{}.{}-{:08x}", self.major, self.minor, self.patch, self.commit,)
     }
 }
 
@@ -99,6 +111,7 @@ impl From<u16> for ClientId {
             1u16 => Self::JitoLabs,
             2u16 => Self::Firedancer,
             3u16 => Self::Agave,
+            4u16 => Self::Xandeum,
             _ => Self::Unknown(client),
         }
     }
@@ -113,7 +126,8 @@ impl TryFrom<ClientId> for u16 {
             ClientId::JitoLabs => Ok(1u16),
             ClientId::Firedancer => Ok(2u16),
             ClientId::Agave => Ok(3u16),
-            ClientId::Unknown(client @ 0u16..=3u16) => Err(format!("Invalid client: {client}")),
+            ClientId::Xandeum => Ok(4u16),
+            ClientId::Unknown(client @ 0u16..=4u16) => Err(format!("Invalid client: {client}")),
             ClientId::Unknown(client) => Ok(client),
         }
     }

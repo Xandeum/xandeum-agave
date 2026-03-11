@@ -1,21 +1,18 @@
 use {
     assert_matches::assert_matches,
+    solana_account_info::{next_account_info, AccountInfo},
     solana_banks_client::BanksClientError,
+    solana_commitment_config::CommitmentLevel,
+    solana_instruction::{AccountMeta, Instruction},
+    solana_msg::msg,
+    solana_program::program::{get_return_data, invoke, set_return_data},
+    solana_program_error::{ProgramError, ProgramResult},
     solana_program_test::{processor, ProgramTest},
-    solana_sdk::{
-        account_info::{next_account_info, AccountInfo},
-        commitment_config::CommitmentLevel,
-        entrypoint::ProgramResult,
-        instruction::{AccountMeta, Instruction},
-        msg,
-        program::{get_return_data, invoke, set_return_data},
-        program_error::ProgramError,
-        pubkey::Pubkey,
-        signature::Signer,
-        transaction::Transaction,
-        transaction_context::TransactionReturnData,
-    },
-    std::str::from_utf8,
+    solana_pubkey::Pubkey,
+    solana_signer::Signer,
+    solana_transaction::Transaction,
+    solana_transaction_context::TransactionReturnData,
+    std::{slice, str::from_utf8},
 };
 
 // Process instruction to get return data from another program
@@ -33,7 +30,7 @@ fn get_return_data_process_instruction(
             accounts: vec![],
             data: input.to_vec(),
         },
-        &[invoked_program_info.clone()],
+        slice::from_ref(invoked_program_info),
     )?;
     let return_data = get_return_data().unwrap();
     msg!("Processing get_return_data instruction after CPI");

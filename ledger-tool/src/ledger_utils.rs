@@ -1,47 +1,46 @@
 use {
     crate::LEDGER_TOOL_DIRECTORY,
+    agave_snapshots::{
+        paths::{self as snapshot_paths, BANK_SNAPSHOTS_DIR},
+        snapshot_config::{SnapshotConfig, SnapshotUsage},
+        snapshot_hash::StartingSnapshotHashes,
+    },
     clap::{value_t, value_t_or_exit, values_t_or_exit, ArgMatches},
     crossbeam_channel::unbounded,
     log::*,
-    solana_accounts_db::{
-        hardened_unpack::open_genesis_config,
-        utils::{create_all_accounts_run_and_snapshot_dirs, move_and_async_delete_path_contents},
+    solana_accounts_db::utils::{
+        create_all_accounts_run_and_snapshot_dirs, move_and_async_delete_path_contents,
     },
-    solana_core::{
-        accounts_hash_verifier::AccountsHashVerifier,
-        snapshot_packager_service::PendingSnapshotPackages, validator::BlockVerificationMethod,
-    },
+    solana_clock::Slot,
+    solana_core::validator::BlockVerificationMethod,
+    solana_genesis_config::GenesisConfig,
+    solana_genesis_utils::open_genesis_config,
     solana_geyser_plugin_manager::geyser_plugin_service::{
         GeyserPluginService, GeyserPluginServiceError,
     },
     solana_ledger::{
         bank_forks_utils::{self, BankForksUtilsError},
         blockstore::{Blockstore, BlockstoreError},
-        blockstore_options::{
-            AccessType, BlockstoreOptions, BlockstoreRecoveryMode, LedgerColumnOptions,
-        },
+        blockstore_options::{AccessType, BlockstoreOptions, BlockstoreRecoveryMode},
         blockstore_processor::{
             self, BlockstoreProcessorError, ProcessOptions, TransactionStatusSender,
         },
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
     solana_measure::measure_time,
+    solana_pubkey::Pubkey,
     solana_rpc::transaction_status_service::TransactionStatusService,
     solana_runtime::{
         accounts_background_service::{
-            AbsRequestHandlers, AbsRequestSender, AccountsBackgroundService,
+            AbsRequestHandlers, AccountsBackgroundService, PendingSnapshotPackages,
             PrunedBanksRequestHandler, SnapshotRequestHandler,
         },
         bank_forks::BankForks,
         prioritization_fee_cache::PrioritizationFeeCache,
-        snapshot_config::SnapshotConfig,
-        snapshot_hash::StartingSnapshotHashes,
+        snapshot_controller::SnapshotController,
         snapshot_utils::{self, clean_orphaned_account_snapshot_dirs},
     },
-    solana_sdk::{
-        clock::Slot, genesis_config::GenesisConfig, pubkey::Pubkey,
-        transaction::VersionedTransaction,
-    },
+    solana_transaction::versioned::VersionedTransaction,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{
         path::{Path, PathBuf},
@@ -69,9 +68,9 @@ pub struct LoadAndProcessLedgerOutput {
 
 const PROCESS_SLOTS_HELP_STRING: &str =
     "The starting slot is either the latest found snapshot slot, or genesis (slot 0) if the \
-     --no-snapshot flag was specified or if no snapshots were found. \
-     The ending slot is the snapshot creation slot for create-snapshot, the value for \
-     --halt-at-slot if specified, or the highest slot in the blockstore.";
+     --no-snapshot flag was specified or if no snapshots were found. The ending slot is the \
+     snapshot creation slot for create-snapshot, the value for --halt-at-slot if specified, or \
+     the highest slot in the blockstore.";
 
 #[derive(Error, Debug)]
 pub(crate) enum LoadAndProcessLedgerError {
@@ -81,7 +80,7 @@ pub(crate) enum LoadAndProcessLedgerError {
     #[error("failed to create all run and snapshot directories: {0}")]
     CreateAllAccountsRunAndSnapshotDirectories(#[source] std::io::Error),
 
-    #[error("custom accounts path is not supported with seconday blockstore access")]
+    #[error("custom accounts path is not supported with secondary blockstore access")]
     CustomAccountsPathUnsupported(#[source] BlockstoreError),
 
     #[error(
@@ -133,46 +132,52 @@ pub fn load_and_process_ledger(
     process_options: ProcessOptions,
     transaction_status_sender: Option<TransactionStatusSender>,
 ) -> Result<LoadAndProcessLedgerOutput, LoadAndProcessLedgerError> {
-    let bank_snapshots_dir = if blockstore.is_primary_access() {
-        blockstore.ledger_path().join("snapshot")
-    } else {
-        blockstore
-            .ledger_path()
-            .join(LEDGER_TOOL_DIRECTORY)
-            .join("snapshot")
-    };
-
     let mut starting_slot = 0; // default start check with genesis
-    let snapshot_config = if arg_matches.is_present("no_snapshot") {
-        None
-    } else {
-        let full_snapshot_archives_dir = value_t!(arg_matches, "snapshots", String)
-            .ok()
+    let snapshot_config = {
+        let snapshots_dir = arg_matches
+            .value_of("snapshots")
             .map(PathBuf::from)
             .unwrap_or_else(|| blockstore.ledger_path().to_path_buf());
-        let incremental_snapshot_archives_dir =
-            value_t!(arg_matches, "incremental_snapshot_archive_path", String)
-                .ok()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| full_snapshot_archives_dir.clone());
+        let bank_snapshots_dir = if blockstore.is_primary_access() {
+            snapshots_dir.join(BANK_SNAPSHOTS_DIR)
+        } else {
+            blockstore
+                .ledger_path()
+                .join(LEDGER_TOOL_DIRECTORY)
+                .join(BANK_SNAPSHOTS_DIR)
+        };
+        let full_snapshot_archives_dir = arg_matches
+            .value_of("full_snapshot_archive_path")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| snapshots_dir.clone());
+        let incremental_snapshot_archives_dir = arg_matches
+            .value_of("incremental_snapshot_archive_path")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| snapshots_dir.clone());
         if let Some(full_snapshot_slot) =
-            snapshot_utils::get_highest_full_snapshot_archive_slot(&full_snapshot_archives_dir)
+            snapshot_paths::get_highest_full_snapshot_archive_slot(&full_snapshot_archives_dir)
         {
             let incremental_snapshot_slot =
-                snapshot_utils::get_highest_incremental_snapshot_archive_slot(
+                snapshot_paths::get_highest_incremental_snapshot_archive_slot(
                     &incremental_snapshot_archives_dir,
                     full_snapshot_slot,
                 )
                 .unwrap_or_default();
             starting_slot = std::cmp::max(full_snapshot_slot, incremental_snapshot_slot);
         }
+        let usage = if arg_matches.is_present("no_snapshot") {
+            SnapshotUsage::Disabled
+        } else {
+            SnapshotUsage::LoadOnly
+        };
 
-        Some(SnapshotConfig {
+        SnapshotConfig {
+            usage,
             full_snapshot_archives_dir,
             incremental_snapshot_archives_dir,
-            bank_snapshots_dir: bank_snapshots_dir.clone(),
-            ..SnapshotConfig::new_load_only()
-        })
+            bank_snapshots_dir,
+            ..SnapshotConfig::default()
+        }
     };
 
     match process_options.halt_at_slot {
@@ -233,8 +238,8 @@ pub fn load_and_process_ledger(
             .join(LEDGER_TOOL_DIRECTORY)
             .join("accounts");
         info!(
-            "Default accounts path is switched aligning with Blockstore's secondary access: {:?}",
-            non_primary_accounts_path
+            "Default accounts path is switched aligning with Blockstore's secondary access: \
+             {non_primary_accounts_path:?}"
         );
         vec![non_primary_accounts_path]
     };
@@ -256,11 +261,14 @@ pub fn load_and_process_ledger(
     );
     info!("{measure_clean_account_paths}");
 
-    snapshot_utils::purge_incomplete_bank_snapshots(&bank_snapshots_dir);
+    snapshot_utils::purge_incomplete_bank_snapshots(&snapshot_config.bank_snapshots_dir);
 
     info!("Cleaning contents of account snapshot paths: {account_snapshot_paths:?}");
-    clean_orphaned_account_snapshot_dirs(&bank_snapshots_dir, &account_snapshot_paths)
-        .map_err(LoadAndProcessLedgerError::CleanOrphanedAccountSnapshotDirectories)?;
+    clean_orphaned_account_snapshot_dirs(
+        &snapshot_config.bank_snapshots_dir,
+        &account_snapshot_paths,
+    )
+    .map_err(LoadAndProcessLedgerError::CleanOrphanedAccountSnapshotDirectories)?;
 
     let geyser_plugin_active = arg_matches.is_present("geyser_plugin_config");
     let (accounts_update_notifier, transaction_notifier) = if geyser_plugin_active {
@@ -283,29 +291,69 @@ pub fn load_and_process_ledger(
     };
 
     let exit = Arc::new(AtomicBool::new(false));
+    // Separate TSS exit flag as it needs to get set at a later point than
+    // the common exit flag. This is coupled to draining TSS receiver queue first.
+    let tss_exit = Arc::new(AtomicBool::new(false));
+
+    let enable_rpc_transaction_history = arg_matches.is_present("enable_rpc_transaction_history");
+
+    let (transaction_status_sender, transaction_status_service) =
+        if geyser_plugin_active || enable_rpc_transaction_history {
+            // Need Primary (R/W) access to insert transaction and rewards data;
+            // obtain Primary access if we do not already have it
+            let write_blockstore =
+                if enable_rpc_transaction_history && !blockstore.is_primary_access() {
+                    Arc::new(open_blockstore(
+                        blockstore.ledger_path(),
+                        arg_matches,
+                        AccessType::PrimaryForMaintenance,
+                    ))
+                } else {
+                    blockstore.clone()
+                };
+
+            let (transaction_status_sender, transaction_status_receiver) = unbounded();
+            let transaction_status_service = TransactionStatusService::new(
+                transaction_status_receiver,
+                Arc::default(),
+                enable_rpc_transaction_history,
+                transaction_notifier,
+                write_blockstore.clone(),
+                arg_matches.is_present("enable_extended_tx_metadata_storage"),
+                None,
+                tss_exit.clone(),
+            );
+
+            (
+                Some(TransactionStatusSender {
+                    sender: transaction_status_sender,
+                    dependency_tracker: None,
+                }),
+                Some(transaction_status_service),
+            )
+        } else {
+            (transaction_status_sender, None)
+        };
+
     let (bank_forks, leader_schedule_cache, starting_snapshot_hashes, ..) =
         bank_forks_utils::load_bank_forks(
             genesis_config,
             blockstore.as_ref(),
             account_paths,
-            snapshot_config.as_ref(),
+            &snapshot_config,
             &process_options,
-            None,
+            transaction_status_sender.as_ref(),
             None, // Maybe support this later, though
             accounts_update_notifier,
             exit.clone(),
         )
         .map_err(LoadAndProcessLedgerError::LoadBankForks)?;
-    let block_verification_method = value_t!(
+    let block_verification_method = value_t_or_exit!(
         arg_matches,
         "block_verification_method",
         BlockVerificationMethod
-    )
-    .unwrap_or_default();
-    info!(
-        "Using: block-verification-method: {}",
-        block_verification_method,
     );
+    info!("Using: block-verification-method: {block_verification_method}");
     let unified_scheduler_handler_threads =
         value_t!(arg_matches, "unified_scheduler_handler_threads", usize).ok();
     match block_verification_method {
@@ -319,7 +367,6 @@ pub fn load_and_process_ledger(
             }
         }
         BlockVerificationMethod::UnifiedScheduler => {
-            let no_transaction_status_sender = None;
             let no_replay_vote_sender = None;
             let ignored_prioritization_fee_cache = Arc::new(PrioritizationFeeCache::new(0u64));
             bank_forks
@@ -328,29 +375,34 @@ pub fn load_and_process_ledger(
                 .install_scheduler_pool(DefaultSchedulerPool::new_dyn(
                     unified_scheduler_handler_threads,
                     process_options.runtime_config.log_messages_bytes_limit,
-                    no_transaction_status_sender,
+                    transaction_status_sender.clone(),
                     no_replay_vote_sender,
                     ignored_prioritization_fee_cache,
                 ));
         }
     }
 
-    let pending_snapshot_packages = Arc::new(Mutex::new(PendingSnapshotPackages::default()));
-    let (accounts_package_sender, accounts_package_receiver) = crossbeam_channel::unbounded();
-    let accounts_hash_verifier = AccountsHashVerifier::new(
-        accounts_package_sender.clone(),
-        accounts_package_receiver,
-        pending_snapshot_packages,
-        exit.clone(),
-        SnapshotConfig::new_load_only(),
-    );
     let (snapshot_request_sender, snapshot_request_receiver) = crossbeam_channel::unbounded();
-    let accounts_background_request_sender = AbsRequestSender::new(snapshot_request_sender.clone());
-    let snapshot_request_handler = SnapshotRequestHandler {
-        snapshot_config: SnapshotConfig::new_load_only(),
+
+    // If snapshot_slot is present, then ledger-tool is attempting to generate a snapshot. Setting
+    // new_generate_snapshots_externally ensures the accounts database retains zero lamport
+    // accounts needed to correctly generate incremental snapshots
+    let snapshot_config = if arg_matches.is_present("snapshot_slot") {
+        SnapshotConfig::new_generate_snapshots_externally()
+    } else {
+        SnapshotConfig::new_load_only()
+    };
+
+    let snapshot_controller = Arc::new(SnapshotController::new(
         snapshot_request_sender,
+        snapshot_config,
+        bank_forks.read().unwrap().root(),
+    ));
+    let pending_snapshot_packages = Arc::new(Mutex::new(PendingSnapshotPackages::default()));
+    let snapshot_request_handler = SnapshotRequestHandler {
+        snapshot_controller: snapshot_controller.clone(),
         snapshot_request_receiver,
-        accounts_package_sender,
+        pending_snapshot_packages,
     };
     let pruned_banks_receiver =
         AccountsBackgroundService::setup_bank_drop_callback(bank_forks.clone());
@@ -361,49 +413,8 @@ pub fn load_and_process_ledger(
         snapshot_request_handler,
         pruned_banks_request_handler,
     };
-    let accounts_background_service = AccountsBackgroundService::new(
-        bank_forks.clone(),
-        exit.clone(),
-        abs_request_handler,
-        process_options.accounts_db_test_hash_calculation,
-    );
-
-    let enable_rpc_transaction_history = arg_matches.is_present("enable_rpc_transaction_history");
-
-    let (transaction_status_sender, transaction_status_service) = if geyser_plugin_active
-        || enable_rpc_transaction_history
-    {
-        // Need Primary (R/W) access to insert transaction data;
-        // obtain Primary access if we do not already have it
-        let tss_blockstore = if enable_rpc_transaction_history && !blockstore.is_primary_access() {
-            Arc::new(open_blockstore(
-                blockstore.ledger_path(),
-                arg_matches,
-                AccessType::PrimaryForMaintenance,
-            ))
-        } else {
-            blockstore.clone()
-        };
-
-        let (transaction_status_sender, transaction_status_receiver) = unbounded();
-        let transaction_status_service = TransactionStatusService::new(
-            transaction_status_receiver,
-            Arc::default(),
-            enable_rpc_transaction_history,
-            transaction_notifier,
-            tss_blockstore,
-            arg_matches.is_present("enable_extended_tx_metadata_storage"),
-            exit.clone(),
-        );
-        (
-            Some(TransactionStatusSender {
-                sender: transaction_status_sender,
-            }),
-            Some(transaction_status_service),
-        )
-    } else {
-        (transaction_status_sender, None)
-    };
+    let accounts_background_service =
+        AccountsBackgroundService::new(bank_forks.clone(), exit.clone(), abs_request_handler);
 
     let result = blockstore_processor::process_blockstore_from_root(
         blockstore.as_ref(),
@@ -411,9 +422,8 @@ pub fn load_and_process_ledger(
         &leader_schedule_cache,
         &process_options,
         transaction_status_sender.as_ref(),
-        None,
-        None, // Maybe support this later, though
-        &accounts_background_request_sender,
+        None, // entry_notification_sender
+        Some(&snapshot_controller),
     )
     .map(|_| LoadAndProcessLedgerOutput {
         bank_forks,
@@ -423,9 +433,8 @@ pub fn load_and_process_ledger(
     .map_err(LoadAndProcessLedgerError::ProcessBlockstoreFromRoot);
 
     exit.store(true, Ordering::Relaxed);
-    accounts_hash_verifier.join().unwrap();
     if let Some(service) = transaction_status_service {
-        service.join().unwrap();
+        service.quiesce_and_join_for_tests(tss_exit);
     }
 
     result
@@ -440,15 +449,13 @@ pub fn open_blockstore(
         .value_of("wal_recovery_mode")
         .map(BlockstoreRecoveryMode::from);
     let force_update_to_open = matches.is_present("force_update_to_open");
-    let enforce_ulimit_nofile = !matches.is_present("ignore_ulimit_nofile_error");
 
     match Blockstore::open_with_options(
         ledger_path,
         BlockstoreOptions {
             access_type: access_type.clone(),
             recovery_mode: wal_recovery_mode.clone(),
-            enforce_ulimit_nofile,
-            column_options: LedgerColumnOptions::default(),
+            ..BlockstoreOptions::default()
         },
     ) {
         Ok(blockstore) => blockstore,
@@ -491,8 +498,8 @@ pub fn open_blockstore(
             )
             .unwrap_or_else(|err| {
                 eprintln!(
-                    "Failed to open blockstore (with --force-update-to-open) at {:?}: {:?}",
-                    ledger_path, err
+                    "Failed to open blockstore (with --force-update-to-open) at {ledger_path:?}: \
+                     {err:?}"
                 );
                 exit(1);
             })
@@ -521,22 +528,19 @@ fn open_blockstore_with_temporary_primary_access(
             BlockstoreOptions {
                 access_type: AccessType::PrimaryForMaintenance,
                 recovery_mode: wal_recovery_mode.clone(),
-                enforce_ulimit_nofile: true,
                 ..BlockstoreOptions::default()
             },
         )?;
     }
     // Now, attempt to open the blockstore with original AccessType
     info!(
-        "Blockstore forced open succeeded, retrying with original access: {:?}",
-        original_access_type
+        "Blockstore forced open succeeded, retrying with original access: {original_access_type:?}"
     );
     Blockstore::open_with_options(
         ledger_path,
         BlockstoreOptions {
             access_type: original_access_type,
             recovery_mode: wal_recovery_mode,
-            enforce_ulimit_nofile: true,
             ..BlockstoreOptions::default()
         },
     )

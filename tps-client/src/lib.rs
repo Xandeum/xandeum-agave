@@ -1,20 +1,27 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 use {
     log::debug,
+    solana_account::Account,
+    solana_clock::DEFAULT_MS_PER_SLOT,
+    solana_commitment_config::CommitmentConfig,
+    solana_epoch_info::EpochInfo,
+    solana_hash::Hash,
+    solana_message::Message,
+    solana_pubkey::Pubkey,
     solana_rpc_client_api::{client_error::Error as ClientError, config::RpcBlockConfig},
-    solana_sdk::{
-        account::Account,
-        clock::DEFAULT_MS_PER_SLOT,
-        commitment_config::CommitmentConfig,
-        epoch_info::EpochInfo,
-        hash::Hash,
-        message::Message,
-        pubkey::Pubkey,
-        signature::Signature,
-        slot_history::Slot,
-        transaction::{Result, Transaction},
-        transport::TransportError,
-    },
+    solana_signature::Signature,
     solana_tpu_client::tpu_client::TpuSenderError,
+    solana_transaction::Transaction,
+    solana_transaction_error::{TransactionResult as Result, TransportError},
     solana_transaction_status::UiConfirmedBlock,
     std::{
         thread::sleep,
@@ -65,7 +72,7 @@ pub trait TpsClient {
                     return Ok(new_blockhash);
                 }
             }
-            debug!("Got same blockhash ({:?}), will retry...", blockhash);
+            debug!("Got same blockhash ({blockhash:?}), will retry...");
 
             // Retry ~twice during a slot
             sleep(Duration::from_millis(DEFAULT_MS_PER_SLOT / 2));
@@ -126,25 +133,24 @@ pub trait TpsClient {
 
     fn get_multiple_accounts(&self, pubkeys: &[Pubkey]) -> TpsClientResult<Vec<Option<Account>>>;
 
-    fn get_slot_with_commitment(
-        &self,
-        commitment_config: CommitmentConfig,
-    ) -> TpsClientResult<Slot>;
+    fn get_slot_with_commitment(&self, commitment_config: CommitmentConfig)
+        -> TpsClientResult<u64>;
 
     fn get_blocks_with_commitment(
         &self,
-        start_slot: Slot,
-        end_slot: Option<Slot>,
+        start_slot: u64,
+        end_slot: Option<u64>,
         commitment_config: CommitmentConfig,
-    ) -> TpsClientResult<Vec<Slot>>;
+    ) -> TpsClientResult<Vec<u64>>;
 
     fn get_block_with_config(
         &self,
-        slot: Slot,
+        slot: u64,
         rpc_block_config: RpcBlockConfig,
     ) -> TpsClientResult<UiConfirmedBlock>;
 }
 
+#[cfg(feature = "bank-client")]
 mod bank_client;
 mod rpc_client;
 mod tpu_client;

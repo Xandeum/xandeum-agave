@@ -1,16 +1,18 @@
 use {
     crate::rpc_subscriptions::{NotificationEntry, RpcNotification, TimestampedNotificationEntry},
     dashmap::{mapref::entry::Entry as DashEntry, DashMap},
+    serde::{Deserialize, Serialize},
     solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig},
+    solana_clock::Slot,
+    solana_commitment_config::CommitmentConfig,
     solana_metrics::{CounterToken, TokenCounter},
+    solana_pubkey::Pubkey,
     solana_rpc_client_api::filter::RpcFilterType,
     solana_runtime::{
         bank::{TransactionLogCollectorConfig, TransactionLogCollectorFilter},
         bank_forks::BankForks,
     },
-    solana_sdk::{
-        clock::Slot, commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature,
-    },
+    solana_signature::Signature,
     solana_transaction_status::{TransactionDetails, UiTransactionEncoding},
     std::{
         collections::hash_map::{Entry, HashMap},
@@ -37,6 +39,12 @@ impl From<SubscriptionId> for u64 {
     fn from(value: SubscriptionId) -> Self {
         value.0
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SignatureSubscriptionType {
+    Regular,       // For regular signature notifications
+    XandeumResult, // For Xandeum result notifications
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -174,6 +182,7 @@ pub struct SignatureSubscriptionParams {
     pub signature: Signature,
     pub commitment: CommitmentConfig,
     pub enable_received_notification: bool,
+    pub subscription_type: SignatureSubscriptionType
 }
 
 #[derive(Clone)]
@@ -677,6 +686,7 @@ mod tests {
             signature: Signature::default(),
             commitment: CommitmentConfig::processed(),
             enable_received_notification: false,
+            subscription_type : SignatureSubscriptionType::Regular
         });
         let token_signature1 = control.control.subscribe(signature_params.clone()).unwrap();
         control.assert_subscribed(&signature_params, 1);
@@ -717,7 +727,7 @@ mod tests {
         assert_eq!(*info.last_notified_slot.read().unwrap(), 0);
 
         let account_params = SubscriptionParams::Account(AccountSubscriptionParams {
-            pubkey: solana_inline_spl::token::id(),
+            pubkey: spl_generic_token::token::id(),
             commitment: CommitmentConfig::finalized(),
             encoding: UiAccountEncoding::Base64Zstd,
             data_slice: None,
@@ -757,7 +767,7 @@ mod tests {
         assert_eq!(counts(&tracker), (0, 0, 0, 0));
 
         let account_params = SubscriptionParams::Account(AccountSubscriptionParams {
-            pubkey: solana_inline_spl::token::id(),
+            pubkey: spl_generic_token::token::id(),
             commitment: CommitmentConfig::finalized(),
             encoding: UiAccountEncoding::Base64Zstd,
             data_slice: None,
@@ -768,7 +778,7 @@ mod tests {
         assert_eq!(counts(&tracker), (0, 0, 0, 0));
 
         let account_params2 = SubscriptionParams::Account(AccountSubscriptionParams {
-            pubkey: solana_inline_spl::token::id(),
+            pubkey: spl_generic_token::token::id(),
             commitment: CommitmentConfig::confirmed(),
             encoding: UiAccountEncoding::Base64Zstd,
             data_slice: None,
@@ -782,6 +792,7 @@ mod tests {
             signature: Signature::default(),
             commitment: CommitmentConfig::processed(),
             enable_received_notification: false,
+            subscription_type: SignatureSubscriptionType::Regular
         });
         tracker.subscribe(signature_params.clone(), 3.into(), || 0);
         assert_eq!(counts(&tracker), (1, 1, 0, 0));

@@ -178,12 +178,10 @@ mod tests {
         file::TieredStorageMagicNumber,
         footer::TieredStorageFooter,
         hot::HOT_FORMAT,
-        solana_sdk::{
-            account::{AccountSharedData, ReadableAccount},
-            clock::Slot,
-            pubkey::Pubkey,
-            system_instruction::MAX_PERMITTED_DATA_LENGTH,
-        },
+        solana_account::AccountSharedData,
+        solana_clock::Slot,
+        solana_pubkey::Pubkey,
+        solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
         std::{
             collections::{HashMap, HashSet},
             mem::ManuallyDrop,
@@ -353,13 +351,8 @@ mod tests {
             .map(|size| create_test_account(*size))
             .collect();
 
-        let account_refs: Vec<_> = accounts
-            .iter()
-            .map(|account| (&account.0.pubkey, &account.1))
-            .collect();
-
         // Slot information is not used here
-        let storable_accounts = (Slot::MAX, &account_refs[..]);
+        let storable_accounts = (Slot::MAX, &accounts[..]);
 
         let temp_dir = tempdir().unwrap();
         let tiered_storage_path = temp_dir.path().join(path_suffix);
@@ -373,7 +366,7 @@ mod tests {
         let mut expected_accounts_map = HashMap::new();
         for i in 0..num_accounts {
             storable_accounts.account_default_if_zero_lamport(i, |account| {
-                expected_accounts_map.insert(*account.pubkey(), account.to_account_shared_data());
+                expected_accounts_map.insert(*account.pubkey(), account.take_account());
             });
         }
 
@@ -386,20 +379,20 @@ mod tests {
         let mut max_pubkey = MIN_PUBKEY;
 
         reader
-            .scan_accounts(|stored_account_meta| {
-                if let Some(account) = expected_accounts_map.get(stored_account_meta.pubkey()) {
+            .scan_accounts(|_offset, stored_account| {
+                if let Some(account) = expected_accounts_map.get(stored_account.pubkey()) {
                     verify_test_account_with_footer(
-                        &stored_account_meta,
+                        &stored_account,
                         account,
-                        stored_account_meta.pubkey(),
+                        stored_account.pubkey(),
                         footer,
                     );
-                    verified_accounts.insert(*stored_account_meta.pubkey());
-                    if min_pubkey > *stored_account_meta.pubkey() {
-                        min_pubkey = *stored_account_meta.pubkey();
+                    verified_accounts.insert(*stored_account.pubkey());
+                    if min_pubkey > *stored_account.pubkey() {
+                        min_pubkey = *stored_account.pubkey();
                     }
-                    if max_pubkey < *stored_account_meta.pubkey() {
-                        max_pubkey = *stored_account_meta.pubkey();
+                    if max_pubkey < *stored_account.pubkey() {
+                        max_pubkey = *stored_account.pubkey();
                     }
                 }
             })

@@ -137,9 +137,6 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --enable-rpc-transaction-history ]]; then
       args+=("$1")
       shift
-    elif [[ $1 = --enable-cpi-and-log-storage ]]; then
-      args+=("$1")
-      shift
     elif [[ $1 = --enable-extended-tx-metadata-storage ]]; then
       args+=("$1")
       shift
@@ -180,6 +177,9 @@ while [[ -n $1 ]]; do
       maybeRequireTower=false
       shift
     elif [[ $1 == --block-production-method ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --transaction-structure ]]; then
       args+=("$1" "$2")
       shift 2
     elif [[ $1 == --wen-restart ]]; then

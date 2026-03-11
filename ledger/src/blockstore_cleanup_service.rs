@@ -5,12 +5,13 @@
 //! the services begins removing data in FIFO order.
 
 use {
-    crate::{
-        blockstore::{Blockstore, PurgeType},
-        blockstore_db::{Result as BlockstoreResult, DATA_SHRED_CF},
+    crate::blockstore::{
+        self,
+        column::{columns, ColumnName},
+        Blockstore, PurgeType,
     },
+    solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_measure::measure::Measure,
-    solana_sdk::clock::{Slot, DEFAULT_MS_PER_SLOT},
     std::{
         string::ToString,
         sync::{
@@ -33,7 +34,7 @@ use {
 pub const DEFAULT_MAX_LEDGER_SHREDS: u64 = 200_000_000;
 
 // Allow down to 50m, or 3.5 days at idle, 1hr at 50k load, around ~100GB
-pub const DEFAULT_MIN_MAX_LEDGER_SHREDS: u64 = 50_000_000;
+pub const DEFAULT_MIN_MAX_LEDGER_SHREDS: u64 = 25_000_000;
 
 // Perform blockstore cleanup at this interval to limit the overhead of cleanup
 // Cleanup will be considered after the latest root has advanced by this value
@@ -105,14 +106,12 @@ impl BlockstoreCleanupService {
         root: Slot,
         max_ledger_shreds: u64,
     ) -> (bool, Slot, u64) {
-        let data_shred_cf_name = DATA_SHRED_CF.to_string();
-
         let live_files = blockstore
             .live_files_metadata()
             .expect("Blockstore::live_files_metadata()");
         let num_shreds = live_files
             .iter()
-            .filter(|live_file| live_file.column_family_name == data_shred_cf_name)
+            .filter(|live_file| live_file.column_family_name == columns::ShredData::NAME)
             .map(|file_meta| file_meta.num_entries)
             .sum();
 
@@ -239,8 +238,8 @@ impl BlockstoreCleanupService {
     }
 
     fn report_disk_metrics(
-        pre: BlockstoreResult<u64>,
-        post: BlockstoreResult<u64>,
+        pre: blockstore::Result<u64>,
+        post: blockstore::Result<u64>,
         total_shreds: u64,
     ) {
         if let (Ok(pre), Ok(post)) = (pre, post) {
@@ -281,7 +280,7 @@ mod tests {
     fn test_find_slots_to_clean() {
         // BlockstoreCleanupService::find_slots_to_clean() does not modify the
         // Blockstore, so we can make repeated calls on the same slots
-        solana_logger::setup();
+        agave_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
@@ -354,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_cleanup() {
-        solana_logger::setup();
+        agave_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let (shreds, _) = make_many_slot_entries(0, 50, 5);
@@ -378,7 +377,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_speed() {
-        solana_logger::setup();
+        agave_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
 
@@ -388,7 +387,7 @@ mod tests {
         let (shreds, _) = make_many_slot_entries(0, initial_slots, initial_entries);
         blockstore.insert_shreds(shreds, None, false).unwrap();
         first_insert.stop();
-        info!("{}", first_insert);
+        info!("{first_insert}");
 
         let mut last_purge_slot = 0;
         let mut slot = initial_slots;
@@ -401,7 +400,7 @@ mod tests {
                 let (shreds, _) = make_many_slot_entries(slot + i * batch_size, batch_size, 5);
                 blockstore.insert_shreds(shreds, None, false).unwrap();
                 if i % 100 == 0 {
-                    info!("inserting..{} of {}", i, batches);
+                    info!("inserting..{i} of {batches}");
                 }
             }
             insert_time.stop();
@@ -415,10 +414,7 @@ mod tests {
                 10,
             );
             time.stop();
-            info!(
-                "slot: {} size: {} {} {}",
-                slot, num_slots, insert_time, time
-            );
+            info!("slot: {slot} size: {num_slots} {insert_time} {time}");
             slot += num_slots;
             num_slots *= 2;
         }

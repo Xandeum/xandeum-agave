@@ -3,14 +3,15 @@ use {
         instruction::SVMInstruction, message_address_table_lookup::SVMMessageAddressTableLookup,
         svm_message::SVMMessage,
     },
-    solana_sdk::{
-        hash::Hash, message::AccountKeys, pubkey::Pubkey, transaction::SanitizedTransaction,
-    },
+    solana_hash::Hash,
+    solana_message::AccountKeys,
+    solana_pubkey::Pubkey,
+    solana_transaction::sanitized::SanitizedTransaction,
 };
 
 impl SVMMessage for SanitizedTransaction {
-    fn num_total_signatures(&self) -> u64 {
-        SVMMessage::num_total_signatures(SanitizedTransaction::message(self))
+    fn num_transaction_signatures(&self) -> u64 {
+        SVMMessage::num_transaction_signatures(SanitizedTransaction::message(self))
     }
 
     fn num_write_locks(&self) -> u64 {
@@ -25,15 +26,21 @@ impl SVMMessage for SanitizedTransaction {
         SVMMessage::num_instructions(SanitizedTransaction::message(self))
     }
 
-    fn instructions_iter(&self) -> impl Iterator<Item = SVMInstruction> {
+    fn instructions_iter(&self) -> impl Iterator<Item = SVMInstruction<'_>> {
         SVMMessage::instructions_iter(SanitizedTransaction::message(self))
     }
 
-    fn program_instructions_iter(&self) -> impl Iterator<Item = (&Pubkey, SVMInstruction)> {
+    fn program_instructions_iter(
+        &self,
+    ) -> impl Iterator<Item = (&Pubkey, SVMInstruction<'_>)> + Clone {
         SVMMessage::program_instructions_iter(SanitizedTransaction::message(self))
     }
 
-    fn account_keys(&self) -> AccountKeys {
+    fn static_account_keys(&self) -> &[Pubkey] {
+        SVMMessage::static_account_keys(SanitizedTransaction::message(self))
+    }
+
+    fn account_keys(&self) -> AccountKeys<'_> {
         SVMMessage::account_keys(SanitizedTransaction::message(self))
     }
 
@@ -57,7 +64,9 @@ impl SVMMessage for SanitizedTransaction {
         SVMMessage::num_lookup_tables(SanitizedTransaction::message(self))
     }
 
-    fn message_address_table_lookups(&self) -> impl Iterator<Item = SVMMessageAddressTableLookup> {
+    fn message_address_table_lookups(
+        &self,
+    ) -> impl Iterator<Item = SVMMessageAddressTableLookup<'_>> {
         SVMMessage::message_address_table_lookups(SanitizedTransaction::message(self))
     }
 }

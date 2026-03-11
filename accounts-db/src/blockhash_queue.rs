@@ -1,10 +1,11 @@
 #[allow(deprecated)]
-use solana_sdk::sysvar::recent_blockhashes;
+use solana_sysvar::recent_blockhashes;
 use {
     serde::{Deserialize, Serialize},
-    solana_sdk::{
-        clock::MAX_RECENT_BLOCKHASHES, fee_calculator::FeeCalculator, hash::Hash, timing::timestamp,
-    },
+    solana_clock::MAX_RECENT_BLOCKHASHES,
+    solana_fee_calculator::FeeCalculator,
+    solana_hash::Hash,
+    solana_time_utils::timestamp,
     std::collections::HashMap,
 };
 
@@ -68,12 +69,6 @@ impl BlockhashQueue {
             .map(|hash_age| hash_age.fee_calculator.lamports_per_signature)
     }
 
-    /// Check if the age of the hash is within the queue's max age
-    #[deprecated(since = "2.0.0", note = "Please use `is_hash_valid_for_age` instead")]
-    pub fn is_hash_valid(&self, hash: &Hash) -> bool {
-        self.hashes.contains_key(hash)
-    }
-
     /// Check if the age of the hash is within the specified age
     pub fn is_hash_valid_for_age(&self, hash: &Hash, max_age: usize) -> bool {
         self.get_hash_info_if_valid(hash, max_age).is_some()
@@ -135,7 +130,7 @@ impl BlockhashQueue {
         note = "Please do not use, will no longer be available in the future"
     )]
     #[allow(deprecated)]
-    pub fn get_recent_blockhashes(&self) -> impl Iterator<Item = recent_blockhashes::IterItem> {
+    pub fn get_recent_blockhashes(&self) -> impl Iterator<Item = recent_blockhashes::IterItem<'_>> {
         (self.hashes).iter().map(|(k, v)| {
             recent_blockhashes::IterItem(v.hash_index, k, v.fee_calculator.lamports_per_signature)
         })
@@ -143,20 +138,20 @@ impl BlockhashQueue {
 
     #[deprecated(
         since = "2.0.0",
-        note = "Please use `solana_program::clock::MAX_PROCESSING_AGE`"
+        note = "Please use `solana_clock::MAX_PROCESSING_AGE`"
     )]
     pub fn get_max_age(&self) -> usize {
+        #[allow(deprecated)]
         self.max_age
     }
 }
 #[cfg(test)]
 mod tests {
     #[allow(deprecated)]
-    use solana_sdk::sysvar::recent_blockhashes::IterItem;
+    use solana_sysvar::recent_blockhashes::IterItem;
     use {
-        super::*,
-        bincode::serialize,
-        solana_sdk::{clock::MAX_RECENT_BLOCKHASHES, hash::hash},
+        super::*, bincode::serialize, solana_clock::MAX_RECENT_BLOCKHASHES,
+        solana_sha256_hasher::hash,
     };
 
     #[test]

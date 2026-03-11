@@ -1,8 +1,13 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![allow(clippy::arithmetic_side_effects)]
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate serde_derive;
 
 pub mod parse_account_data;
 pub mod parse_address_lookup_table;
@@ -21,9 +26,12 @@ pub use solana_account_decoder_client_types::{
     UiAccount, UiAccountData, UiAccountEncoding, UiDataSliceConfig,
 };
 use {
-    crate::parse_account_data::{parse_account_data_v2, AccountAdditionalDataV2},
+    crate::parse_account_data::{parse_account_data_v3, AccountAdditionalDataV3},
     base64::{prelude::BASE64_STANDARD, Engine},
-    solana_sdk::{account::ReadableAccount, fee_calculator::FeeCalculator, pubkey::Pubkey},
+    serde::{Deserialize, Serialize},
+    solana_account::ReadableAccount,
+    solana_fee_calculator::FeeCalculator,
+    solana_pubkey::Pubkey,
     std::io::Write,
 };
 
@@ -47,7 +55,7 @@ pub fn encode_ui_account<T: ReadableAccount>(
     pubkey: &Pubkey,
     account: &T,
     encoding: UiAccountEncoding,
-    additional_data: Option<AccountAdditionalDataV2>,
+    additional_data: Option<AccountAdditionalDataV3>,
     data_slice_config: Option<UiDataSliceConfig>,
 ) -> UiAccount {
     let space = account.data().len();
@@ -79,7 +87,7 @@ pub fn encode_ui_account<T: ReadableAccount>(
         }
         UiAccountEncoding::JsonParsed => {
             if let Ok(parsed_data) =
-                parse_account_data_v2(pubkey, account.owner(), account.data(), additional_data)
+                parse_account_data_v3(pubkey, account.owner(), account.data(), additional_data)
             {
                 UiAccountData::Json(parsed_data)
             } else {
@@ -141,7 +149,7 @@ mod test {
     use {
         super::*,
         assert_matches::assert_matches,
-        solana_sdk::account::{Account, AccountSharedData},
+        solana_account::{Account, AccountSharedData},
     };
 
     #[test]

@@ -12,12 +12,8 @@
 //! RuntimeTransaction types, not the TransactionMeta itself.
 //!
 use {
-    crate::compute_budget_instruction_details::ComputeBudgetInstructionDetails,
-    solana_compute_budget::compute_budget_limits::ComputeBudgetLimits,
-    solana_sdk::{
-        feature_set::FeatureSet, hash::Hash, message::TransactionSignatureDetails,
-        transaction::Result,
-    },
+    solana_compute_budget_instruction::compute_budget_instruction_details::ComputeBudgetInstructionDetails,
+    solana_hash::Hash, solana_message::TransactionSignatureDetails,
 };
 
 /// metadata can be extracted statically from sanitized transaction,
@@ -26,7 +22,8 @@ pub trait StaticMeta {
     fn message_hash(&self) -> &Hash;
     fn is_simple_vote_transaction(&self) -> bool;
     fn signature_details(&self) -> &TransactionSignatureDetails;
-    fn compute_budget_limits(&self, feature_set: &FeatureSet) -> Result<ComputeBudgetLimits>;
+    fn compute_budget_instruction_details(&self) -> &ComputeBudgetInstructionDetails;
+    fn instruction_data_len(&self) -> u16;
 }
 
 /// Statically loaded meta is a supertrait of Dynamically loaded meta, when
@@ -43,4 +40,5 @@ pub struct TransactionMeta {
     pub(crate) is_simple_vote_transaction: bool,
     pub(crate) signature_details: TransactionSignatureDetails,
     pub(crate) compute_budget_instruction_details: ComputeBudgetInstructionDetails,
+    pub(crate) instruction_data_len: u16,
 }

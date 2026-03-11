@@ -21,6 +21,28 @@ The Solana validator community holds regular educational workshops. You can
 watch past workshops through the
 [Solana validator educational workshops playlist](https://www.youtube.com/watch?v=86zySQ5vGW8&list=PLilwLeBwGuK6jKrmn7KOkxRxS9tvbRa5p).
 
+## Community Validator calls
+
+The Solana validator community holds regular calls. 
+There is the 'Solana Foundation Validator Discussion' which is hosted by the Solana Foundation and the 'Community Led Validator Call'
+which is hosted by the community itself. 
+
+### Solana Foundation Validator Discussion
+
+This is a monthly call that is hosted by the Solana Foundation. 
+- Schedule: every second Thursday of the month 18:00 CET
+- Agenda: See [validator-announcements channel in Discord](https://discord.com/channels/428295358100013066/586252910506016798). 
+- This call **is recorded** and past calls can be watched back on the [Community Validator Discussions playlist](https://www.youtube.com/playlist?list=PLilwLeBwGuK78yjGBZwYhTf7rao0t13Zw)
+
+### Community Led Validator Call
+
+This is also a monthly call hosted by the Solana validator community itself.
+- Schedule: every fourth Thursday of the month 18:00 CET
+- Agenda: See [HackMD site](https://hackmd.io/1DFauFMWTZG37-U7CXhxMg?view#Solana-Community-Validator-Call-Agendas). 
+- This call is **not recorded**
+
+***Please note that the scheduling of these calls can be changed last minute due to any circumstances. For the most up-to-date information go to the [validator-announcements channel in Discord](https://discord.com/channels/428295358100013066/586252910506016798).***
+
 ## Help with the validator command line
 
 From within the Solana CLI, you can execute the `agave-validator` command with
@@ -67,45 +89,18 @@ will need to upgrade often, so it is important to get comfortable with this
 process.
 
 > **Note** validator nodes do not need to be offline while the newest version is
-> being downloaded or built from source. All methods below can be done before
+> being built from source. All methods below can be done before
 > the validator process is restarted.
 
-### Building From Source
+### Building the newest version from source
 
-It is a best practice to always build your Agave binaries from source. If you
-build from source, you are certain that the code you are building has not been
-tampered with before the binary was created. You may also be able to optimize
-your `agave-validator` binary to your specific hardware.
-
-If you build from source on the validator machine (or a machine with the same
-CPU), you can target your specific architecture using the `-march` flag. Refer
-to the following doc for
-[instructions on building from source](../../cli/install.md#build-from-source).
-
-### agave-install
-
-If you are not comfortable building from source, or you need to quickly install
-a new version to test something out, you could instead try using the
-`agave-install` command.
-
-Assuming you want to install Agave version `1.14.17`, you would execute the
-following:
-
-```
-agave-install init 1.14.17
-```
-
-This command downloads the executable for `1.14.17` and installs it into a
-`.local` directory. You can also look at `agave-install --help` for more
-options.
-
-> **Note** this command only works if you already have the solana cli installed.
-> If you do not have the cli installed, refer to
-> [install solana cli tools](../../cli/install.md)
+The easiest way to upgrade the Solana CLI software is to build the newest
+version from source. See the
+[build from source](../../cli/install.md#build-from-source) instructions for details.
 
 ### Restart
 
-For all install methods, the validator process will need to be restarted before
+The validator process will need to be restarted before
 the newly installed version is in use. Use `agave-validator exit` to restart
 your validator process.
 
@@ -128,7 +123,7 @@ ledger. Therefore, you should not download a new snapshot any time your
 validator is offline or experiences an issue. Downloading a snapshot should only
 be reserved for occasions when you do not have local state. Prolonged downtime
 or the first install of a new validator are examples of times when you may not
-have state locally. In other cases such as restarts for upgrades, a snapshot
+have state locally. In other cases, such as restarts for upgrades, a snapshot
 download should be avoided.
 
 To avoid downloading a snapshot on restart, add the following flag to the
@@ -157,41 +152,6 @@ If one of the known validators is downloading slowly, you can try adding the
 `--minimal-snapshot-download-speed` flag to your validator. This flag will
 switch to another known validator if the initial download speed is below the
 threshold that you set.
-
-### Manually Downloading Snapshots
-
-In the case that there are network troubles with one or more of your known
-validators, then you may have to manually download the snapshot. To manually
-download a snapshot from one of your known validators, first, find the IP
-address of the validator in using the `solana gossip` command. In the example
-below, `5D1fNXzvv5NjV1ysLjirC4WY92RNsVH18vjmcszZd8on` is the pubkey of one of my
-known validators:
-
-```
-solana gossip | grep 5D1fNXzvv5NjV1ysLjirC4WY92RNsVH18vjmcszZd8on
-```
-
-The IP address of the validators is `139.178.68.207` and the open port on this
-validator is `80`. You can see the IP address and port in the fifth column in
-the gossip output:
-
-```
-139.178.68.207  | 5D1fNXzvv5NjV1ysLjirC4WY92RNsVH18vjmcszZd8on | 8001   | 8004  | 139.178.68.207:80     | 1.10.27 | 1425680972
-```
-
-Now that the IP and port are known, you can download a full snapshot or an
-incremental snapshot:
-
-```
-wget --trust-server-names http://139.178.68.207:80/snapshot.tar.bz2
-wget --trust-server-names http://139.178.68.207:80/incremental-snapshot.tar.bz2
-```
-
-Now move those files into your snapshot directory. If you have not specified a
-snapshot directory, then you should put the files in your ledger directory.
-
-Once you have a local snapshot, you can restart your validator with the
-`--no-snapshot-fetch` flag.
 
 ## Regularly Check Account Balances
 

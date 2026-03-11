@@ -2,14 +2,15 @@
 
 use {
     crate::result::{Error, Result},
-    crossbeam_channel::{unbounded, RecvTimeoutError},
+    crossbeam_channel::{unbounded, RecvTimeoutError, TrySendError},
+    solana_clock::{DEFAULT_TICKS_PER_SLOT, HOLD_TRANSACTIONS_SLOT_OFFSET},
     solana_metrics::{inc_new_counter_debug, inc_new_counter_info},
-    solana_perf::{packet::PacketBatchRecycler, recycler::Recycler},
-    solana_poh::poh_recorder::PohRecorder,
-    solana_sdk::{
-        clock::{DEFAULT_TICKS_PER_SLOT, HOLD_TRANSACTIONS_SLOT_OFFSET},
-        packet::{Packet, PacketFlags},
+    solana_packet::PacketFlags,
+    solana_perf::{
+        packet::{PacketBatchRecycler, PacketRefMut},
+        recycler::Recycler,
     },
+    solana_poh::poh_recorder::PohRecorder,
     solana_streamer::streamer::{
         self, PacketBatchReceiver, PacketBatchSender, StreamerReceiveStats,
     },
@@ -36,7 +37,7 @@ impl FetchStage {
         tpu_vote_sockets: Vec<UdpSocket>,
         exit: Arc<AtomicBool>,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
-        coalesce: Duration,
+        coalesce: Option<Duration>,
     ) -> (Self, PacketBatchReceiver, PacketBatchReceiver) {
         let (sender, receiver) = unbounded();
         let (vote_sender, vote_receiver) = unbounded();
@@ -72,7 +73,7 @@ impl FetchStage {
         forward_sender: &PacketBatchSender,
         forward_receiver: PacketBatchReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
-        coalesce: Duration,
+        coalesce: Option<Duration>,
         in_vote_only_mode: Option<Arc<AtomicBool>>,
         tpu_enable_udp: bool,
     ) -> Self {
@@ -100,7 +101,7 @@ impl FetchStage {
         sendr: &PacketBatchSender,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
     ) -> Result<()> {
-        let mark_forwarded = |packet: &mut Packet| {
+        let mark_forwarded = |mut packet: PacketRefMut| {
             packet.meta_mut().flags |= PacketFlags::FORWARDED;
         };
 
@@ -123,12 +124,23 @@ impl FetchStage {
             .unwrap()
             .would_be_leader(HOLD_TRANSACTIONS_SLOT_OFFSET.saturating_mul(DEFAULT_TICKS_PER_SLOT))
         {
-            inc_new_counter_debug!("fetch_stage-honor_forwards", num_packets);
+            let mut packets_sent = 0usize;
+            let mut packets_dropped = 0usize;
             for packet_batch in packet_batches {
-                #[allow(clippy::question_mark)]
-                if sendr.send(packet_batch).is_err() {
-                    return Err(Error::Send);
-                }
+                let packets_in_batch = packet_batch.len();
+                match sendr.try_send(packet_batch) {
+                    Ok(()) => {
+                        packets_sent += packets_in_batch;
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        packets_dropped += packets_in_batch;
+                    }
+                    Err(TrySendError::Disconnected(_)) => return Err(Error::Send),
+                };
+            }
+            inc_new_counter_debug!("fetch_stage-honor_forwards", packets_sent);
+            if packets_dropped > 0 {
+                inc_new_counter_error!("fetch_stage-dropped_forwards", packets_dropped);
             }
         } else {
             inc_new_counter_info!("fetch_stage-discard_forwards", num_packets);
@@ -148,7 +160,7 @@ impl FetchStage {
         forward_sender: &PacketBatchSender,
         forward_receiver: PacketBatchReceiver,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
-        coalesce: Duration,
+        coalesce: Option<Duration>,
         in_vote_only_mode: Option<Arc<AtomicBool>>,
         tpu_enable_udp: bool,
     ) -> Self {
@@ -237,7 +249,7 @@ impl FetchStage {
                         Error::RecvTimeout(RecvTimeoutError::Timeout) => (),
                         Error::Recv(_) => break,
                         Error::Send => break,
-                        _ => error!("{:?}", e),
+                        _ => error!("{e:?}"),
                     }
                 }
             })

@@ -68,7 +68,7 @@ impl MerkleTree {
         if level_len == 1 {
             0
         } else {
-            (level_len + 1) / 2
+            level_len.div_ceil(2)
         }
     }
 
@@ -139,7 +139,7 @@ impl MerkleTree {
         self.nodes.iter().last()
     }
 
-    pub fn find_path(&self, index: usize) -> Option<Proof> {
+    pub fn find_path(&self, index: usize) -> Option<Proof<'_>> {
         if index >= self.leaf_count {
             return None;
         }

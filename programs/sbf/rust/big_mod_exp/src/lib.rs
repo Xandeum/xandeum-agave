@@ -1,10 +1,12 @@
 //! Big_mod_exp Syscall tests
 
-extern crate solana_program;
-use solana_program::{big_mod_exp::big_mod_exp, custom_panic_default, msg};
+use {
+    solana_big_mod_exp::big_mod_exp, solana_msg::msg,
+    solana_program_entrypoint::custom_panic_default,
+};
 
 fn big_mod_exp_test() {
-    #[derive(serde_derive::Deserialize)]
+    #[derive(serde::Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct TestCase {
         base: String,

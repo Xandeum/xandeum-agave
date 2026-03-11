@@ -1,36 +1,34 @@
 use {
     crate::{args::*, canonicalize_ledger_path, ledger_utils::*},
+    agave_syscalls::create_program_runtime_environment_v1,
     clap::{App, AppSettings, Arg, ArgMatches, SubCommand},
     log::*,
-    serde_derive::{Deserialize, Serialize},
+    serde::{Deserialize, Serialize},
     serde_json::Result,
-    solana_bpf_loader_program::{
-        create_vm, load_program_from_bytes, serialization::serialize_parameters,
-        syscalls::create_program_runtime_environment_v1,
+    solana_account::{
+        create_account_shared_data_for_test, state_traits::StateMut, AccountSharedData,
     },
+    solana_bpf_loader_program::{create_vm, load_program_from_bytes},
     solana_cli_output::{OutputFormat, QuietDisplay, VerboseDisplay},
+    solana_clock::Slot,
     solana_ledger::blockstore_options::AccessType,
+    solana_loader_v3_interface::state::UpgradeableLoaderState,
     solana_program_runtime::{
         invoke_context::InvokeContext,
         loaded_programs::{
             LoadProgramMetrics, ProgramCacheEntryType, DELAY_VISIBILITY_SLOT_OFFSET,
         },
+        serialization::serialize_parameters,
         with_mock_invoke_context,
     },
-    solana_rbpf::{
-        assembler::assemble, elf::Executable, static_analysis::Analysis,
+    solana_pubkey::Pubkey,
+    solana_runtime::bank::Bank,
+    solana_sbpf::{
+        assembler::assemble, ebpf::MM_INPUT_START, elf::Executable, static_analysis::Analysis,
         verifier::RequisiteVerifier,
     },
-    solana_runtime::bank::Bank,
-    solana_sdk::{
-        account::{create_account_shared_data_for_test, AccountSharedData},
-        account_utils::StateMut,
-        bpf_loader_upgradeable::{self, UpgradeableLoaderState},
-        pubkey::Pubkey,
-        slot_history::Slot,
-        sysvar,
-        transaction_context::{IndexOfAccount, InstructionAccount},
-    },
+    solana_sdk_ids::{bpf_loader_upgradeable, sysvar},
+    solana_transaction_context::{IndexOfAccount, InstructionAccount, InstructionContext},
     std::{
         collections::HashMap,
         fmt::{self, Debug, Formatter},
@@ -60,6 +58,7 @@ struct Account {
 struct Input {
     program_id: String,
     accounts: Vec<Account>,
+    #[serde(with = "serde_bytes")]
     instruction_data: Vec<u8>,
 }
 fn load_accounts(path: &Path) -> Result<Input> {
@@ -241,11 +240,11 @@ impl VerboseDisplay for Output {}
 // https://github.com/rust-lang/rust/issues/74465
 struct LazyAnalysis<'a, 'b> {
     analysis: Option<Analysis<'a>>,
-    executable: &'a Executable<InvokeContext<'b>>,
+    executable: &'a Executable<InvokeContext<'b, 'b>>,
 }
 
 impl<'a, 'b> LazyAnalysis<'a, 'b> {
-    fn new(executable: &'a Executable<InvokeContext<'b>>) -> Self {
+    fn new(executable: &'a Executable<InvokeContext<'b, 'b>>) -> Self {
         Self {
             analysis: None,
             executable,
@@ -261,34 +260,11 @@ impl<'a, 'b> LazyAnalysis<'a, 'b> {
     }
 }
 
-fn output_trace(
-    matches: &ArgMatches<'_>,
-    trace: &[[u64; 12]],
-    frame: usize,
-    analysis: &mut LazyAnalysis,
-) {
-    if matches.value_of("trace").unwrap() == "stdout" {
-        writeln!(&mut std::io::stdout(), "Frame {frame}").unwrap();
-        analysis
-            .analyze()
-            .disassemble_trace_log(&mut std::io::stdout(), trace)
-            .unwrap();
-    } else {
-        let filename = format!("{}.{}", matches.value_of("trace").unwrap(), frame);
-        let mut fd = File::create(filename).unwrap();
-        writeln!(&fd, "Frame {frame}").unwrap();
-        analysis
-            .analyze()
-            .disassemble_trace_log(&mut fd, trace)
-            .unwrap();
-    }
-}
-
 fn load_program<'a>(
     filename: &Path,
     program_id: Pubkey,
-    invoke_context: &InvokeContext<'a>,
-) -> Executable<InvokeContext<'a>> {
+    invoke_context: &InvokeContext<'a, 'a>,
+) -> Executable<InvokeContext<'a, 'a>> {
     let mut file = File::open(filename).unwrap();
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic).unwrap();
@@ -348,9 +324,10 @@ fn load_program<'a>(
     #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
     verified_executable.jit_compile().unwrap();
     unsafe {
-        std::mem::transmute::<Executable<InvokeContext<'static>>, Executable<InvokeContext<'a>>>(
-            verified_executable,
-        )
+        std::mem::transmute::<
+            Executable<InvokeContext<'static, 'static>>,
+            Executable<InvokeContext<'a, 'a>>,
+        >(verified_executable)
     }
 }
 
@@ -409,13 +386,7 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
                 pubkey,
                 AccountSharedData::new(0, allocation_size, &Pubkey::new_unique()),
             ));
-            instruction_accounts.push(InstructionAccount {
-                index_in_transaction: 0,
-                index_in_caller: 0,
-                index_in_callee: 0,
-                is_signer: false,
-                is_writable: true,
-            });
+            instruction_accounts.push(InstructionAccount::new(0, false, true));
             vec![]
         }
         Err(_) => {
@@ -447,7 +418,7 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
                                 programdata_address,
                             }) = account.state()
                             {
-                                debug!("Program data address {}", programdata_address);
+                                debug!("Program data address {programdata_address}");
                                 if bank
                                     .get_account_with_fixed_root(&programdata_address)
                                     .is_some()
@@ -486,13 +457,11 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
                         transaction_accounts.push((pubkey, account));
                         idx
                     };
-                    InstructionAccount {
-                        index_in_transaction: txn_acct_index as IndexOfAccount,
-                        index_in_caller: txn_acct_index as IndexOfAccount,
-                        index_in_callee: txn_acct_index as IndexOfAccount,
-                        is_signer: account_info.is_signer.unwrap_or(false),
-                        is_writable: account_info.is_writable.unwrap_or(false),
-                    }
+                    InstructionAccount::new(
+                        txn_acct_index as IndexOfAccount,
+                        account_info.is_signer.unwrap_or(false),
+                        account_info.is_writable.unwrap_or(false),
+                    )
                 })
                 .collect();
             input.instruction_data
@@ -501,7 +470,7 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
     let program_index: u16 = instruction_accounts.len().try_into().unwrap();
     transaction_accounts.push((
         loader_id,
-        AccountSharedData::new(0, 0, &solana_sdk::native_loader::id()),
+        AccountSharedData::new(0, 0, &solana_sdk_ids::native_loader::id()),
     ));
     transaction_accounts.push((
         program_id, // ID of the loaded program. It can modify accounts with the same owner key
@@ -514,42 +483,46 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
     let interpreted = matches.value_of("mode").unwrap() != "jit";
     with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
 
+    let provide_instruction_data_offset_in_vm_r2 = invoke_context
+        .get_feature_set()
+        .provide_instruction_data_offset_in_vm_r2;
+
     // Adding `DELAY_VISIBILITY_SLOT_OFFSET` to slots to accommodate for delay visibility of the program
     let mut program_cache_for_tx_batch =
-        bank.new_program_cache_for_tx_batch_for_slot(bank.slot() + DELAY_VISIBILITY_SLOT_OFFSET);
+        ProgramCacheForTxBatch::new(bank.slot() + DELAY_VISIBILITY_SLOT_OFFSET);
     for key in cached_account_keys {
         program_cache_for_tx_batch.replenish(
             key,
             bank.load_program(&key, false, bank.epoch())
                 .expect("Couldn't find program account"),
         );
-        debug!("Loaded program {}", key);
+        debug!("Loaded program {key}");
     }
     invoke_context.program_cache_for_tx_batch = &mut program_cache_for_tx_batch;
 
     invoke_context
         .transaction_context
-        .get_next_instruction_context()
-        .unwrap()
-        .configure(
-            &[program_index, program_index.saturating_add(1)],
-            &instruction_accounts,
-            &instruction_data,
-        );
+        .configure_next_instruction_for_tests(
+            program_index.saturating_add(1),
+            instruction_accounts,
+            instruction_data,
+        )
+        .unwrap();
     invoke_context.push().unwrap();
-    let (_parameter_bytes, regions, account_lengths) = serialize_parameters(
-        invoke_context.transaction_context,
-        invoke_context
-            .transaction_context
-            .get_current_instruction_context()
-            .unwrap(),
-        true, // copy_account_data
-    )
-    .unwrap();
+    let (_parameter_bytes, regions, account_lengths, instruction_data_offset) =
+        serialize_parameters(
+            &invoke_context
+                .transaction_context
+                .get_current_instruction_context()
+                .unwrap(),
+            false, // stricter_abi_and_runtime_constraints
+            false, // account_data_direct_mapping
+            true,  // for mask_out_rent_epoch_in_vm_serialization
+        )
+        .unwrap();
 
     let program = matches.value_of("PROGRAM").unwrap();
     let verified_executable = load_program(Path::new(program), program_id, &invoke_context);
-    let mut analysis = LazyAnalysis::new(&verified_executable);
     create_vm!(
         vm,
         &verified_executable,
@@ -562,20 +535,51 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
     if matches.value_of("mode").unwrap() == "debugger" {
         vm.debug_port = Some(matches.value_of("port").unwrap().parse::<u16>().unwrap());
     }
+    vm.registers[1] = MM_INPUT_START;
+
+    // SIMD-0321: Provide offset to instruction data in VM register 2.
+    if provide_instruction_data_offset_in_vm_r2 {
+        vm.registers[2] = instruction_data_offset as u64;
+    }
     let (instruction_count, result) = vm.execute_program(&verified_executable, interpreted);
     let duration = Instant::now() - start_time;
-    if matches.occurrences_of("trace") > 0 {
-        // top level trace is stored in syscall_context
-        if let Some(Some(syscall_context)) = vm.context_object_pointer.syscall_context.last() {
-            let trace = syscall_context.trace_log.as_slice();
-            output_trace(matches, trace, 0, &mut analysis);
-        }
-        // the remaining traces are saved in InvokeContext when
-        // corresponding syscall_contexts are popped
-        let traces = vm.context_object_pointer.get_traces();
-        for (frame, trace) in traces.iter().filter(|t| !t.is_empty()).enumerate() {
-            output_trace(matches, trace, frame + 1, &mut analysis);
-        }
+    if let Some(trace_option) = matches.value_of("trace") {
+        vm.context_object_pointer.iterate_vm_traces(
+            &|instruction_context: InstructionContext, executable, register_trace| {
+                let mut analysis = LazyAnalysis::new(executable);
+                if trace_option == "stdout" {
+                    writeln!(
+                        &mut std::io::stdout(),
+                        "TX Instruction {} Program {:?}",
+                        instruction_context.get_index_in_trace(),
+                        instruction_context.get_program_key(),
+                    )
+                    .unwrap();
+                    analysis
+                        .analyze()
+                        .disassemble_register_trace(&mut std::io::stdout(), register_trace)
+                        .unwrap();
+                } else {
+                    let filename = format!(
+                        "{}.{}",
+                        trace_option,
+                        instruction_context.get_index_in_trace()
+                    );
+                    let mut fd = File::create(filename).unwrap();
+                    writeln!(
+                        &fd,
+                        "TX Instruction {} Program {:?}",
+                        instruction_context.get_index_in_trace(),
+                        instruction_context.get_program_key(),
+                    )
+                    .unwrap();
+                    analysis
+                        .analyze()
+                        .disassemble_register_trace(&mut fd, register_trace)
+                        .unwrap();
+                }
+            },
+        );
     }
     drop(vm);
 

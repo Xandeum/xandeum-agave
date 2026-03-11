@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 //! A client for the ledger state, from the perspective of an arbitrary validator.
 //!
 //! Use start_tcp_client() to create a client and then import BanksClientExt to
@@ -12,20 +21,21 @@ pub use {
 use {
     borsh::BorshDeserialize,
     futures::future::join_all,
+    solana_account::{from_account, Account},
     solana_banks_interface::{
         BanksRequest, BanksResponse, BanksTransactionResultWithMetadata,
         BanksTransactionResultWithSimulation,
     },
-    solana_program::{
-        clock::Slot, hash::Hash, program_pack::Pack, pubkey::Pubkey, rent::Rent, sysvar::Sysvar,
-    },
-    solana_sdk::{
-        account::{from_account, Account},
-        commitment_config::CommitmentLevel,
-        message::Message,
-        signature::Signature,
-        transaction::{self, VersionedTransaction},
-    },
+    solana_clock::Slot,
+    solana_commitment_config::CommitmentLevel,
+    solana_hash::Hash,
+    solana_message::Message,
+    solana_program_pack::Pack,
+    solana_pubkey::Pubkey,
+    solana_rent::Rent,
+    solana_signature::Signature,
+    solana_sysvar::SysvarSerialize,
+    solana_transaction::versioned::VersionedTransaction,
     tarpc::{
         client::{self, NewClient, RequestDispatch},
         context::{self, Context},
@@ -37,6 +47,10 @@ use {
 };
 
 mod error;
+
+mod transaction {
+    pub use solana_transaction_error::TransactionResult as Result;
+}
 
 // This exists only for backward compatibility
 pub trait BanksClientExt {}
@@ -177,7 +191,7 @@ impl BanksClient {
     }
 
     /// Return the cluster Sysvar
-    pub async fn get_sysvar<T: Sysvar>(&self) -> Result<T, BanksClientError> {
+    pub async fn get_sysvar<T: SysvarSerialize>(&self) -> Result<T, BanksClientError> {
         let sysvar = self
             .get_account(T::id())
             .await?
@@ -448,7 +462,6 @@ impl BanksClient {
             .await?
             .map(|x| x.0)
             .ok_or(BanksClientError::ClientError("valid blockhash not found"))
-            .map_err(Into::into)
     }
 
     pub async fn get_latest_blockhash_with_commitment(
@@ -533,9 +546,9 @@ mod tests {
             bank::Bank, bank_forks::BankForks, commitment::BlockCommitmentCache,
             genesis_utils::create_genesis_config,
         },
-        solana_sdk::{
-            message::Message, signature::Signer, system_instruction, transaction::Transaction,
-        },
+        solana_signer::Signer,
+        solana_system_interface::instruction as system_instruction,
+        solana_transaction::Transaction,
         std::sync::{Arc, RwLock},
         tarpc::transport,
         tokio::{
@@ -565,7 +578,7 @@ mod tests {
         ));
         let bank_forks = BankForks::new_rw_arc(bank);
 
-        let bob_pubkey = solana_sdk::pubkey::new_rand();
+        let bob_pubkey = solana_pubkey::new_rand();
         let mint_pubkey = genesis.mint_keypair.pubkey();
         let instruction = system_instruction::transfer(&mint_pubkey, &bob_pubkey, 1);
         let message = Message::new(&[instruction], Some(&mint_pubkey));
@@ -605,7 +618,7 @@ mod tests {
         let bank_forks = BankForks::new_rw_arc(bank);
 
         let mint_pubkey = &genesis.mint_keypair.pubkey();
-        let bob_pubkey = solana_sdk::pubkey::new_rand();
+        let bob_pubkey = solana_pubkey::new_rand();
         let instruction = system_instruction::transfer(mint_pubkey, &bob_pubkey, 1);
         let message = Message::new(&[instruction], Some(mint_pubkey));
 

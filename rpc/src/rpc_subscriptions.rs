@@ -7,59 +7,39 @@ use {
         parsed_token_accounts::{get_parsed_token_account, get_parsed_token_accounts},
         rpc_pubsub_service::PubSubConfig,
         rpc_subscription_tracker::{
-            AccountSubscriptionParams, BlockSubscriptionKind, BlockSubscriptionParams,
-            LogsSubscriptionKind, LogsSubscriptionParams, ProgramSubscriptionParams,
-            SignatureSubscriptionParams, SubscriptionControl, SubscriptionId, SubscriptionInfo,
-            SubscriptionParams, SubscriptionsTracker,
+            AccountSubscriptionParams, BlockSubscriptionKind, BlockSubscriptionParams, LogsSubscriptionKind, LogsSubscriptionParams, ProgramSubscriptionParams, SignatureSubscriptionParams, SignatureSubscriptionType, SubscriptionControl, SubscriptionId, SubscriptionInfo, SubscriptionParams, SubscriptionsTracker
         },
-    },
-    crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender},
-    itertools::Either,
-    rayon::prelude::*,
-    serde::Serialize,
-    solana_account_decoder::{
-        encode_ui_account, parse_token::is_known_spl_token_id, UiAccount, UiAccountEncoding,
-    },
-    solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path},
-    solana_measure::measure::Measure,
-    solana_rpc_client_api::response::{
+    }, crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender}, itertools::Either, rayon::prelude::*, serde::Serialize, solana_account::{AccountSharedData, ReadableAccount}, solana_account_decoder::{
+        UiAccount, UiAccountEncoding, encode_ui_account, parse_token::is_known_spl_token_id
+    }, solana_client::rpc_response::RpcApiVersion, solana_clock::Slot, solana_commitment_config::CommitmentConfig, solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path}, solana_measure::measure::Measure, solana_pubkey::Pubkey, solana_rpc_client_api::response::{
         ProcessedSignatureResult, ReceivedSignatureResult, Response as RpcResponse, RpcBlockUpdate,
         RpcBlockUpdateError, RpcKeyedAccount, RpcLogsResponse, RpcResponseContext,
         RpcSignatureResult, RpcVote, SlotInfo, SlotUpdate,
-    },
-    solana_runtime::{
+    }, solana_runtime::{
         bank::{Bank, TransactionLogInfo},
         bank_forks::BankForks,
         commitment::{BlockCommitmentCache, CommitmentSlots},
-    },
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount},
-        clock::Slot,
-        pubkey::Pubkey,
-        signature::Signature,
-        timing::timestamp,
-        transaction,
-    },
-    solana_transaction_status::{
+    }, solana_signature::Signature, solana_time_utils::timestamp, solana_transaction_error::TransactionError, solana_transaction_status::{
         BlockEncodingOptions, ConfirmedBlock, EncodeError, VersionedConfirmedBlock,
-    },
-    solana_vote::vote_transaction::VoteTransaction,
-    std::{
+    }, solana_vote::vote_transaction::VoteTransaction, std::{
         cell::RefCell,
         collections::{HashMap, VecDeque},
         io::Cursor,
         str,
         sync::{
-            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-            Arc, Mutex, RwLock, Weak,
+            Arc, Mutex, RwLock, Weak, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}
         },
-        thread::{Builder, JoinHandle},
+        thread::{Builder, JoinHandle, sleep},
         time::{Duration, Instant},
-    },
-    tokio::sync::broadcast,
+    }, tokio::sync::broadcast
 };
 
+mod transaction {
+    pub use solana_transaction_error::TransactionResult as Result;
+}
+
 const RECEIVE_DELAY_MILLIS: u64 = 100;
+pub type SlotSignatures = (Slot, Vec<Signature>);
 
 fn get_transaction_logs(
     bank: &Bank,
@@ -95,38 +75,46 @@ impl From<NotificationEntry> for TimestampedNotificationEntry {
 
 pub enum NotificationEntry {
     Slot(SlotInfo),
-    SlotUpdate(SlotUpdate),
     Vote((Pubkey, VoteTransaction, Signature)),
-    Root(Slot),
-    Bank(CommitmentSlots),
-    Gossip(Slot),
-    SignaturesReceived((Slot, Vec<Signature>)),
+    Root(u64),
+    Bank(CommitmentSlots), // Corrected from Bank(Bank) to CommitmentSlots
+    SignaturesReceived(SlotSignatures),
     Subscribed(SubscriptionParams, SubscriptionId),
     Unsubscribed(SubscriptionParams, SubscriptionId),
+    XandeumResult(Signature, serde_json::Value), // Your Xandeum addition
+    SignatureSubscribe(Signature, RpcSignatureResult),
+    LogsSubscribe(Vec<String>),
+    SlotUpdate(SlotUpdate), // Added missing variant
+    Gossip(Slot),           // Added missing variant
 }
 
 impl std::fmt::Debug for NotificationEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            NotificationEntry::Root(root) => write!(f, "Root({root})"),
-            NotificationEntry::Vote(vote) => write!(f, "Vote({vote:?})"),
             NotificationEntry::Slot(slot_info) => write!(f, "Slot({slot_info:?})"),
-            NotificationEntry::SlotUpdate(slot_update) => {
-                write!(f, "SlotUpdate({slot_update:?})")
-            }
+            NotificationEntry::Vote(vote) => write!(f, "Vote({vote:?})"),
+            NotificationEntry::Root(root) => write!(f, "Root({root})"),
             NotificationEntry::Bank(commitment_slots) => {
-                write!(f, "Bank({{slot: {:?}}})", commitment_slots.slot)
+                write!(f, "Bank(slot: {}, root: {})", commitment_slots.slot, commitment_slots.root)
             }
             NotificationEntry::SignaturesReceived(slot_signatures) => {
                 write!(f, "SignaturesReceived({slot_signatures:?})")
             }
-            NotificationEntry::Gossip(slot) => write!(f, "Gossip({slot:?})"),
             NotificationEntry::Subscribed(params, id) => {
                 write!(f, "Subscribed({params:?}, {id:?})")
             }
             NotificationEntry::Unsubscribed(params, id) => {
                 write!(f, "Unsubscribed({params:?}, {id:?})")
             }
+            NotificationEntry::XandeumResult(signature, value) => {
+                write!(f, "XandeumResult({signature:?}, {value:?})")
+            }
+            NotificationEntry::SignatureSubscribe(signature, result) => {
+                write!(f, "SignatureSubscribe({signature:?}, {result:?})")
+            }
+            NotificationEntry::LogsSubscribe(logs) => write!(f, "LogsSubscribe({logs:?})"),
+            NotificationEntry::SlotUpdate(slot_update) => write!(f, "SlotUpdate({slot_update:?})"),
+            NotificationEntry::Gossip(slot) => write!(f, "Gossip({slot:?})"),
         }
     }
 }
@@ -401,7 +389,9 @@ fn filter_signature_result(
 ) -> (Option<RpcSignatureResult>, Slot) {
     (
         result.map(|result| {
-            RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult { err: result.err() })
+            RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
+                err: result.err().map(Into::into),
+            })
         }),
         last_notified_slot,
     )
@@ -445,7 +435,7 @@ fn filter_logs_results(
 ) -> (impl Iterator<Item = RpcLogsResponse>, Slot) {
     let responses = logs.into_iter().flatten().map(|log| RpcLogsResponse {
         signature: log.signature.to_string(),
-        err: log.result.err(),
+        err: log.result.err().map(Into::into),
         logs: log.log_messages,
     });
     (responses, last_notified_slot)
@@ -522,7 +512,7 @@ pub struct RpcSubscriptions {
 impl Drop for RpcSubscriptions {
     fn drop(&mut self) {
         self.shutdown().unwrap_or_else(|err| {
-            warn!("RPC Notification - shutdown error: {:?}", err);
+            warn!("RPC Notification - shutdown error: {err:?}");
         });
     }
 }
@@ -531,32 +521,32 @@ impl RpcSubscriptions {
     pub fn new(
         exit: Arc<AtomicBool>,
         max_complete_transaction_status_slot: Arc<AtomicU64>,
-        max_complete_rewards_slot: Arc<AtomicU64>,
         blockstore: Arc<Blockstore>,
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) -> Self {
         Self::new_with_config(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             blockstore,
             bank_forks,
             block_commitment_cache,
             optimistically_confirmed_bank,
             &PubSubConfig::default(),
             None,
+            transaction_results,
         )
     }
 
     pub fn new_for_tests(
         exit: Arc<AtomicBool>,
         max_complete_transaction_status_slot: Arc<AtomicU64>,
-        max_complete_rewards_slot: Arc<AtomicU64>,
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) -> Self {
         let ledger_path = get_tmp_ledger_path!();
         let blockstore = Blockstore::open(&ledger_path).unwrap();
@@ -565,35 +555,35 @@ impl RpcSubscriptions {
         Self::new_for_tests_with_blockstore(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             blockstore,
             bank_forks,
             block_commitment_cache,
             optimistically_confirmed_bank,
+            transaction_results,
         )
     }
 
     pub fn new_for_tests_with_blockstore(
         exit: Arc<AtomicBool>,
         max_complete_transaction_status_slot: Arc<AtomicU64>,
-        max_complete_rewards_slot: Arc<AtomicU64>,
         blockstore: Arc<Blockstore>,
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) -> Self {
         let rpc_notifier_ready = Arc::new(AtomicBool::new(false));
 
         let rpc_subscriptions = Self::new_with_config(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             blockstore,
             bank_forks,
             block_commitment_cache,
             optimistically_confirmed_bank,
             &PubSubConfig::default_for_tests(),
             Some(rpc_notifier_ready.clone()),
+            transaction_results,
         );
 
         // Ensure RPC notifier is ready to receive notifications before proceeding
@@ -612,16 +602,15 @@ impl RpcSubscriptions {
     pub fn new_with_config(
         exit: Arc<AtomicBool>,
         max_complete_transaction_status_slot: Arc<AtomicU64>,
-        max_complete_rewards_slot: Arc<AtomicU64>,
         blockstore: Arc<Blockstore>,
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
         config: &PubSubConfig,
         rpc_notifier_ready: Option<Arc<AtomicBool>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) -> Self {
         let (notification_sender, notification_receiver) = crossbeam_channel::unbounded();
-
         let subscriptions = SubscriptionsTracker::new(bank_forks.clone());
 
         let (broadcast_sender, _) = broadcast::channel(config.queue_capacity_items);
@@ -651,7 +640,6 @@ impl RpcSubscriptions {
                         Self::process_notifications(
                             exit,
                             max_complete_transaction_status_slot,
-                            max_complete_rewards_slot,
                             blockstore,
                             notifier,
                             notification_receiver,
@@ -659,6 +647,7 @@ impl RpcSubscriptions {
                             bank_forks,
                             block_commitment_cache,
                             optimistically_confirmed_bank,
+                            transaction_results.clone()
                         )
                     });
                 })
@@ -670,7 +659,6 @@ impl RpcSubscriptions {
             notification_sender.clone(),
             broadcast_sender,
         );
-
         Self {
             notification_sender: config.notification_threads.map(|_| notification_sender),
             t_cleanup,
@@ -682,8 +670,8 @@ impl RpcSubscriptions {
     // For tests only...
     pub fn default_with_bank_forks(
         max_complete_transaction_status_slot: Arc<AtomicU64>,
-        max_complete_rewards_slot: Arc<AtomicU64>,
         bank_forks: Arc<RwLock<BankForks>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) -> Self {
         let ledger_path = get_tmp_ledger_path!();
         let blockstore = Blockstore::open(&ledger_path).unwrap();
@@ -693,11 +681,11 @@ impl RpcSubscriptions {
         Self::new(
             Arc::new(AtomicBool::new(false)),
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             blockstore,
             bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::default())),
             optimistically_confirmed_bank,
+            transaction_results,
         )
     }
 
@@ -734,6 +722,52 @@ impl RpcSubscriptions {
         self.enqueue_notification(NotificationEntry::SignaturesReceived(slot_signatures));
     }
 
+
+	fn emit_standard_events(&self, signature: Signature, value: &serde_json::Value) {
+		// Delay before emitting "confirmed" to allow clients to subscribe
+		debug!("Delaying 2000ms before emitting confirmed notification for signature: {:?}", signature);
+		sleep(Duration::from_millis(2000));
+
+		// Check if the XTx result indicates an error (assuming status == 2 means Failed)
+		let is_error = value.get("status").and_then(|s| s.as_i64()).map(|s| s == 2).unwrap_or(false);
+		let error_message = if is_error {
+			value.get("message").and_then(|m| m.as_str()).map(|_| TransactionError::SanitizeFailure)
+		} else {
+			None
+		};
+
+		// Construct RpcSignatureResult for subscription notifications
+		let signature_result = RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
+			err: error_message.map(Into::into),
+		});
+
+		// Emit "confirmed" notification
+		debug!("Emitting signatureSubscribe (confirmed) for signature: {:?}", signature);
+		let confirmed_notification = NotificationEntry::SignatureSubscribe(signature, signature_result.clone());
+		self.enqueue_notification(confirmed_notification);
+
+		// Delay before emitting "finalized" to allow further processing
+		debug!("Delaying 1000ms before emitting finalized notification for signature: {:?}", signature);
+		sleep(Duration::from_millis(1000));
+
+		// Emit "finalized" notification
+		debug!("Emitting signatureSubscribe (finalized) for signature: {:?}", signature);
+		let finalized_notification = NotificationEntry::SignatureSubscribe(signature, signature_result);
+		self.enqueue_notification(finalized_notification);
+
+		// Emit logs notification with XTx result
+		debug!("Emitting logsSubscribe for signature: {:?}", signature);
+		let log_message = format!("Xandeum XTx completed: {:?}", value);
+		let logs_notification = NotificationEntry::LogsSubscribe(vec![log_message]);
+		self.enqueue_notification(logs_notification);
+	}
+
+    // Your existing method to notify Xandeum result and trigger standard events
+    pub fn notify_xandeum_result(&self, signature: Signature, value: serde_json::Value) {
+        self.enqueue_notification(NotificationEntry::XandeumResult(signature, value.clone()));
+        self.emit_standard_events(signature, &value);
+    }
+
     pub fn notify_vote(&self, vote_pubkey: Pubkey, vote: VoteTransaction, signature: Signature) {
         self.enqueue_notification(NotificationEntry::Vote((vote_pubkey, vote, signature)));
     }
@@ -754,10 +788,7 @@ impl RpcSubscriptions {
             match notification_sender.send(notification_entry.into()) {
                 Ok(()) => (),
                 Err(SendError(notification)) => {
-                    warn!(
-                        "Dropped RPC Notification - receiver disconnected : {:?}",
-                        notification
-                    );
+                    warn!("Dropped RPC Notification - receiver disconnected : {notification:?}");
                 }
             }
         }
@@ -767,7 +798,6 @@ impl RpcSubscriptions {
     fn process_notifications(
         exit: Arc<AtomicBool>,
         max_complete_transaction_status_slot: Arc<AtomicU64>,
-        max_complete_rewards_slot: Arc<AtomicU64>,
         blockstore: Arc<Blockstore>,
         notifier: RpcNotifier,
         notification_receiver: Receiver<TimestampedNotificationEntry>,
@@ -775,6 +805,7 @@ impl RpcSubscriptions {
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
+        transaction_results: Arc<Mutex<HashMap<String, xandeum_protos::response::TxResponse>>>,
     ) {
         let mut stats = PubsubNotificationStats::default();
 
@@ -805,7 +836,7 @@ impl RpcSubscriptions {
                                 .node_progress_watchers()
                                 .get(&SubscriptionParams::Slot)
                             {
-                                debug!("slot notify: {:?}", slot_info);
+                                debug!("slot notify: {slot_info:?}");
                                 inc_new_counter_info!("rpc-subscription-notify-slot", 1);
                                 notifier.notify(slot_info, sub, false);
                             }
@@ -834,7 +865,7 @@ impl RpcSubscriptions {
                                     timestamp: vote_info.timestamp(),
                                     signature: signature.to_string(),
                                 };
-                                debug!("vote notify: {:?}", vote_info);
+                                debug!("vote notify: {vote_info:?}");
                                 inc_new_counter_info!("rpc-subscription-notify-vote", 1);
                                 notifier.notify(&rpc_vote, sub, false);
                             }
@@ -844,7 +875,7 @@ impl RpcSubscriptions {
                                 .node_progress_watchers()
                                 .get(&SubscriptionParams::Root)
                             {
-                                debug!("root notify: {:?}", root);
+                                debug!("root notify: {root:?}");
                                 inc_new_counter_info!("rpc-subscription-notify-root", 1);
                                 notifier.notify(root, sub, false);
                             }
@@ -853,7 +884,6 @@ impl RpcSubscriptions {
                             const SOURCE: &str = "bank";
                             RpcSubscriptions::notify_watchers(
                                 max_complete_transaction_status_slot.clone(),
-                                max_complete_rewards_slot.clone(),
                                 subscriptions.commitment_watchers(),
                                 &bank_forks,
                                 &blockstore,
@@ -870,7 +900,6 @@ impl RpcSubscriptions {
                             const SOURCE: &str = "gossip";
                             RpcSubscriptions::notify_watchers(
                                 max_complete_transaction_status_slot.clone(),
-                                max_complete_rewards_slot.clone(),
                                 subscriptions.gossip_watchers(),
                                 &bank_forks,
                                 &blockstore,
@@ -888,16 +917,52 @@ impl RpcSubscriptions {
                                             subscription.params()
                                         {
                                             if params.enable_received_notification {
-                                                notifier.notify(
-                                                    RpcResponse::from(RpcNotificationResponse {
-                                                        context: RpcNotificationContext { slot },
-                                                        value: RpcSignatureResult::ReceivedSignature(
-                                                            ReceivedSignatureResult::ReceivedSignature,
-                                                        ),
-                                                    }),
-                                                    subscription,
-                                                    false,
-                                                );
+                                                match params.subscription_type {
+                                                    SignatureSubscriptionType::Regular => {
+                                                        notifier.notify(
+                                                            RpcResponse::from(RpcNotificationResponse {
+                                                                context: RpcNotificationContext { slot },
+                                                                value: RpcSignatureResult::ReceivedSignature(
+                                                                    ReceivedSignatureResult::ReceivedSignature,
+                                                                ),
+                                                            }),
+                                                            subscription,
+                                                            false,
+                                                        );
+                                                    }
+                                                    SignatureSubscriptionType::XandeumResult => {
+                                                        let signature_str =
+                                                            slot_signature.to_string();
+                                                        let transaction_results = 
+                                                            transaction_results
+                                                            .lock().unwrap();
+                                                        if let Some(xandeum_result) =
+                                                            transaction_results.get(&signature_str)
+                                                        {
+                                                            let json_value = serde_json::to_value(xandeum_result)
+                                                            .unwrap_or_else(|e| {
+                                                                error!("Failed to serialize XandeumResult: {:?}", e);
+                                                                serde_json::json!({ "error": "Failed to serialize result" })
+                                                            });
+                                                            debug!("Xandeum result notify: subscription_id={:?}, signature={:?}, value={:?}", subscription.id(), slot_signature, json_value);
+                                                            inc_new_counter_info!("rpc-subscription-notify-xandeum-result", 1);
+                                                            notifier.notify(
+                                                                RpcResponse {
+                                                                    context: RpcResponseContext {
+                                                                        slot,
+                                                                        api_version: Some(
+                                                                            RpcApiVersion::default(
+                                                                            ),
+                                                                        ),
+                                                                    },
+                                                                    value: json_value,
+                                                                },
+                                                                subscription,
+                                                                false,
+                                                            );
+                                                        }
+                                                    }
+                                                }
                                             }
                                         } else {
                                             error!("invalid params type in visit_by_signature");
@@ -906,6 +971,89 @@ impl RpcSubscriptions {
                                 }
                             }
                         }
+                        NotificationEntry::XandeumResult(signature, value) => {
+                            if let Some(subs) = subscriptions.by_signature().get(&signature) {
+                                let value_clone = value.clone();
+                                for subscription in subs.values() {
+                                    if let SubscriptionParams::Signature(params) =
+                                        subscription.params()
+                                    {
+                                        if params.subscription_type
+                                            == SignatureSubscriptionType::XandeumResult
+                                        {
+                                            debug!("Xandeum result notify: subscription_id={:?}, signature={:?}, value={:?}", subscription.id(), signature, value_clone.clone());
+                                            inc_new_counter_info!(
+                                                "rpc-subscription-notify-xandeum-result",
+                                                1
+                                            );
+                                            notifier.notify(
+                                                RpcResponse {
+                                                    context: RpcResponseContext {
+                                                        slot: 0,
+                                                        api_version: Some(RpcApiVersion::default()),
+                                                    }, 
+                                                    value: value.clone(),
+                                                },
+                                                subscription,
+                                                false,
+                                            );
+                                        }
+                                    } else {
+                                        error!("invalid params type in visit_by_signature");
+                                    }
+                                }
+                            } else {
+                                info!(
+                                    "No Xandeum subscriptions found for signature: {:?}",
+                                    signature
+                                );
+                            }
+                        }
+						NotificationEntry::SignatureSubscribe(signature, result) => {
+								if let Some(subs) = subscriptions.by_signature().get(&signature) {
+									for subscription in subs.values() {
+										if let SubscriptionParams::Signature(_params) = subscription.params() {
+											// Notify subscribers listening for signature updates
+											debug!("Signature notify: subscription_id={:?}, signature={:?}, result={:?}", subscription.id(), signature, result);
+											inc_new_counter_info!("rpc-subscription-notify-signature", 1);
+											notifier.notify(
+												RpcResponse::from(RpcNotificationResponse {
+													context: RpcNotificationContext { slot: 0 }, // Slot might need adjustment based on context
+													value: result.clone(),
+												}),
+												subscription,
+												false,
+											);
+										} else {
+											error!("Invalid params type in visit_by_signature for SignatureSubscribe");
+										}
+									}
+								} else {
+									info!("No signature subscriptions found for signature: {:?}", signature);
+								}
+							}
+						NotificationEntry::LogsSubscribe(logs) => {
+							// Notify subscribers listening for logs (e.g., logsSubscribe)
+							if let Some(sub) = subscriptions.node_progress_watchers().get(&SubscriptionParams::Logs(LogsSubscriptionParams {
+								kind: LogsSubscriptionKind::All, // Adjust based on your subscription logic
+								commitment: CommitmentConfig::processed(), // Adjust as needed
+							})) {
+								debug!("Logs notify: {:?}", logs);
+								inc_new_counter_info!("rpc-subscription-notify-logs", 1);
+								notifier.notify(
+									RpcResponse::from(RpcNotificationResponse {
+										context: RpcNotificationContext { slot: 0 }, // Slot might need adjustment
+										value: RpcLogsResponse {
+											signature: "".to_string(), // No specific signature for logs in this context
+											err: None,
+											logs,
+										},
+									}),
+									sub,
+									false,
+								);
+							}
+						}
                     }
                     stats.notification_entry_processing_time_us +=
                         queued_at.elapsed().as_micros() as u64;
@@ -925,7 +1073,6 @@ impl RpcSubscriptions {
 
     fn notify_watchers(
         max_complete_transaction_status_slot: Arc<AtomicU64>,
-        max_complete_rewards_slot: Arc<AtomicU64>,
         subscriptions: &HashMap<SubscriptionId, Arc<SubscriptionInfo>>,
         bank_forks: &Arc<RwLock<BankForks>>,
         blockstore: &Blockstore,
@@ -1019,16 +1166,14 @@ impl RpcSubscriptions {
                                 // caused by non-deterministic concurrency accesses, we
                                 // break out of the loop. Besides if the current `s` is
                                 // greater, then any `s + K` is also greater.
-                                if s > max_complete_transaction_status_slot.load(Ordering::SeqCst)
-                                    || s > max_complete_rewards_slot.load(Ordering::SeqCst)
-                                {
+                                if s > max_complete_transaction_status_slot.load(Ordering::SeqCst) {
                                     break;
                                 }
 
                                 let block_update_result = blockstore
                                     .get_complete_block(s, false)
                                     .map_err(|e| {
-                                        error!("get_complete_block error: {}", e);
+                                        error!("get_complete_block error: {e}");
                                         RpcBlockUpdateError::BlockStoreError
                                     })
                                     .and_then(|block| filter_block_result_txs(block, s, params));
@@ -1145,7 +1290,8 @@ impl RpcSubscriptions {
         let total_ms = total_time.as_ms();
         if total_notified > 0 || total_ms > 10 {
             debug!(
-                "notified({}): accounts: {} / {} logs: {} / {} programs: {} / {} signatures: {} / {}",
+                "notified({}): accounts: {} / {} logs: {} / {} programs: {} / {} signatures: {} / \
+                 {}",
                 source,
                 num_accounts_found.load(Ordering::Relaxed),
                 num_accounts_notified.load(Ordering::Relaxed),
@@ -1236,7 +1382,10 @@ pub(crate) mod tests {
             rpc_pubsub_service,
         },
         serial_test::serial,
+        solana_commitment_config::CommitmentConfig,
+        solana_keypair::Keypair,
         solana_ledger::get_tmp_ledger_path_auto_delete,
+        solana_message::Message,
         solana_rpc_client_api::config::{
             RpcAccountInfoConfig, RpcBlockSubscribeConfig, RpcBlockSubscribeFilter,
             RpcProgramAccountsConfig, RpcSignatureSubscribeConfig, RpcTransactionLogsConfig,
@@ -1247,18 +1396,13 @@ pub(crate) mod tests {
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
             prioritization_fee_cache::PrioritizationFeeCache,
         },
-        solana_sdk::{
-            commitment_config::CommitmentConfig,
-            message::Message,
-            signature::{Keypair, Signer},
-            stake, system_instruction, system_program, system_transaction,
-            transaction::Transaction,
-        },
+        solana_signer::Signer,
+        solana_stake_interface as stake,
+        solana_system_interface::{instruction as system_instruction, program as system_program},
+        solana_system_transaction as system_transaction,
+        solana_transaction::Transaction,
         solana_transaction_status::{TransactionDetails, UiTransactionEncoding},
-        std::{
-            collections::HashSet,
-            sync::atomic::{AtomicU64, Ordering::Relaxed},
-        },
+        std::{collections::HashSet, sync::atomic::AtomicU64},
     };
 
     struct AccountResult {
@@ -1310,11 +1454,9 @@ pub(crate) mod tests {
 
         let exit = Arc::new(AtomicBool::new(false));
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks.clone(),
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests_with_slots(
                 1, 1,
@@ -1455,11 +1597,9 @@ pub(crate) mod tests {
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let blockstore = Arc::new(blockstore);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests_with_blockstore(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             blockstore.clone(),
             bank_forks.clone(),
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests())),
@@ -1575,11 +1715,9 @@ pub(crate) mod tests {
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let blockstore = Arc::new(blockstore);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests_with_blockstore(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             blockstore.clone(),
             bank_forks.clone(),
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests())),
@@ -1693,11 +1831,9 @@ pub(crate) mod tests {
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let blockstore = Arc::new(blockstore);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests_with_blockstore(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             blockstore.clone(),
             bank_forks.clone(),
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests())),
@@ -1826,11 +1962,9 @@ pub(crate) mod tests {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests())),
             optimistically_confirmed_bank,
@@ -1913,7 +2047,6 @@ pub(crate) mod tests {
             ..
         } = create_genesis_config(100);
         let bank = Bank::new_for_tests(&genesis_config);
-        bank.lazy_rent_collection.store(true, Relaxed);
 
         let blockhash = bank.last_blockhash();
         let bank_forks = BankForks::new_rw_arc(bank);
@@ -1976,11 +2109,9 @@ pub(crate) mod tests {
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let mut pending_optimistically_confirmed_banks = HashSet::new();
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks.clone(),
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests_with_slots(
                 1, 1,
@@ -2020,7 +2151,10 @@ pub(crate) mod tests {
         // Optimistically notifying slot 3 without notifying slot 1 and 2, bank3 is unfrozen, we expect
         // to see transaction for alice and bob to be notified in order.
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::OptimisticallyConfirmed(3),
+            (
+                BankNotification::OptimisticallyConfirmed(3),
+                None, /* no dependency work */
+            ),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -2030,6 +2164,7 @@ pub(crate) mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // no dependency tracker
         );
 
         // a closure to reduce code duplications in building expected responses:
@@ -2073,7 +2208,10 @@ pub(crate) mod tests {
 
         bank3.freeze();
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::Frozen(bank3),
+            (
+                BankNotification::Frozen(bank3),
+                None, /* no dependency work */
+            ),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -2083,6 +2221,7 @@ pub(crate) mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // no dependency tracker
         );
 
         let response = receiver.recv();
@@ -2108,7 +2247,6 @@ pub(crate) mod tests {
             ..
         } = create_genesis_config(100);
         let bank = Bank::new_for_tests(&genesis_config);
-        bank.lazy_rent_collection.store(true, Relaxed);
 
         let blockhash = bank.last_blockhash();
         let bank_forks = BankForks::new_rw_arc(bank);
@@ -2154,11 +2292,9 @@ pub(crate) mod tests {
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let mut pending_optimistically_confirmed_banks = HashSet::new();
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks.clone(),
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests_with_slots(
                 1, 1,
@@ -2195,7 +2331,10 @@ pub(crate) mod tests {
         // Optimistically notifying slot 3 without notifying slot 1 and 2, bank3 is not in the bankforks, we do not
         // expect to see any RPC notifications.
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::OptimisticallyConfirmed(3),
+            (
+                BankNotification::OptimisticallyConfirmed(3),
+                None, /* no dependency work */
+            ),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -2205,6 +2344,7 @@ pub(crate) mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // no dependency tracker
         );
 
         // The following should panic
@@ -2224,7 +2364,6 @@ pub(crate) mod tests {
             ..
         } = create_genesis_config(100);
         let bank = Bank::new_for_tests(&genesis_config);
-        bank.lazy_rent_collection.store(true, Relaxed);
 
         let blockhash = bank.last_blockhash();
         let bank_forks = BankForks::new_rw_arc(bank);
@@ -2270,11 +2409,9 @@ pub(crate) mod tests {
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let mut pending_optimistically_confirmed_banks = HashSet::new();
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks.clone(),
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests_with_slots(
                 1, 1,
@@ -2313,7 +2450,10 @@ pub(crate) mod tests {
         // to see transaction for alice and bob to be notified only when bank3 is added to the fork and
         // frozen. The notifications should be in the increasing order of the slot.
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::OptimisticallyConfirmed(3),
+            (
+                BankNotification::OptimisticallyConfirmed(3),
+                None, /* no dependency work */
+            ),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -2323,6 +2463,7 @@ pub(crate) mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // no dependency tracker
         );
 
         // a closure to reduce code duplications in building expected responses:
@@ -2368,7 +2509,10 @@ pub(crate) mod tests {
         bank3.process_transaction(&tx).unwrap();
         bank3.freeze();
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::Frozen(bank3),
+            (
+                BankNotification::Frozen(bank3),
+                None, /* no dependency work */
+            ),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -2378,6 +2522,7 @@ pub(crate) mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // no dependency tracker
         );
 
         let response = receiver.recv();
@@ -2433,7 +2578,7 @@ pub(crate) mod tests {
 
         let next_bank = Bank::new_from_parent(
             bank_forks.read().unwrap().get(0).unwrap(),
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             1,
         );
         bank_forks.write().unwrap().insert(next_bank);
@@ -2467,11 +2612,9 @@ pub(crate) mod tests {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks,
             Arc::new(RwLock::new(block_commitment_cache)),
             optimistically_confirmed_bank,
@@ -2643,11 +2786,9 @@ pub(crate) mod tests {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests())),
             optimistically_confirmed_bank,
@@ -2690,11 +2831,9 @@ pub(crate) mod tests {
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests())),
             optimistically_confirmed_bank,
@@ -2742,7 +2881,6 @@ pub(crate) mod tests {
         let bank2 = Bank::new_from_parent(bank0, &Pubkey::default(), 2);
         bank_forks.write().unwrap().insert(bank2);
 
-        // we need a pubkey that will pass its rent collection slot so rent_epoch gets updated to max since this account is exempt
         let alice = Keypair::from_base58_string("sfLnS4rZ5a8gXke3aGxCgM6usFAVPxLUaBSRdssGY9uS5eoiEWQ41CqDcpXbcekpKsie8Lyy3LNFdhEvjUE1wd9");
 
         let optimistically_confirmed_bank =
@@ -2751,11 +2889,9 @@ pub(crate) mod tests {
 
         let exit = Arc::new(AtomicBool::new(false));
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks.clone(),
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests_with_slots(
                 1, 1,
@@ -2807,7 +2943,7 @@ pub(crate) mod tests {
         let mut highest_root_slot: Slot = 0;
         let mut last_notified_confirmed_slot: Slot = 0;
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::OptimisticallyConfirmed(2),
+            (BankNotification::OptimisticallyConfirmed(2), None),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -2817,12 +2953,16 @@ pub(crate) mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // no dependency tracker
         );
 
         // Now, notify the frozen bank and ensure its notifications are processed
         highest_confirmed_slot = 0;
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::OptimisticallyConfirmed(1),
+            (
+                BankNotification::OptimisticallyConfirmed(1),
+                None, /* no dependency work */
+            ),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -2832,6 +2972,7 @@ pub(crate) mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // no dependency tracker
         );
 
         let response = receiver0.recv();
@@ -2877,7 +3018,10 @@ pub(crate) mod tests {
         bank2.freeze();
         highest_confirmed_slot = 0;
         OptimisticallyConfirmedBankTracker::process_notification(
-            BankNotification::Frozen(bank2),
+            (
+                BankNotification::Frozen(bank2),
+                None, /* no dependency work */
+            ),
             &bank_forks,
             &optimistically_confirmed_bank,
             &subscriptions,
@@ -2887,6 +3031,7 @@ pub(crate) mod tests {
             &mut highest_root_slot,
             &None,
             &PrioritizationFeeCache::default(),
+            &None, // no dependency tracker
         );
         let response = receiver1.recv();
         let expected = json!({
@@ -2955,13 +3100,11 @@ pub(crate) mod tests {
 
         let exit = Arc::new(AtomicBool::new(false));
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
             exit,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks.clone(),
             Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests())),
             optimistically_confirmed_bank,
@@ -3032,11 +3175,9 @@ pub(crate) mod tests {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(100);
         let bank = Bank::new_for_tests(&genesis_config);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
-        let max_complete_rewards_slot = Arc::new(AtomicU64::default());
         let bank_forks = BankForks::new_rw_arc(bank);
         let subscriptions = Arc::new(RpcSubscriptions::default_with_bank_forks(
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             bank_forks,
         ));
 

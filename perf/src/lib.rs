@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 pub mod cuda_runtime;
 pub mod data_budget;
@@ -11,9 +20,6 @@ pub mod sigverify;
 #[cfg(feature = "dev-context-only-utils")]
 pub mod test_tx;
 pub mod thread;
-
-#[macro_use]
-extern crate lazy_static;
 
 #[macro_use]
 extern crate log;
@@ -71,8 +77,9 @@ pub fn report_target_features() {
                 info!("AVX detected");
             } else {
                 error!(
-                "Incompatible CPU detected: missing AVX support. Please build from source on the target"
-            );
+                    "Incompatible CPU detected: missing AVX support. Please build from source on \
+                     the target"
+                );
                 std::process::abort();
             }
         }
@@ -86,7 +93,8 @@ pub fn report_target_features() {
                 info!("AVX2 detected");
             } else {
                 error!(
-                    "Incompatible CPU detected: missing AVX2 support. Please build from source on the target"
+                    "Incompatible CPU detected: missing AVX2 support. Please build from source on \
+                     the target"
                 );
                 std::process::abort();
             }

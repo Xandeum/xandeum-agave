@@ -28,10 +28,10 @@ source ci/rust-version.sh nightly
 # as normal (not dev) dependencies, only if you're sure that there's good
 # reason to bend dev-context-only-utils's original intention and that listed
 # package isn't part of released binaries.
-source scripts/dcou-tainted-packages.sh
+source scripts/agave-build-lists.sh
 
 # convert to comma separeted (ref: https://stackoverflow.com/a/53839433)
-printf -v allowed '"%s",' "${dcou_tainted_packages[@]}"
+printf -v allowed '"%s",' "${DCOU_TAINTED_PACKAGES[@]}"
 allowed="${allowed%,}"
 
 mode=${1:-full}
@@ -150,6 +150,15 @@ fi
 # We could selectively deny (= `-D`) them here, however, deny all warnings for
 # consistency with other CI steps and for the possibility of new similar lints.
 export RUSTFLAGS="-D warnings -Z threads=8 $RUSTFLAGS"
+
+# As this environment value is used by the rather deep crate of our dep graph
+# (solana-varsion), this could invalidate significant portion of caches when
+# this changes just with a new tiny commit. Technically, it's possible for
+# CI_COMMIT to affect the outcome of compilation via build.rs, but it's
+# extremely unrealistic for such diverting compilation behaviors to be desired
+# as a sane use-case. So, just unset CI_COMMIT unconditionally to increase
+# cache efficiency.
+unset CI_COMMIT
 
 if [[ $mode = "check-bins-and-lib" || $mode = "full" ]]; then
   _ cargo "+${rust_nightly}" hack "$@" check

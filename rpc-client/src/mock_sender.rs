@@ -6,6 +6,12 @@ use {
     base64::{prelude::BASE64_STANDARD, Engine},
     serde_json::{json, Number, Value},
     solana_account_decoder_client_types::{UiAccount, UiAccountData, UiAccountEncoding},
+    solana_clock::{Slot, UnixTimestamp},
+    solana_epoch_info::EpochInfo,
+    solana_epoch_schedule::EpochSchedule,
+    solana_instruction::{error::InstructionError, TRANSACTION_LEVEL_STACK_HEIGHT},
+    solana_message::MessageHeader,
+    solana_pubkey::Pubkey,
     solana_rpc_client_api::{
         client_error::Result,
         config::RpcBlockProductionConfig,
@@ -19,16 +25,9 @@ use {
             RpcVoteAccountStatus,
         },
     },
-    solana_sdk::{
-        clock::{Slot, UnixTimestamp},
-        epoch_info::EpochInfo,
-        instruction::InstructionError,
-        message::MessageHeader,
-        pubkey::Pubkey,
-        signature::Signature,
-        sysvar::epoch_schedule::EpochSchedule,
-        transaction::{self, Transaction, TransactionError, TransactionVersion},
-    },
+    solana_signature::Signature,
+    solana_transaction::{versioned::TransactionVersion, Transaction},
+    solana_transaction_error::{TransactionError, TransactionResult},
     solana_transaction_status_client_types::{
         option_serializer::OptionSerializer, EncodedConfirmedBlock,
         EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
@@ -37,14 +36,54 @@ use {
         UiRawMessage, UiTransaction, UiTransactionStatusMeta,
     },
     solana_version::Version,
-    std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::RwLock},
+    std::{
+        collections::{HashMap, VecDeque},
+        net::SocketAddr,
+        str::FromStr,
+        sync::RwLock,
+    },
 };
 
 pub const PUBKEY: &str = "7RoSF9fUmdphVCpabEoefH81WwrW7orsWonXWqTXkKV8";
 
 pub type Mocks = HashMap<RpcRequest, Value>;
+
+impl From<Mocks> for MocksMap {
+    fn from(mocks: Mocks) -> Self {
+        let mut map = HashMap::new();
+        for (key, value) in mocks {
+            map.insert(key, [value].into());
+        }
+        MocksMap(map)
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct MocksMap(pub HashMap<RpcRequest, VecDeque<Value>>);
+
+impl FromIterator<(RpcRequest, Value)> for MocksMap {
+    fn from_iter<T: IntoIterator<Item = (RpcRequest, Value)>>(iter: T) -> Self {
+        let mut map = MocksMap::default();
+        for (request, value) in iter {
+            map.insert(request, value);
+        }
+        map
+    }
+}
+
+impl MocksMap {
+    pub fn insert(&mut self, request: RpcRequest, value: Value) {
+        let queue = self.0.entry(request).or_default();
+        queue.push_back(value)
+    }
+
+    pub fn pop_front_with_request(&mut self, request: &RpcRequest) -> Option<Value> {
+        self.0.get_mut(request).and_then(|queue| queue.pop_front())
+    }
+}
+
 pub struct MockSender {
-    mocks: RwLock<Mocks>,
+    mocks: RwLock<MocksMap>,
     url: String,
 }
 
@@ -81,6 +120,13 @@ impl MockSender {
     pub fn new_with_mocks<U: ToString>(url: U, mocks: Mocks) -> Self {
         Self {
             url: url.to_string(),
+            mocks: RwLock::new(MocksMap::from(mocks)),
+        }
+    }
+
+    pub fn new_with_mocks_map<U: ToString>(url: U, mocks: MocksMap) -> Self {
+        Self {
+            url: url.to_string(),
             mocks: RwLock::new(mocks),
         }
     }
@@ -97,7 +143,7 @@ impl RpcSender for MockSender {
         request: RpcRequest,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        if let Some(value) = self.mocks.write().unwrap().remove(&request) {
+        if let Some(value) = self.mocks.write().unwrap().pop_front_with_request(&request) {
             return Ok(value);
         }
         if self.url == "fails" {
@@ -124,7 +170,7 @@ impl RpcSender for MockSender {
                 transaction_count: Some(123),
             })?,
             "getSignatureStatuses" => {
-                let status: transaction::Result<()> = if self.url == "account_in_use" {
+                let status: TransactionResult<()> = if self.url == "account_in_use" {
                     Err(TransactionError::AccountInUse)
                 } else if self.url == "instruction_error" {
                     Err(TransactionError::InstructionError(
@@ -181,7 +227,7 @@ impl RpcSender for MockSender {
                                         program_id_index: 2,
                                         accounts: vec![0, 1],
                                         data: "3Bxs49DitAvXtoDR".to_string(),
-                                        stack_height: None,
+                                        stack_height: Some(TRANSACTION_LEVEL_STACK_HEIGHT as u32),
                                     }],
                                     address_table_lookups: None,
                                 })
@@ -200,6 +246,7 @@ impl RpcSender for MockSender {
                             loaded_addresses: OptionSerializer::Skip,
                             return_data: OptionSerializer::Skip,
                             compute_units_consumed: OptionSerializer::Skip,
+                            cost_units: OptionSerializer::Skip,
                         }),
                 },
                 block_time: Some(1628633791),
@@ -305,10 +352,17 @@ impl RpcSender for MockSender {
                     logs: None,
                     accounts: None,
                     units_consumed: None,
+                    loaded_accounts_data_size: None,
                     return_data: None,
                     inner_instructions: None,
-                    replacement_blockhash: None
-                },
+                    replacement_blockhash: None,
+                    fee: None,
+                    pre_balances: None,
+                    post_balances: None,
+                    pre_token_balances: None,
+                    post_token_balances: None,
+                    loaded_addresses: None,
+                }
             })?,
             "getMinimumBalanceForRentExemption" => json![20],
             "getVersion" => {
@@ -455,7 +509,7 @@ pub(crate) fn mock_encoded_account(pubkey: &Pubkey) -> UiAccount {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, solana_account_decoder::encode_ui_account, solana_sdk::account::Account};
+    use {super::*, solana_account::Account, solana_account_decoder::encode_ui_account};
 
     #[test]
     fn test_mock_encoded_account() {

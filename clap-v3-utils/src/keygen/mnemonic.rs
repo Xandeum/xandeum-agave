@@ -81,11 +81,9 @@ pub fn no_passphrase_arg<'a>() -> Arg<'a> {
 
 #[deprecated(since = "2.0.0", note = "Please use `try_get_language` instead")]
 pub fn acquire_language(matches: &ArgMatches) -> Language {
-    match matches
-        .get_one::<String>(LANGUAGE_ARG.name)
-        .unwrap()
-        .as_str()
-    {
+    #[allow(deprecated)]
+    let language_name = LANGUAGE_ARG.name;
+    match matches.get_one::<String>(language_name).unwrap().as_str() {
         "english" => Language::English,
         "chinese-simplified" => Language::ChineseSimplified,
         "chinese-traditional" => Language::ChineseTraditional,
@@ -121,15 +119,17 @@ pub fn no_passphrase_and_message() -> (String, String) {
 pub fn acquire_passphrase_and_message(
     matches: &ArgMatches,
 ) -> Result<(String, String), Box<dyn error::Error>> {
+    #[rustfmt::skip]
+    const PROMPT: &str =
+        "\nFor added security, enter a BIP39 passphrase\n\
+         \nNOTE! This passphrase improves security of the recovery seed phrase NOT the\n\
+         keypair file itself, which is stored as insecure plain text\n\
+         \nBIP39 Passphrase (empty for none): ";
+
     if matches.try_contains_id(NO_PASSPHRASE_ARG.name)? {
         Ok(no_passphrase_and_message())
     } else {
-        match prompt_passphrase(
-            "\nFor added security, enter a BIP39 passphrase\n\
-             \nNOTE! This passphrase improves security of the recovery seed phrase NOT the\n\
-             keypair file itself, which is stored as insecure plain text\n\
-             \nBIP39 Passphrase (empty for none): ",
-        ) {
+        match prompt_passphrase(PROMPT) {
             Ok(passphrase) => {
                 println!();
                 Ok((passphrase, " and your BIP39 passphrase".to_string()))

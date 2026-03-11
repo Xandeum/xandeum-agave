@@ -1,7 +1,7 @@
 use {
     crate::bank::Bank,
+    solana_clock::{Epoch, Slot},
     solana_program_runtime::loaded_programs::ProgramCacheStats,
-    solana_sdk::clock::{Epoch, Slot},
     std::sync::atomic::{
         AtomicU64,
         Ordering::{self, Relaxed},
@@ -11,20 +11,17 @@ use {
 pub(crate) struct NewEpochTimings {
     pub(crate) thread_pool_time_us: u64,
     pub(crate) apply_feature_activations_time_us: u64,
-    pub(crate) activate_epoch_time_us: u64,
+    pub(crate) calculate_activated_stake_time_us: u64,
     pub(crate) update_epoch_stakes_time_us: u64,
     pub(crate) update_rewards_with_thread_pool_time_us: u64,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct RewardsMetrics {
-    pub(crate) load_vote_and_stake_accounts_us: AtomicU64,
     pub(crate) calculate_points_us: AtomicU64,
     pub(crate) redeem_rewards_us: u64,
     pub(crate) store_stake_accounts_us: AtomicU64,
     pub(crate) store_vote_accounts_us: AtomicU64,
-    pub(crate) vote_accounts_cache_miss_count: usize,
-    pub(crate) hash_partition_rewards_us: u64,
 }
 
 pub(crate) struct NewBankTimings {
@@ -36,7 +33,6 @@ pub(crate) struct NewBankTimings {
     pub(crate) stakes_cache_time_us: u64,
     pub(crate) epoch_stakes_time_us: u64,
     pub(crate) builtin_program_ids_time_us: u64,
-    pub(crate) rewards_pool_pubkeys_time_us: u64,
     pub(crate) executor_cache_time_us: u64,
     pub(crate) transaction_debug_keys_time_us: u64,
     pub(crate) transaction_log_collector_config_time_us: u64,
@@ -46,7 +42,7 @@ pub(crate) struct NewBankTimings {
     pub(crate) cache_preparation_time_us: u64,
     pub(crate) update_sysvars_time_us: u64,
     pub(crate) fill_sysvar_cache_time_us: u64,
-    pub(crate) populate_cache_for_accounts_lt_hash_us: Option<u64>,
+    pub(crate) populate_cache_for_accounts_lt_hash_us: u64,
 }
 
 pub(crate) fn report_new_epoch_metrics(
@@ -67,7 +63,11 @@ pub(crate) fn report_new_epoch_metrics(
             timings.apply_feature_activations_time_us,
             i64
         ),
-        ("activate_epoch_us", timings.activate_epoch_time_us, i64),
+        (
+            "calculate_activated_stake_us",
+            timings.calculate_activated_stake_time_us,
+            i64
+        ),
         (
             "update_epoch_stakes_us",
             timings.update_epoch_stakes_time_us,
@@ -76,11 +76,6 @@ pub(crate) fn report_new_epoch_metrics(
         (
             "update_rewards_with_thread_pool_us",
             timings.update_rewards_with_thread_pool_time_us,
-            i64
-        ),
-        (
-            "load_vote_and_stake_accounts_us",
-            metrics.load_vote_and_stake_accounts_us.load(Relaxed),
             i64
         ),
         (
@@ -99,16 +94,6 @@ pub(crate) fn report_new_epoch_metrics(
             metrics.store_vote_accounts_us.load(Relaxed),
             i64
         ),
-        (
-            "vote_accounts_cache_miss_count",
-            metrics.vote_accounts_cache_miss_count,
-            i64
-        ),
-        (
-            "hash_partition_rewards_us",
-            metrics.hash_partition_rewards_us,
-            i64
-        ),
     );
 }
 
@@ -116,7 +101,7 @@ pub(crate) fn report_new_bank_metrics(
     slot: Slot,
     parent_slot: Slot,
     block_height: u64,
-    num_accounts_modified_this_slot: Option<usize>,
+    num_accounts_modified_this_slot: usize,
     timings: NewBankTimings,
 ) {
     datapoint_info!(
@@ -134,11 +119,6 @@ pub(crate) fn report_new_bank_metrics(
         (
             "builtin_programs_us",
             timings.builtin_program_ids_time_us,
-            i64
-        ),
-        (
-            "rewards_pool_pubkeys_us",
-            timings.rewards_pool_pubkeys_time_us,
             i64
         ),
         ("executor_cache_us", timings.executor_cache_time_us, i64),
@@ -169,12 +149,12 @@ pub(crate) fn report_new_bank_metrics(
         (
             "num_accounts_modified_this_slot",
             num_accounts_modified_this_slot,
-            Option<i64>
+            i64
         ),
         (
             "populate_cache_for_accounts_lt_hash_us",
             timings.populate_cache_for_accounts_lt_hash_us,
-            Option<i64>
+            i64
         ),
     );
 }
@@ -182,6 +162,7 @@ pub(crate) fn report_new_bank_metrics(
 /// Metrics for partitioned epoch reward store
 #[derive(Debug, Default)]
 pub(crate) struct RewardsStoreMetrics {
+    pub(crate) total_num_partitions: usize,
     pub(crate) partition_index: u64,
     pub(crate) store_stake_accounts_us: u64,
     pub(crate) store_stake_accounts_count: usize,
@@ -205,6 +186,7 @@ pub(crate) fn report_partitioned_reward_metrics(bank: &Bank, timings: RewardsSto
             timings.store_stake_accounts_us,
             i64
         ),
+        ("total_num_partitions", timings.total_num_partitions, i64),
         (
             "store_stake_accounts_count",
             timings.store_stake_accounts_count,

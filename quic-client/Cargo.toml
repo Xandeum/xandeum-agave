@@ -9,12 +9,14 @@ homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
 
+[features]
+agave-unstable-api = []
+
 [dependencies]
 async-lock = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 itertools = { workspace = true }
-lazy_static = { workspace = true }
 log = { workspace = true }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
@@ -29,13 +31,17 @@ solana-quic-definitions = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-signer = { workspace = true }
 solana-streamer = { workspace = true }
+solana-tls-utils = { workspace = true }
 solana-transaction-error = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
+agave-logger = { workspace = true }
 crossbeam-channel = { workspace = true }
-solana-logger = { workspace = true }
 solana-net-utils = { workspace = true, features = ["dev-context-only-utils"] }
+solana-packet = { workspace = true }
 solana-perf = { workspace = true }
-solana-sdk = { workspace = true }
+solana-quic-client = { path = ".", features = ["agave-unstable-api"] }
+solana-streamer = { workspace = true, features = ["dev-context-only-utils"] }
+tokio-util = { workspace = true }

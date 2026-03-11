@@ -23,6 +23,7 @@ ignores=(
   .cargo
   target
   node_modules
+  ci/xtask
 )
 
 not_paths=()
@@ -93,7 +94,7 @@ check)
   exit 0
   ;;
 -*)
-  if [[ $1 =~ ^-[A-Za-z0-9]*$ ]]; then
+  if [[ $1 =~ ^-[\.A-Za-z0-9]*$ ]]; then
     SPECIAL="$1"
   else
     echo "Error: Unsupported characters found in $1"
@@ -129,7 +130,7 @@ for Cargo_toml in "${Cargo_tomls[@]}"; do
   # Set new crate version
   (
     set -x
-    sed -i "$Cargo_toml" -e "0,/^version =/{s/^version = \"[^\"]*\"$/version = \"$newVersion\"/}"
+    sed -i "$Cargo_toml" -e "s/^version = \"$currentVersion\"$/version = \"$newVersion\"/"
   )
 
   # Fix up the version references to other internal crates
@@ -145,16 +146,6 @@ done
 
 # Update cargo lock files
 scripts/cargo-for-all-lock-files.sh tree >/dev/null
-
-# Only apply related changes
-(
-  shopt -s globstar
-  git diff --unified=0 ./**/Cargo.lock >cargo-lock-patch
-  grep -E '^(diff|index|---|\+\+\+|@@.*@@ name = .*|-version|\+version)' cargo-lock-patch >filtered-cargo-lock-patch
-  git checkout ./**/Cargo.lock
-  git apply --unidiff-zero filtered-cargo-lock-patch
-  rm cargo-lock-patch filtered-cargo-lock-patch
-)
 
 echo "$currentVersion -> $newVersion"
 

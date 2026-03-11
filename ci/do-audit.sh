@@ -29,6 +29,17 @@ cargo_audit_ignores=(
   # Solution:  Upgrade to >=2
   --ignore RUSTSEC-2022-0093
 
+  # Crate:     idna
+  # Version:   0.1.5
+  # Title:     `idna` accepts Punycode labels that do not produce any non-ASCII when decoded
+  # Date:      2024-12-09
+  # ID:        RUSTSEC-2024-0421
+  # URL:       https://rustsec.org/advisories/RUSTSEC-2024-0421
+  # Solution:  Upgrade to >=1.0.0
+  # need to solve this dependant tree:
+  # jsonrpc-core-client v18.0.0 -> jsonrpc-client-transports v18.0.0 -> url v1.7.2 -> idna v0.1.5
+  --ignore RUSTSEC-2024-0421
+
   # === programs/sbf ===
   #
   # Crate:     curve25519-dalek
@@ -48,6 +59,37 @@ cargo_audit_ignores=(
   # URL:       https://rustsec.org/advisories/RUSTSEC-2024-0376
   # Solution:  Upgrade to >=0.12.3
   --ignore RUSTSEC-2024-0376
+
+	# Crate:     bytes
+	# Version:   1.10.1
+	# Title:     Integer overflow in `BytesMut::reserve`
+	# Date:      2026-02-03
+	# ID:        RUSTSEC-2026-0007
+	# URL:       https://github.com/advisories/GHSA-434x-w66g-qw3r
+	# Solution:  Upgrade to >=1.11.1
+	--ignore RUSTSEC-2026-0007
+
+	# Crate:     time
+	# Version:   0.3.9
+	# Title:     Denial of Service via Stack Exhaustion
+	# Date:      2026-02-05
+	# ID:        RUSTSEC-2026-0009
+	# URL:       https://rustsec.org/advisories/RUSTSEC-2026-0009
+	# Severity:  6.8 (medium)
+	# Solution:  Upgrade to >=0.3.47
+	--ignore RUSTSEC-2026-0009
+
+  # Crate:     quinn-proto
+  # Version:   0.11.13
+  # Title:     Denial of service in Quinn endpoints
+  # Date:      2026-03-09
+  # ID:        RUSTSEC-2026-0037
+  # URL:       https://rustsec.org/advisories/RUSTSEC-2026-0037
+  # Severity:  8.7 (high)
+  # Solution:  Upgrade to >=0.11.14
+  #
+  # AGAVE OK: we backported the fix to 0.11.13 vendored
+  --ignore RUSTSEC-2026-0037
 )
 scripts/cargo-for-all-lock-files.sh audit "${cargo_audit_ignores[@]}" | $dep_tree_filter
 # we want the `cargo audit` exit code, not `$dep_tree_filter`'s

@@ -4,18 +4,18 @@ use {
         black_box, criterion_group, criterion_main, measurement::Measurement, BenchmarkGroup,
         Criterion, Throughput,
     },
-    solana_sdk::{
-        hash::Hash,
-        instruction::Instruction,
-        message::{
-            v0::{self, MessageAddressTableLookup},
-            Message, MessageHeader, VersionedMessage,
-        },
-        pubkey::Pubkey,
-        signature::Keypair,
-        signer::Signer,
-        system_instruction,
-        transaction::{SanitizedVersionedTransaction, VersionedTransaction},
+    solana_hash::Hash,
+    solana_instruction::Instruction,
+    solana_keypair::Keypair,
+    solana_message::{
+        v0::{self, MessageAddressTableLookup},
+        Message, MessageHeader, VersionedMessage,
+    },
+    solana_pubkey::Pubkey,
+    solana_signer::Signer,
+    solana_system_interface::instruction as system_instruction,
+    solana_transaction::versioned::{
+        sanitized::SanitizedVersionedTransaction, VersionedTransaction,
     },
 };
 
@@ -64,7 +64,8 @@ fn bench_transactions_parsing(
     group.bench_function("TransactionView (Sanitized)", |c| {
         c.iter(|| {
             for bytes in serialized_transactions.iter() {
-                let _ = TransactionView::try_new_sanitized(black_box(bytes.as_ref())).unwrap();
+                let _ =
+                    TransactionView::try_new_sanitized(black_box(bytes.as_ref()), true).unwrap();
             }
         });
     });
@@ -132,8 +133,8 @@ fn packed_transfers() -> Vec<VersionedTransaction> {
 
 fn packed_noops() -> Vec<VersionedTransaction> {
     // Creating noop instructions to maximize the number of instructions per
-    // transaction. We can fit up to 355 noops.
-    const MAX_INSTRUCTIONS_PER_TRANSACTION: usize = 355;
+    // transaction. We are allowed to fit up to 64 instructions per transaction.
+    const MAX_INSTRUCTIONS_PER_TRANSACTION: usize = 64;
 
     (0..NUM_TRANSACTIONS)
         .map(|_| {

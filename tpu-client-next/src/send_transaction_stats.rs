@@ -1,17 +1,14 @@
-//! This module defines [`SendTransactionStats`] which is used to collect per IP
-//! statistics about relevant network errors.
+//! This module defines [`SendTransactionStats`] which is used to collect
+//! statistics about relevant network events. This will aggregate
+//! events from all transactions and all leaders. Stats can be reset at
+//! any time to start a new monitoring period.
 
 use {
     super::QuicError,
     quinn::{ConnectError, ConnectionError, WriteError},
     std::{
-        collections::HashMap,
         fmt,
-        net::IpAddr,
-        sync::{
-            atomic::{AtomicU64, Ordering},
-            Arc,
-        },
+        sync::atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -30,6 +27,7 @@ pub struct SendTransactionStats {
     pub connection_error_timed_out: AtomicU64,
     pub connection_error_transport_error: AtomicU64,
     pub connection_error_version_mismatch: AtomicU64,
+    pub transport_congestion_events: AtomicU64,
     pub write_error_closed_stream: AtomicU64,
     pub write_error_connection_lost: AtomicU64,
     pub write_error_stopped: AtomicU64,
@@ -120,10 +118,13 @@ pub fn record_error(err: QuicError, stats: &SendTransactionStats) {
         // Endpoint is created on the scheduler level and handled separately
         // No counters are used for this case.
         QuicError::Endpoint(_) => (),
+        QuicError::HandshakeTimeout => {
+            stats
+                .connection_error_timed_out
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
-
-pub type SendTransactionStatsPerAddr = HashMap<IpAddr, Arc<SendTransactionStats>>;
 
 macro_rules! display_send_transaction_stats_body {
     ($self:ident, $f:ident, $($field:ident),* $(,)?) => {
@@ -161,13 +162,14 @@ impl fmt::Display for SendTransactionStats {
             write_error_connection_lost,
             write_error_stopped,
             write_error_zero_rtt_rejected,
+            transport_congestion_events,
         )
     }
 }
 
-/// For tests it is useful to be have PartialEq but we cannot have it on top of
-/// atomics. This macro creates a structure with the same attributes but of type
-/// u64.
+/// For external use it is useful to have direct access to data and `PartialEq` but
+/// we cannot have that on top of atomics. This macro creates a structure with the same
+/// fields but of type u64.
 macro_rules! define_non_atomic_struct_for {
     ($name:ident, $atomic_name:ident, {$($field:ident),* $(,)?}) => {
         #[derive(Debug, Default, PartialEq)]
@@ -176,6 +178,13 @@ macro_rules! define_non_atomic_struct_for {
         }
 
         impl $atomic_name {
+            /// Fully resets the content to zeros, returning stored values
+            pub fn read_and_reset(&self) -> $name {
+                            $name {
+                                $($field: self.$field.swap(0, Ordering::Relaxed)),*
+                            }
+                        }
+            /// Returns contents as non-atomic types
             pub fn to_non_atomic(&self) -> $name {
                 $name {
                     $($field: self.$field.load(Ordering::Relaxed)),*
@@ -203,8 +212,9 @@ define_non_atomic_struct_for!(
         connection_error_transport_error,
         connection_error_version_mismatch,
         write_error_closed_stream,
+        transport_congestion_events,
         write_error_connection_lost,
         write_error_stopped,
-        write_error_zero_rtt_rejected
+        write_error_zero_rtt_rejected,
     }
 );
