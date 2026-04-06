@@ -4707,12 +4707,12 @@ pub mod rpc_full {
                             });
 
                         for ix in poke_instructions {
-                            if ix.accounts.len() != 2 {
-                                log::error!(
-                                    "Poke instruction must have exactly 2 accounts, skipping"
-                                );
-                                continue;
-                            }
+                            // if ix.accounts.len() != 2 {
+                            //     log::error!(
+                            //         "Poke instruction must have exactly 2 accounts, skipping"
+                            //     );
+                            //     continue;
+                            // }
 
                             let signers: Vec<&Pubkey> = ix
                                 .accounts
