@@ -943,7 +943,7 @@ impl JsonRpcService {
 
                         let transaction_results = transaction_results.clone();
                         let rpc_sub_clone1 = rpc_sub_clone1.clone();
-                        let block_store_clone = block_store_clone.clone();
+                        let _block_store_clone = block_store_clone.clone();
                         let bank_fork_clone = bank_fork_clone.clone();
                         let responses = responses.clone();
 
@@ -982,7 +982,7 @@ impl JsonRpcService {
                 
                                                 debug!("Adding the signature to block-store");
                 
-                                                let status = TransactionStatusMeta {
+                                                let _status = TransactionStatusMeta {
                                                     status: Ok(()),
                                                     fee: 0,
                                                     pre_balances: vec![],
