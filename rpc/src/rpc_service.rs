@@ -66,7 +66,7 @@ use {
         task::{Context, Poll},
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
-    }, tokio::{runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime}, task::spawn_blocking}, tokio_util::{
+    }, tokio::runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime}, tokio_util::{
         bytes::Bytes,
         codec::{BytesCodec, FramedRead},
     },
@@ -733,7 +733,6 @@ impl JsonRpcService {
         )));
 
         let transaction_results_clone = transaction_results.clone();
-        let runtime_clone1 = runtime.clone();
         let responses: Arc<Mutex<HashMap<u64, ResponseWrapper>>> = Arc::new(Mutex::new(HashMap::new()));
         let responses_clone = responses.clone();
         let request_id_counter = Arc::new(AtomicU64::new(1));
@@ -924,7 +923,18 @@ impl JsonRpcService {
 
         let rpc_sub_clone1 = rpc_subscriptions.clone();
 
-        runtime_clone1.spawn(async move {
+        // new dedicated thread pool to receive from dock
+        let from_dock_pool = TokioBuilder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(4)
+            .thread_name("solFromdockBlk")
+            .enable_all()
+            .build()
+            .expect("Fromdock pool runtime");
+
+        Builder::new()
+            .name("xandFromdockRecv".to_string())
+            .spawn(move || {
             let _request_processor = request_processor_for_responses;
             let socket = context_clone.socket(zmq::PULL).unwrap();
 
@@ -947,9 +957,7 @@ impl JsonRpcService {
                         let bank_fork_clone = bank_fork_clone.clone();
                         let responses = responses.clone();
 
-                        spawn_blocking(move || {
-
-                       
+                        from_dock_pool.spawn_blocking(move || {
                             match ResponseWrapper::decode(&msg[..]) {
                                 Ok(wrapper) => {
                                     let response = match wrapper.response {
@@ -1057,12 +1065,12 @@ impl JsonRpcService {
                     Err(e) => {
                         error!("Receive error: {:?}", e);
                         // For errors, add a small delay to avoid busy loop
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        std::thread::sleep(Duration::from_millis(100));
                     }
                 }
-                // No yield needed with blocking receive
             }
-        });
+            })
+            .expect("Failed to spawn fromdock receiver thread");
 
         let close_handle = close_handle_receiver.recv().unwrap()?;
 
