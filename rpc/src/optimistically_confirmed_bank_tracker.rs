@@ -21,8 +21,8 @@ use {
     std::{
         collections::HashSet,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
         thread::{self, Builder, JoinHandle},
         time::Duration,
@@ -74,7 +74,7 @@ impl std::fmt::Debug for BankNotification {
 
 pub type BankNotificationWithDependencyWork = (
     BankNotification,
-    Option<u64>, // dependecy work id
+    Option<u64>, // dependency work id
 );
 
 pub type BankNotificationReceiver = Receiver<BankNotificationWithDependencyWork>;
@@ -102,7 +102,7 @@ impl OptimisticallyConfirmedBankTracker {
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
         subscriptions: Arc<RpcSubscriptions>,
         slot_notification_subscribers: Option<Arc<RwLock<Vec<SlotNotificationSender>>>>,
-        prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+        prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
         dependency_tracker: Option<Arc<DependencyTracker>>,
     ) -> Self {
         let mut pending_optimistically_confirmed_banks = HashSet::new();
@@ -111,25 +111,27 @@ impl OptimisticallyConfirmedBankTracker {
         let mut newest_root_slot: Slot = 0;
         let thread_hdl = Builder::new()
             .name("solOpConfBnkTrk".to_string())
-            .spawn(move || loop {
-                if exit.load(Ordering::Relaxed) {
-                    break;
-                }
+            .spawn(move || {
+                loop {
+                    if exit.load(Ordering::Relaxed) {
+                        break;
+                    }
 
-                if let Err(RecvTimeoutError::Disconnected) = Self::recv_notification(
-                    &receiver,
-                    &bank_forks,
-                    &optimistically_confirmed_bank,
-                    &subscriptions,
-                    &mut pending_optimistically_confirmed_banks,
-                    &mut last_notified_confirmed_slot,
-                    &mut highest_confirmed_slot,
-                    &mut newest_root_slot,
-                    &slot_notification_subscribers,
-                    &prioritization_fee_cache,
-                    &dependency_tracker,
-                ) {
-                    break;
+                    if let Err(RecvTimeoutError::Disconnected) = Self::recv_notification(
+                        &receiver,
+                        &bank_forks,
+                        &optimistically_confirmed_bank,
+                        &subscriptions,
+                        &mut pending_optimistically_confirmed_banks,
+                        &mut last_notified_confirmed_slot,
+                        &mut highest_confirmed_slot,
+                        &mut newest_root_slot,
+                        &slot_notification_subscribers,
+                        prioritization_fee_cache.as_deref(),
+                        &dependency_tracker,
+                    ) {
+                        break;
+                    }
                 }
             })
             .unwrap();
@@ -147,7 +149,7 @@ impl OptimisticallyConfirmedBankTracker {
         highest_confirmed_slot: &mut Slot,
         newest_root_slot: &mut Slot,
         slot_notification_subscribers: &Option<Arc<RwLock<Vec<SlotNotificationSender>>>>,
-        prioritization_fee_cache: &PrioritizationFeeCache,
+        prioritization_fee_cache: Option<&PrioritizationFeeCache>,
         dependency_tracker: &Option<Arc<DependencyTracker>>,
     ) -> Result<(), RecvTimeoutError> {
         let notification = receiver.recv_timeout(Duration::from_secs(1))?;
@@ -190,7 +192,7 @@ impl OptimisticallyConfirmedBankTracker {
         last_notified_confirmed_slot: &mut Slot,
         pending_optimistically_confirmed_banks: &mut HashSet<Slot>,
         slot_notification_subscribers: &Option<Arc<RwLock<Vec<SlotNotificationSender>>>>,
-        prioritization_fee_cache: &PrioritizationFeeCache,
+        prioritization_fee_cache: Option<&PrioritizationFeeCache>,
     ) {
         if bank.is_frozen() {
             if bank.slot() > *last_notified_confirmed_slot {
@@ -206,7 +208,9 @@ impl OptimisticallyConfirmedBankTracker {
                 );
 
                 // finalize block's minimum prioritization fee cache for this bank
-                prioritization_fee_cache.finalize_priority_fee(bank.slot(), bank.bank_id());
+                if let Some(prioritization_fee_cache) = prioritization_fee_cache {
+                    prioritization_fee_cache.finalize_priority_fee(bank.slot(), bank.bank_id());
+                }
             }
         } else if bank.slot() > bank_forks.read().unwrap().root() {
             pending_optimistically_confirmed_banks.insert(bank.slot());
@@ -222,7 +226,7 @@ impl OptimisticallyConfirmedBankTracker {
         last_notified_confirmed_slot: &mut Slot,
         pending_optimistically_confirmed_banks: &mut HashSet<Slot>,
         slot_notification_subscribers: &Option<Arc<RwLock<Vec<SlotNotificationSender>>>>,
-        prioritization_fee_cache: &PrioritizationFeeCache,
+        prioritization_fee_cache: Option<&PrioritizationFeeCache>,
     ) {
         for confirmed_bank in bank.parents_inclusive().iter().rev() {
             if confirmed_bank.slot() > slot_threshold {
@@ -279,7 +283,7 @@ impl OptimisticallyConfirmedBankTracker {
         highest_confirmed_slot: &mut Slot,
         newest_root_slot: &mut Slot,
         slot_notification_subscribers: &Option<Arc<RwLock<Vec<SlotNotificationSender>>>>,
-        prioritization_fee_cache: &PrioritizationFeeCache,
+        prioritization_fee_cache: Option<&PrioritizationFeeCache>,
         dependency_tracker: &Option<Arc<DependencyTracker>>,
     ) {
         debug!("received bank notification: {notification:?} event: {dependency_work:?}");
@@ -414,7 +418,7 @@ mod tests {
     use {
         super::*,
         crossbeam_channel::unbounded,
-        solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo},
+        solana_ledger::genesis_utils::{GenesisConfigInfo, create_genesis_config},
         solana_pubkey::Pubkey,
         solana_runtime::{commitment::BlockCommitmentCache, dependency_tracker},
         std::sync::atomic::AtomicU64,
@@ -479,7 +483,7 @@ mod tests {
             &mut highest_confirmed_slot,
             &mut newest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            None,
             &None, // No dependency tracker
         );
         assert_eq!(optimistically_confirmed_bank.read().unwrap().bank.slot(), 2);
@@ -499,7 +503,7 @@ mod tests {
             &mut highest_confirmed_slot,
             &mut newest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            None,
             &None, // No dependency tracker
         );
         assert_eq!(optimistically_confirmed_bank.read().unwrap().bank.slot(), 2);
@@ -519,7 +523,7 @@ mod tests {
             &mut highest_confirmed_slot,
             &mut newest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            None,
             &None, // No dependency tracker
         );
         assert_eq!(optimistically_confirmed_bank.read().unwrap().bank.slot(), 2);
@@ -544,7 +548,7 @@ mod tests {
             &mut highest_confirmed_slot,
             &mut newest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            None,
             &None, // No dependency tracker
         );
         assert_eq!(optimistically_confirmed_bank.read().unwrap().bank.slot(), 3);
@@ -568,7 +572,7 @@ mod tests {
             &mut highest_confirmed_slot,
             &mut newest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            None,
             &None, // No dependency tracker
         );
         assert_eq!(optimistically_confirmed_bank.read().unwrap().bank.slot(), 3);
@@ -601,7 +605,7 @@ mod tests {
             &mut highest_confirmed_slot,
             &mut newest_root_slot,
             &subscribers,
-            &PrioritizationFeeCache::default(),
+            None,
             &None, // No dependency tracker
         );
         assert_eq!(optimistically_confirmed_bank.read().unwrap().bank.slot(), 5);
@@ -624,7 +628,7 @@ mod tests {
             &mut highest_confirmed_slot,
             &mut newest_root_slot,
             &subscribers,
-            &PrioritizationFeeCache::default(),
+            None,
             &None, // No dependency tracker
         );
 
@@ -655,7 +659,7 @@ mod tests {
             &mut highest_confirmed_slot,
             &mut newest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            None,
             &None, // No dependency tracker
         );
         assert_eq!(optimistically_confirmed_bank.read().unwrap().bank.slot(), 5);
@@ -680,7 +684,7 @@ mod tests {
             &mut highest_confirmed_slot,
             &mut newest_root_slot,
             &subscribers,
-            &PrioritizationFeeCache::default(),
+            None,
             &None, // No dependency tracker
         );
         assert_eq!(optimistically_confirmed_bank.read().unwrap().bank.slot(), 7);
@@ -702,7 +706,7 @@ mod tests {
             &mut highest_confirmed_slot,
             &mut newest_root_slot,
             &subscribers,
-            &PrioritizationFeeCache::default(),
+            None,
             &None, // No dependency tracker
         );
 
@@ -766,7 +770,7 @@ mod tests {
                 &mut highest_confirmed_slot,
                 &mut newest_root_slot,
                 &None,
-                &PrioritizationFeeCache::default(),
+                None,
                 &Some(tracker_clone.clone()),
             );
 
@@ -791,7 +795,7 @@ mod tests {
                 &mut highest_confirmed_slot,
                 &mut newest_root_slot,
                 &None,
-                &PrioritizationFeeCache::default(),
+                None,
                 &Some(tracker_clone),
             );
 

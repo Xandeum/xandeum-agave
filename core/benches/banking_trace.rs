@@ -5,15 +5,16 @@ extern crate test;
 use {
     agave_banking_stage_ingress_types::BankingPacketBatch,
     solana_core::banking_trace::{
+        BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT, BankingTracer, Channels, TraceError,
+        TracerThreadResult,
         for_test::{
             drop_and_clean_temp_dir_unless_suppressed, sample_packet_batch, terminate_tracer,
         },
-        receiving_loop_with_minimized_sender_overhead, BankingTracer, Channels, TraceError,
-        TracerThreadResult, BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT,
+        receiving_loop_with_minimized_sender_overhead,
     },
     std::{
         path::PathBuf,
-        sync::{atomic::AtomicBool, Arc},
+        sync::{Arc, atomic::AtomicBool},
         thread,
     },
     tempfile::TempDir,
@@ -40,7 +41,7 @@ fn bench_banking_tracer_main_thread_overhead_noop_baseline(bencher: &mut Bencher
         non_vote_sender,
         non_vote_receiver,
         ..
-    } = tracer.create_channels(false);
+    } = tracer.create_channels();
 
     let exit_for_dummy_thread = exit.clone();
     let dummy_main_thread = thread::spawn(move || {
@@ -73,7 +74,7 @@ fn bench_banking_tracer_main_thread_overhead_under_peak_write(bencher: &mut Benc
         non_vote_sender,
         non_vote_receiver,
         ..
-    } = tracer.create_channels(false);
+    } = tracer.create_channels();
 
     let exit_for_dummy_thread = exit.clone();
     let dummy_main_thread = thread::spawn(move || {
@@ -114,7 +115,7 @@ fn bench_banking_tracer_main_thread_overhead_under_sustained_write(bencher: &mut
         non_vote_sender,
         non_vote_receiver,
         ..
-    } = tracer.create_channels(false);
+    } = tracer.create_channels();
 
     let exit_for_dummy_thread = exit.clone();
     let dummy_main_thread = thread::spawn(move || {
@@ -159,7 +160,7 @@ fn bench_banking_tracer_background_thread_throughput(bencher: &mut Bencher) {
             non_vote_sender,
             non_vote_receiver,
             ..
-        } = tracer.create_channels(false);
+        } = tracer.create_channels();
 
         let dummy_main_thread = thread::spawn(move || {
             receiving_loop_with_minimized_sender_overhead::<_, TraceError, 0>(

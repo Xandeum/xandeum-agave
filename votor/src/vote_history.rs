@@ -8,9 +8,11 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_pubkey::Pubkey,
-    std::collections::{hash_map::Entry, HashMap, HashSet},
+    std::collections::{HashMap, HashSet, hash_map::Entry},
     thiserror::Error,
 };
+
+pub const VOTE_THRESHOLD_SIZE: f64 = 2f64 / 3f64;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub enum VoteHistoryVersions {
@@ -31,7 +33,7 @@ impl VoteHistoryVersions {
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiExample),
-    frozen_abi(digest = "5sT71PEL9bNaZhoQGjLwiMESWDRMMVmW1wMvtQpvZs5F")
+    frozen_abi(digest = "9dp4rEVqAsT7mfiL5oEgWrxgWCUiEe4Fk8xJoTWwSN1X")
 )]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
 pub struct VoteHistory {
@@ -128,7 +130,7 @@ impl VoteHistory {
     pub fn votes_cast_since(&self, slot: Slot) -> Vec<Vote> {
         self.votes_cast
             .iter()
-            .filter(|(&s, _)| s > slot)
+            .filter(|&(&s, _)| s > slot)
             .flat_map(|(_, votes)| votes.iter())
             .cloned()
             .collect()
@@ -193,6 +195,11 @@ impl VoteHistory {
                 self.skipped.insert(vote.slot);
                 self.voted_skip_fallback.insert(vote.slot);
             }
+            Vote::Genesis(_vote) => {
+                // Genesis votes are only used during migration.
+                // Since these votes are tracked and sent outside of
+                // votor, we do not need to insert anything here.
+            }
         }
         self.votes_cast.entry(vote.slot()).or_default().push(vote);
     }
@@ -243,7 +250,6 @@ impl VoteHistory {
         self.parent_ready_slots.retain(|s, _| *s >= root);
     }
 
-    #[allow(dead_code)]
     /// Save the vote history to `vote_history_storage` signed by `node_keypair`
     pub fn save(
         &self,
@@ -508,9 +514,9 @@ mod test {
         vote_history.add_vote(vote_2);
 
         // Save to storage
-        assert!(vote_history
+        vote_history
             .save(&vote_history_storage, &node_keypair)
-            .is_ok());
+            .unwrap();
         // Restore from storage
         let restored_vote_history =
             VoteHistory::restore(&vote_history_storage, &node_keypair.pubkey())

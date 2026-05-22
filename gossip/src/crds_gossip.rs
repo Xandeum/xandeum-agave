@@ -26,9 +26,9 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::shred::Shred,
+    solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
     solana_signer::Signer,
-    solana_streamer::socket::SocketAddrSpace,
     solana_time_utils::timestamp,
     std::{
         collections::{HashMap, HashSet},
@@ -213,7 +213,8 @@ impl CrdsGossip {
         ping_cache: &Mutex<PingCache>,
         pings: &mut Vec<(SocketAddr, Ping)>,
         socket_addr_space: &SocketAddrSpace,
-    ) -> Result<impl Iterator<Item = (SocketAddr, CrdsFilter)> + Clone, CrdsGossipError> {
+    ) -> Result<impl Iterator<Item = (SocketAddr, CrdsFilter)> + Clone + use<>, CrdsGossipError>
+    {
         self.pull.new_pull_request(
             thread_pool,
             &self.crds,
@@ -338,7 +339,7 @@ pub(crate) fn get_gossip_nodes<R: Rng>(
                 // In order to mitigate eclipse attack, for staked nodes
                 // continue retrying periodically.
                 let stake = stakes.get(node.pubkey()).copied().unwrap_or_default();
-                if stake == 0u64 || !rng.gen_ratio(1, 16) {
+                if stake == 0u64 || !rng.random_ratio(1, 16) {
                     return None;
                 }
             }
@@ -430,7 +431,7 @@ mod test {
             )
             .unwrap();
         let ping_cache = PingCache::new(
-            &mut rand::thread_rng(),
+            &mut rand::rng(),
             Instant::now(),
             Duration::from_secs(20 * 60),      // ttl
             Duration::from_secs(20 * 60) / 64, // rate_limit_delay

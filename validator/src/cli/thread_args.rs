@@ -1,7 +1,7 @@
 //! Arguments for controlling the number of threads allocated for various tasks
 
 use {
-    clap::{value_t_or_exit, Arg, ArgMatches},
+    clap::{Arg, ArgMatches, value_t_or_exit},
     solana_accounts_db::{accounts_db, accounts_index},
     solana_clap_utils::{hidden_unless_forced, input_validators::is_within_range},
     solana_core::banking_stage::BankingStage,
@@ -19,8 +19,7 @@ pub struct DefaultThreadArgs {
     pub rayon_global_threads: String,
     pub replay_forks_threads: String,
     pub replay_transactions_threads: String,
-    pub rocksdb_compaction_threads: String,
-    pub rocksdb_flush_threads: String,
+    pub tpu_sigverify_threads: String,
     pub tpu_transaction_forward_receive_threads: String,
     pub tpu_transaction_receive_threads: String,
     pub tpu_vote_transaction_receive_threads: String,
@@ -44,8 +43,7 @@ impl Default for DefaultThreadArgs {
             replay_forks_threads: ReplayForksThreadsArg::bounded_default().to_string(),
             replay_transactions_threads: ReplayTransactionsThreadsArg::bounded_default()
                 .to_string(),
-            rocksdb_compaction_threads: RocksdbCompactionThreadsArg::bounded_default().to_string(),
-            rocksdb_flush_threads: RocksdbFlushThreadsArg::bounded_default().to_string(),
+            tpu_sigverify_threads: TpuSigverifyThreadsArg::bounded_default().to_string(),
             tpu_transaction_forward_receive_threads:
                 TpuTransactionForwardReceiveThreadArgs::bounded_default().to_string(),
             tpu_transaction_receive_threads: TpuTransactionReceiveThreads::bounded_default()
@@ -69,8 +67,7 @@ pub fn thread_args<'a>(defaults: &DefaultThreadArgs) -> Vec<Arg<'_, 'a>> {
         new_thread_arg::<RayonGlobalThreadsArg>(&defaults.rayon_global_threads),
         new_thread_arg::<ReplayForksThreadsArg>(&defaults.replay_forks_threads),
         new_thread_arg::<ReplayTransactionsThreadsArg>(&defaults.replay_transactions_threads),
-        new_thread_arg::<RocksdbCompactionThreadsArg>(&defaults.rocksdb_compaction_threads),
-        new_thread_arg::<RocksdbFlushThreadsArg>(&defaults.rocksdb_flush_threads),
+        new_thread_arg::<TpuSigverifyThreadsArg>(&defaults.tpu_sigverify_threads),
         new_thread_arg::<TpuTransactionForwardReceiveThreadArgs>(
             &defaults.tpu_transaction_forward_receive_threads,
         ),
@@ -84,7 +81,7 @@ pub fn thread_args<'a>(defaults: &DefaultThreadArgs) -> Vec<Arg<'_, 'a>> {
     ]
 }
 
-fn new_thread_arg<'a, T: ThreadArg>(default: &str) -> Arg<'_, 'a> {
+pub(crate) fn new_thread_arg<'a, T: ThreadArg>(default: &str) -> Arg<'_, 'a> {
     Arg::with_name(T::NAME)
         .long(T::LONG_NAME)
         .takes_value(true)
@@ -104,6 +101,7 @@ pub struct NumThreadConfig {
     pub rayon_global_threads: NonZeroUsize,
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
+    pub tpu_sigverify_threads: NonZeroUsize,
     pub tpu_transaction_forward_receive_threads: NonZeroUsize,
     pub tpu_transaction_receive_threads: NonZeroUsize,
     pub tpu_vote_transaction_receive_threads: NonZeroUsize,
@@ -113,15 +111,12 @@ pub struct NumThreadConfig {
 }
 
 pub fn parse_num_threads_args(matches: &ArgMatches) -> NumThreadConfig {
-    let accounts_db_background_threads = {
-        if matches.is_present("accounts_db_clean_threads") {
-            value_t_or_exit!(matches, "accounts_db_clean_threads", NonZeroUsize)
-        } else {
-            value_t_or_exit!(matches, AccountsDbBackgroundThreadsArg::NAME, NonZeroUsize)
-        }
-    };
     NumThreadConfig {
-        accounts_db_background_threads,
+        accounts_db_background_threads: value_t_or_exit!(
+            matches,
+            AccountsDbBackgroundThreadsArg::NAME,
+            NonZeroUsize
+        ),
         accounts_db_foreground_threads: value_t_or_exit!(
             matches,
             AccountsDbForegroundThreadsArg::NAME,
@@ -147,6 +142,11 @@ pub fn parse_num_threads_args(matches: &ArgMatches) -> NumThreadConfig {
         replay_transactions_threads: value_t_or_exit!(
             matches,
             ReplayTransactionsThreadsArg::NAME,
+            NonZeroUsize
+        ),
+        tpu_sigverify_threads: value_t_or_exit!(
+            matches,
+            TpuSigverifyThreadsArg::NAME,
             NonZeroUsize
         ),
         tpu_transaction_forward_receive_threads: value_t_or_exit!(
@@ -272,9 +272,6 @@ impl ThreadArg for IpEchoServerThreadsArg {
     fn default() -> usize {
         solana_net_utils::DEFAULT_IP_ECHO_SERVER_THREADS.get()
     }
-    fn min() -> usize {
-        solana_net_utils::MINIMUM_IP_ECHO_SERVER_THREADS.get()
-    }
 }
 
 struct RayonGlobalThreadsArg;
@@ -316,25 +313,15 @@ impl ThreadArg for ReplayTransactionsThreadsArg {
     }
 }
 
-pub struct RocksdbCompactionThreadsArg;
-impl ThreadArg for RocksdbCompactionThreadsArg {
-    const NAME: &'static str = "rocksdb_compaction_threads";
-    const LONG_NAME: &'static str = "rocksdb-compaction-threads";
-    const HELP: &'static str = "Number of threads to use for rocksdb (Blockstore) compactions";
+struct TpuSigverifyThreadsArg;
+impl ThreadArg for TpuSigverifyThreadsArg {
+    const NAME: &'static str = "tpu_sigverify_threads";
+    const LONG_NAME: &'static str = "tpu-sigverify-threads";
+    const HELP: &'static str =
+        "Number of threads to use for performing signature verification of received transactions";
 
     fn default() -> usize {
-        solana_ledger::blockstore::default_num_compaction_threads().get()
-    }
-}
-
-pub struct RocksdbFlushThreadsArg;
-impl ThreadArg for RocksdbFlushThreadsArg {
-    const NAME: &'static str = "rocksdb_flush_threads";
-    const LONG_NAME: &'static str = "rocksdb-flush-threads";
-    const HELP: &'static str = "Number of threads to use for rocksdb (Blockstore) memtable flushes";
-
-    fn default() -> usize {
-        solana_ledger::blockstore::default_num_flush_threads().get()
+        get_thread_count()
     }
 }
 
@@ -343,7 +330,7 @@ impl ThreadArg for TpuTransactionForwardReceiveThreadArgs {
     const NAME: &'static str = "tpu_transaction_forward_receive_threads";
     const LONG_NAME: &'static str = "tpu-transaction-forward-receive-threads";
     const HELP: &'static str =
-        "Number of threads to use for receiving transactions on the TPU fowards port";
+        "Number of threads to use for receiving transactions on the TPU forwards port";
 
     fn default() -> usize {
         solana_streamer::quic::default_num_tpu_transaction_forward_receive_threads()

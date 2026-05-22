@@ -11,7 +11,7 @@ use {
     solana_accounts_db::{
         account_info::{AccountInfo, StorageLocation},
         accounts::{AccountAddressFilter, Accounts},
-        accounts_db::{AccountFromStorage, AccountsDb, ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS},
+        accounts_db::{ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS, AccountFromStorage, AccountsDb},
         accounts_index::ScanConfig,
         ancestors::Ancestors,
     },
@@ -68,10 +68,10 @@ where
     F: Fn(&Accounts, &[Pubkey]) + Send + Copy + 'static,
 {
     let num_readers = 5;
-    let accounts_db = new_accounts_db(vec![PathBuf::from(
-        std::env::var("FARF_DIR").unwrap_or_else(|_| "farf".to_string()),
-    )
-    .join(bench_name)]);
+    let accounts_db = new_accounts_db(vec![
+        PathBuf::from(std::env::var("FARF_DIR").unwrap_or_else(|_| "farf".to_string()))
+            .join(bench_name),
+    ]);
     let accounts = Arc::new(Accounts::new(Arc::new(accounts_db)));
     let num_keys = 1000;
     let slot = 0;
@@ -85,11 +85,8 @@ where
     )
     .collect();
     let storable_accounts: Vec<_> = pubkeys.iter().zip(accounts_data.iter()).collect();
-    accounts.store_accounts_par((slot, storable_accounts.as_slice()), None);
-    accounts.add_root(slot);
-    accounts
-        .accounts_db
-        .flush_accounts_cache_slot_for_tests(slot);
+    accounts.store_accounts_par((slot, storable_accounts.as_slice()), None, None);
+    accounts.accounts_db.add_root_and_flush_write_cache(slot);
 
     let pubkeys = Arc::new(pubkeys);
     for i in 0..num_readers {
@@ -112,7 +109,7 @@ where
         // Write to a different slot than the one being read from. Because
         // there's a new account pubkey being written to every time, will
         // compete for the accounts index lock on every store
-        accounts.store_accounts_par((slot + 1, new_storable_accounts.as_slice()), None);
+        accounts.store_accounts_par((slot + 1, new_storable_accounts.as_slice()), None, None);
     });
 }
 
@@ -122,9 +119,9 @@ fn bench_concurrent_read_write(bencher: &mut Bencher) {
         "concurrent_read_write",
         bencher,
         |accounts, pubkeys| {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             loop {
-                let i = rng.gen_range(0..pubkeys.len());
+                let i = rng.random_range(0..pubkeys.len());
                 test::black_box(
                     accounts
                         .load_without_fixed_root(&Ancestors::default(), &pubkeys[i])
@@ -137,17 +134,19 @@ fn bench_concurrent_read_write(bencher: &mut Bencher) {
 
 #[bench]
 fn bench_concurrent_scan_write(bencher: &mut Bencher) {
-    store_accounts_with_possible_contention("concurrent_scan_write", bencher, |accounts, _| loop {
-        test::black_box(
-            accounts
-                .load_by_program(
-                    &Ancestors::default(),
-                    0,
-                    AccountSharedData::default().owner(),
-                    &ScanConfig::default(),
-                )
-                .unwrap(),
-        );
+    store_accounts_with_possible_contention("concurrent_scan_write", bencher, |accounts, _| {
+        loop {
+            test::black_box(
+                accounts
+                    .load_by_program(
+                        &Ancestors::default(),
+                        0,
+                        AccountSharedData::default().owner(),
+                        &ScanConfig::default(),
+                    )
+                    .unwrap(),
+            );
+        }
     })
 }
 
@@ -164,8 +163,10 @@ fn bench_dashmap_single_reader_with_n_writers(bencher: &mut Bencher) {
         let map = map.clone();
         Builder::new()
             .name("readers".to_string())
-            .spawn(move || loop {
-                test::black_box(map.entry(5).or_insert(2));
+            .spawn(move || {
+                loop {
+                    test::black_box(map.entry(5).or_insert(2));
+                }
             })
             .unwrap();
     }
@@ -189,8 +190,10 @@ fn bench_rwlock_hashmap_single_reader_with_n_writers(bencher: &mut Bencher) {
         let map = map.clone();
         Builder::new()
             .name("readers".to_string())
-            .spawn(move || loop {
-                test::black_box(map.write().unwrap().get(&5));
+            .spawn(move || {
+                loop {
+                    test::black_box(map.write().unwrap().get(&5));
+                }
             })
             .unwrap();
     }
@@ -202,10 +205,10 @@ fn bench_rwlock_hashmap_single_reader_with_n_writers(bencher: &mut Bencher) {
 }
 
 fn setup_bench_dashmap_iter() -> (Arc<Accounts>, DashMap<Pubkey, (AccountSharedData, Hash)>) {
-    let accounts_db = new_accounts_db(vec![PathBuf::from(
-        std::env::var("FARF_DIR").unwrap_or_else(|_| "farf".to_string()),
-    )
-    .join("bench_dashmap_par_iter")]);
+    let accounts_db = new_accounts_db(vec![
+        PathBuf::from(std::env::var("FARF_DIR").unwrap_or_else(|_| "farf".to_string()))
+            .join("bench_dashmap_par_iter"),
+    ]);
     let accounts = Arc::new(Accounts::new(Arc::new(accounts_db)));
 
     let dashmap = DashMap::new();
@@ -257,9 +260,9 @@ fn bench_dashmap_iter(bencher: &mut Bencher) {
 fn bench_load_largest_accounts(b: &mut Bencher) {
     let accounts_db = new_accounts_db(Vec::new());
     let accounts = Accounts::new(Arc::new(accounts_db));
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     for _ in 0..10_000 {
-        let lamports = rng.gen();
+        let lamports = rng.random();
         let pubkey = Pubkey::new_unique();
         let account = AccountSharedData::new(lamports, 0, &Pubkey::default());
         accounts
@@ -296,7 +299,7 @@ fn bench_sort_and_remove_dups(b: &mut Bencher) {
     use rand::prelude::*;
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1234);
     let accounts: Vec<_> =
-        std::iter::repeat_with(|| generate_sample_account_from_storage(rng.gen::<u8>()))
+        std::iter::repeat_with(|| generate_sample_account_from_storage(rng.random::<u8>()))
             .take(1000)
             .collect();
 
@@ -316,9 +319,10 @@ fn bench_sort_and_remove_dups_no_dups(b: &mut Bencher) {
     }
 
     use rand::prelude::*;
+
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1234);
     let mut accounts: Vec<_> =
-        std::iter::repeat_with(|| generate_sample_account_from_storage(rng.gen::<u8>()))
+        std::iter::repeat_with(|| generate_sample_account_from_storage(rng.random::<u8>()))
             .take(1000)
             .collect();
 

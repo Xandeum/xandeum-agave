@@ -1,24 +1,24 @@
 use {
     agave_banking_stage_ingress_types::BankingPacketBatch,
-    crossbeam_channel::{unbounded, Receiver, Sender},
+    crossbeam_channel::{Receiver, Sender, unbounded},
     rand::prelude::*,
     solana_account::AccountSharedData,
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_core::banking_stage::{
+        TOTAL_BUFFERED_PACKETS,
         decision_maker::BufferedPacketsDecision,
         transaction_scheduler::{
             receive_and_buffer::{ReceiveAndBuffer, TransactionViewReceiveAndBuffer},
             transaction_state_container::StateContainer,
         },
-        TOTAL_BUFFERED_PACKETS,
     },
     solana_genesis_config::GenesisConfig,
     solana_hash::Hash,
     solana_instruction::{AccountMeta, Instruction},
     solana_keypair::Keypair,
-    solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo},
+    solana_ledger::genesis_utils::{GenesisConfigInfo, create_genesis_config},
     solana_message::{Message, VersionedMessage},
-    solana_perf::packet::{to_packet_batches, PacketBatch, NUM_PACKETS},
+    solana_perf::packet::{NUM_PACKETS, PacketBatch, to_packet_batches},
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_sdk_ids::system_program,
@@ -57,7 +57,7 @@ impl FaultyBlockhash {
     }
 
     pub fn get<R: Rng>(&self, rng: &mut R) -> Hash {
-        if rng.gen::<f64>() < self.probability_invalid_blockhash {
+        if rng.random::<f64>() < self.probability_invalid_blockhash {
             Hash::default()
         } else {
             self.blockhash
@@ -83,7 +83,7 @@ fn generate_transactions(
     }
     let blockhash = FaultyBlockhash::new(bank.last_blockhash(), probability_invalid_blockhash);
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     let mut fee_payers = fee_payers.iter().cycle();
 
@@ -95,7 +95,7 @@ fn generate_transactions(
             let mut instructions = Vec::with_capacity(num_instructions_per_tx);
             if set_rand_cu_price {
                 // Experiments with different distributions didn't show much of the effect on the performance.
-                let compute_unit_price = rng.gen_range(0..1000);
+                let compute_unit_price = rng.random_range(0..1000);
                 instructions.push(ComputeBudgetInstruction::set_compute_unit_price(
                     compute_unit_price,
                 ));
@@ -140,7 +140,7 @@ impl ReceiveAndBufferCreator for TransactionViewReceiveAndBuffer {
     ) -> Self {
         TransactionViewReceiveAndBuffer {
             receiver,
-            bank_forks,
+            sharable_banks: bank_forks.read().unwrap().sharable_banks(),
         }
     }
 }
@@ -183,7 +183,7 @@ pub fn setup_receive_and_buffer<T: ReceiveAndBuffer + ReceiveAndBufferCreator>(
 
     let txs = generate_transactions(
         num_txs,
-        bank.clone(),
+        bank,
         &fee_payers,
         num_instructions_per_tx,
         probability_invalid_blockhash,

@@ -1,13 +1,14 @@
 use {
     itertools::Itertools,
     log::{error, info},
+    solana_keypair::{Keypair, write_keypair_file},
     std::{
         env,
         ffi::OsStr,
         fs::File,
         io::{BufWriter, Write},
-        path::Path,
-        process::{exit, Command, Stdio},
+        path::{Path, PathBuf},
+        process::{Command, Stdio, exit},
     },
 };
 
@@ -59,4 +60,25 @@ where
         .iter()
         .map(|&c| c as char)
         .collect::<String>()
+}
+
+pub(crate) fn create_directory(path: &PathBuf) {
+    std::fs::create_dir_all(path).unwrap_or_else(|err| {
+        error!("Failed create folder: {err}");
+        exit(1);
+    });
+}
+
+pub(crate) fn copy_file(from: &Path, to: &Path) {
+    std::fs::copy(from, to).unwrap_or_else(|err| {
+        error!("Failed to copy file: {err}");
+        exit(1);
+    });
+}
+
+pub(crate) fn generate_keypair(path: &PathBuf) {
+    write_keypair_file(&Keypair::new(), path).unwrap_or_else(|err| {
+        error!("Unable to create {}: {err}", path.display());
+        exit(1);
+    });
 }

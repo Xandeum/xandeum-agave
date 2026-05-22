@@ -1,15 +1,12 @@
 use {
     super::{Bank, BankStatusCache},
-    agave_feature_set::{raise_cpi_nesting_limit_to_8, FeatureSet},
+    agave_feature_set::{FeatureSet, raise_cpi_nesting_limit_to_8},
     solana_accounts_db::blockhash_queue::BlockhashQueue,
-    solana_clock::{
-        MAX_PROCESSING_AGE, MAX_TRANSACTION_FORWARDING_DELAY, MAX_TRANSACTION_FORWARDING_DELAY_GPU,
-    },
-    solana_fee::{calculate_fee_details, FeeFeatures},
+    solana_clock::{MAX_PROCESSING_AGE, MAX_TRANSACTION_FORWARDING_DELAY, Slot},
+    solana_fee::{FeeFeatures, calculate_fee_details},
     solana_fee_structure::{FeeBudgetLimits, FeeDetails},
     solana_nonce::state::{Data as NonceData, DurableNonce},
     solana_nonce_account as nonce_account,
-    solana_perf::perf_libs,
     solana_program_runtime::execution_budget::SVMTransactionExecutionAndFeeBudgetLimits,
     solana_pubkey::Pubkey,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
@@ -35,12 +32,7 @@ impl Bank {
         //  1. Transaction forwarding delay
         //  2. The slot at which the next leader will actually process the transaction
         // Drop the transaction if it will expire by the time the next node receives and processes it
-        let api = perf_libs::api();
-        let max_tx_fwd_delay = if api.is_none() {
-            MAX_TRANSACTION_FORWARDING_DELAY
-        } else {
-            MAX_TRANSACTION_FORWARDING_DELAY_GPU
-        };
+        let max_tx_fwd_delay = MAX_TRANSACTION_FORWARDING_DELAY;
 
         self.check_transactions(
             transactions,
@@ -59,13 +51,36 @@ impl Bank {
         max_age: usize,
         error_counters: &mut TransactionErrorMetrics,
     ) -> Vec<TransactionCheckResult> {
+        self.check_transactions_with_processed_slots(
+            sanitized_txs,
+            lock_results,
+            max_age,
+            false,
+            error_counters,
+        )
+        .0
+    }
+
+    pub fn check_transactions_with_processed_slots<Tx: TransactionWithMeta>(
+        &self,
+        sanitized_txs: &[impl core::borrow::Borrow<Tx>],
+        lock_results: &[TransactionResult<()>],
+        max_age: usize,
+        collect_processed_slots: bool,
+        error_counters: &mut TransactionErrorMetrics,
+    ) -> (Vec<TransactionCheckResult>, Option<Vec<Option<Slot>>>) {
         let lock_results = self.check_age_and_compute_budget_limits(
             sanitized_txs,
             lock_results,
             max_age,
             error_counters,
         );
-        self.check_status_cache(sanitized_txs, lock_results, error_counters)
+        self.check_status_cache(
+            sanitized_txs,
+            lock_results,
+            collect_processed_slots,
+            error_counters,
+        )
     }
 
     fn check_age_and_compute_budget_limits<Tx: TransactionWithMeta>(
@@ -214,38 +229,51 @@ impl Bank {
         &self,
         sanitized_txs: &[impl core::borrow::Borrow<Tx>],
         lock_results: Vec<TransactionCheckResult>,
+        collect_processed_slots: bool,
         error_counters: &mut TransactionErrorMetrics,
-    ) -> Vec<TransactionCheckResult> {
+    ) -> (Vec<TransactionCheckResult>, Option<Vec<Option<Slot>>>) {
         // Do allocation before acquiring the lock on the status cache.
         let mut check_results = Vec::with_capacity(sanitized_txs.len());
+        let mut processed_slots = if collect_processed_slots {
+            Some(Vec::with_capacity(sanitized_txs.len()))
+        } else {
+            None
+        };
         let rcache = self.status_cache.read().unwrap();
 
-        check_results.extend(sanitized_txs.iter().zip(lock_results).map(
-            |(sanitized_tx, lock_result)| {
-                let sanitized_tx = sanitized_tx.borrow();
-                if lock_result.is_ok()
-                    && self.is_transaction_already_processed(sanitized_tx, &rcache)
-                {
-                    error_counters.already_processed += 1;
-                    return Err(TransactionError::AlreadyProcessed);
-                }
+        for (sanitized_tx_ref, lock_result) in sanitized_txs.iter().zip(lock_results) {
+            let sanitized_tx = sanitized_tx_ref.borrow();
 
-                lock_result
-            },
-        ));
-        check_results
+            let (result, processed_slot) = if lock_result.is_ok() {
+                if let Some(slot) = self.get_processed_slot(sanitized_tx, &rcache) {
+                    error_counters.already_processed += 1;
+                    (Err(TransactionError::AlreadyProcessed), Some(slot))
+                } else {
+                    (lock_result, None)
+                }
+            } else {
+                (lock_result, None)
+            };
+
+            check_results.push(result);
+            if let Some(processed_slots) = processed_slots.as_mut() {
+                processed_slots.push(processed_slot)
+            }
+        }
+
+        (check_results, processed_slots)
     }
 
-    fn is_transaction_already_processed(
+    fn get_processed_slot(
         &self,
         sanitized_tx: &impl TransactionWithMeta,
         status_cache: &BankStatusCache,
-    ) -> bool {
+    ) -> Option<Slot> {
         let key = sanitized_tx.message_hash();
         let transaction_blockhash = sanitized_tx.recent_blockhash();
         status_cache
             .get_status(key, transaction_blockhash, &self.ancestors)
-            .is_some()
+            .map(|status| status.0)
     }
 }
 
@@ -261,10 +289,10 @@ mod tests {
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_message::{
-            compiled_instruction::CompiledInstruction,
-            v0::{self, LoadedAddresses, MessageAddressTableLookup},
             Message, MessageHeader, SanitizedMessage, SanitizedVersionedMessage,
             SimpleAddressLoader, VersionedMessage,
+            compiled_instruction::CompiledInstruction,
+            v0::{self, LoadedAddresses, MessageAddressTableLookup},
         },
         solana_nonce::{state::State as NonceState, versions::Versions as NonceVersions},
         solana_signer::Signer,
@@ -342,9 +370,10 @@ mod tests {
             Some(&custodian_pubkey),
             &nonce_hash,
         ));
-        assert!(bank
-            .check_nonce_transaction_validity(&message, &bank.next_durable_nonce())
-            .is_none());
+        assert!(
+            bank.check_nonce_transaction_validity(&message, &bank.next_durable_nonce())
+                .is_none()
+        );
     }
 
     #[test]
@@ -371,12 +400,13 @@ mod tests {
             &nonce_hash,
         );
         message.instructions[0].accounts.clear();
-        assert!(bank
-            .check_nonce_transaction_validity(
+        assert!(
+            bank.check_nonce_transaction_validity(
                 &new_sanitized_message(message),
                 &bank.next_durable_nonce(),
             )
-            .is_none());
+            .is_none()
+        );
     }
 
     #[test]
@@ -404,9 +434,10 @@ mod tests {
             Some(&custodian_pubkey),
             &nonce_hash,
         ));
-        assert!(bank
-            .check_nonce_transaction_validity(&message, &bank.next_durable_nonce())
-            .is_none());
+        assert!(
+            bank.check_nonce_transaction_validity(&message, &bank.next_durable_nonce())
+                .is_none()
+        );
     }
 
     #[test]
@@ -431,9 +462,10 @@ mod tests {
             Some(&custodian_pubkey),
             &Hash::default(),
         ));
-        assert!(bank
-            .check_nonce_transaction_validity(&message, &bank.next_durable_nonce())
-            .is_none());
+        assert!(
+            bank.check_nonce_transaction_validity(&message, &bank.next_durable_nonce())
+                .is_none()
+        );
     }
 
     #[test_case(true; "test_check_nonce_transaction_validity_nonce_is_alt_disallowed")]

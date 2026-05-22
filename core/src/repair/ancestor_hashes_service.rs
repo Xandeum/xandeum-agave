@@ -17,15 +17,15 @@ use {
         shred_fetch_stage::receive_quic_datagrams,
     },
     bytes::Bytes,
-    crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
-    dashmap::{mapref::entry::Entry::Occupied, DashMap},
-    solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded},
+    dashmap::{DashMap, mapref::entry::Entry::Occupied},
+    solana_clock::{DEFAULT_MS_PER_SLOT, Slot},
     solana_cluster_type::ClusterType,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol, ping_pong::Pong},
-    solana_keypair::{signable::Signable, Keypair, Signer},
+    solana_keypair::{Keypair, Signer, signable::Signable},
     solana_ledger::blockstore::Blockstore,
     solana_perf::{
-        packet::{deserialize_from_with_limit, PacketBatch, PacketFlags, PacketRef},
+        packet::{PacketBatch, PacketFlags, PacketRef, deserialize_from_with_limit},
         recycler::Recycler,
     },
     solana_pubkey::Pubkey,
@@ -37,10 +37,10 @@ use {
         io::{Cursor, Read},
         net::{SocketAddr, UdpSocket},
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
-        thread::{self, sleep, Builder, JoinHandle},
+        thread::{self, Builder, JoinHandle, sleep},
         time::{Duration, Instant},
     },
     tokio::sync::mpsc::Sender as AsyncSender,
@@ -90,6 +90,8 @@ struct AncestorHashesResponsesStats {
 }
 
 impl AncestorHashesResponsesStats {
+    const REPORT_INTERVAL: Duration = Duration::from_secs(2);
+
     fn report(&mut self) {
         datapoint_info!(
             "ancestor_hashes_responses",
@@ -119,6 +121,8 @@ impl Default for AncestorRepairRequestsStats {
 }
 
 impl AncestorRepairRequestsStats {
+    const REPORT_INTERVAL: Duration = Duration::from_secs(2);
+
     fn report(&mut self) {
         let slot_to_count: Vec<_> = self
             .ancestor_requests
@@ -128,7 +132,7 @@ impl AncestorRepairRequestsStats {
             .collect();
 
         let repair_total = self.ancestor_requests.count;
-        if self.last_report.elapsed().as_secs() > 2 && repair_total > 0 {
+        if self.last_report.elapsed() > Self::REPORT_INTERVAL && repair_total > 0 {
             info!("ancestor_repair_requests_stats: {slot_to_count:?}");
             datapoint_info!(
                 "ancestor-repair",
@@ -171,7 +175,6 @@ impl AncestorHashesService {
             )),
             Some(Duration::from_millis(1)), // coalesce
             false,                          // use_pinned_memory
-            None,                           // in_vote_only_mode
             false,                          // is_staked_service
         );
 
@@ -277,7 +280,7 @@ impl AncestorHashesService {
                             return;
                         }
                     };
-                    if last_stats_report.elapsed().as_secs() > 2 {
+                    if last_stats_report.elapsed() > AncestorHashesResponsesStats::REPORT_INTERVAL {
                         stats.report();
                         last_stats_report = Instant::now();
                     }
@@ -603,11 +606,13 @@ impl AncestorHashesService {
         retryable_slots_receiver: RetryableSlotsReceiver,
     ) -> JoinHandle<()> {
         let serve_repair = {
+            let bank_forks_r = repair_info.bank_forks.read().unwrap();
             ServeRepair::new(
                 repair_info.cluster_info.clone(),
-                repair_info.bank_forks.read().unwrap().sharable_banks(),
+                bank_forks_r.sharable_banks(),
                 repair_info.repair_whitelist.clone(),
                 Box::new(StandardRepairHandler::new(blockstore)),
+                bank_forks_r.migration_status(),
             )
         };
         let mut repair_stats = AncestorRepairRequestsStats::default();
@@ -631,27 +636,29 @@ impl AncestorHashesService {
         let mut request_throttle = vec![];
         Builder::new()
             .name("solManAncReqs".to_string())
-            .spawn(move || loop {
-                if exit.load(Ordering::Relaxed) {
-                    return;
-                }
-                Self::manage_ancestor_requests(
-                    &ancestor_hashes_request_statuses,
-                    &ancestor_hashes_request_socket,
-                    &ancestor_hashes_request_quic_sender,
-                    &repair_info,
-                    &outstanding_requests,
-                    &ancestor_hashes_replay_update_receiver,
-                    &retryable_slots_receiver,
-                    &serve_repair,
-                    &mut repair_stats,
-                    &mut dead_slot_pool,
-                    &mut repairable_dead_slot_pool,
-                    &mut popular_pruned_slot_pool,
-                    &mut request_throttle,
-                );
+            .spawn(move || {
+                loop {
+                    if exit.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    Self::manage_ancestor_requests(
+                        &ancestor_hashes_request_statuses,
+                        &ancestor_hashes_request_socket,
+                        &ancestor_hashes_request_quic_sender,
+                        &repair_info,
+                        &outstanding_requests,
+                        &ancestor_hashes_replay_update_receiver,
+                        &retryable_slots_receiver,
+                        &serve_repair,
+                        &mut repair_stats,
+                        &mut dead_slot_pool,
+                        &mut repairable_dead_slot_pool,
+                        &mut popular_pruned_slot_pool,
+                        &mut request_throttle,
+                    );
 
-                sleep(Duration::from_millis(DEFAULT_MS_PER_SLOT));
+                    sleep(Duration::from_millis(DEFAULT_MS_PER_SLOT));
+                }
             })
             .unwrap()
     }
@@ -888,9 +895,11 @@ impl AncestorHashesService {
             duplicate_slot,
             request_type,
         );
-        assert!(ancestor_hashes_request_statuses
-            .insert(duplicate_slot, ancestor_request_status)
-            .is_none());
+        assert!(
+            ancestor_hashes_request_statuses
+                .insert(duplicate_slot, ancestor_request_status)
+                .is_none()
+        );
         true
     }
 }
@@ -908,8 +917,8 @@ mod test {
                 serve_repair_service::adapt_repair_requests_packets,
             },
             replay_stage::{
-                tests::{replay_blockstore_components, ReplayBlockstoreComponents},
                 ReplayStage,
+                tests::{ReplayBlockstoreComponents, replay_blockstore_components},
             },
             vote_simulator::VoteSimulator,
         },
@@ -924,11 +933,10 @@ mod test {
             blockstore::make_many_slot_entries, get_tmp_ledger_path,
             get_tmp_ledger_path_auto_delete, shred::Nonce,
         },
-        solana_net_utils::sockets::bind_to_localhost_unique,
+        solana_net_utils::{SocketAddrSpace, sockets::bind_to_localhost_unique},
         solana_perf::packet::Packet,
         solana_runtime::bank_forks::BankForks,
         solana_signer::Signer,
-        solana_streamer::socket::SocketAddrSpace,
         std::collections::HashMap,
         trees::tr,
     };
@@ -1270,11 +1278,13 @@ mod test {
             let ledger_path = get_tmp_ledger_path!();
             let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
             let responder_serve_repair = {
+                let bank_forks_r = vote_simulator.bank_forks.read().unwrap();
                 ServeRepair::new(
                     Arc::new(cluster_info),
-                    vote_simulator.bank_forks.read().unwrap().sharable_banks(),
+                    bank_forks_r.sharable_banks(),
                     Arc::<RwLock<HashSet<_>>>::default(), // repair whitelist
                     Box::new(StandardRepairHandler::new(blockstore.clone())),
+                    bank_forks_r.migration_status(),
                 )
             };
 
@@ -1311,7 +1321,6 @@ mod test {
                 Arc::new(StreamerReceiveStats::new("repair_request_receiver")),
                 Some(Duration::from_millis(1)), // coalesce
                 false,
-                None,
                 false,
             );
             let (remote_request_sender, remote_request_receiver) = unbounded();
@@ -1377,11 +1386,13 @@ mod test {
             let ledger_path = get_tmp_ledger_path!();
             let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
             let requester_serve_repair = {
+                let bank_forks_r = bank_forks.read().unwrap();
                 ServeRepair::new(
                     requester_cluster_info.clone(),
-                    bank_forks.read().unwrap().sharable_banks(),
+                    bank_forks_r.sharable_banks(),
                     repair_whitelist.clone(),
                     Box::new(StandardRepairHandler::new(blockstore)),
+                    bank_forks_r.migration_status(),
                 )
             };
             let (ancestor_duplicate_slots_sender, _ancestor_duplicate_slots_receiver) = unbounded();
@@ -1393,7 +1404,6 @@ mod test {
                 ancestor_duplicate_slots_sender,
                 repair_validators: None,
                 repair_whitelist,
-                wen_restart_repair_slots: None,
             };
 
             let (ancestor_hashes_replay_update_sender, ancestor_hashes_replay_update_receiver) =
@@ -1964,16 +1974,18 @@ mod test {
         let mut packet = Packet::default();
         packet.meta_mut().size = 0;
 
-        assert!(AncestorHashesService::verify_and_process_ancestor_response(
-            &packet,
-            &ancestor_hashes_request_statuses,
-            &mut AncestorHashesResponsesStats::default(),
-            &outstanding_requests,
-            &blockstore,
-            &repair_info.cluster_info.keypair(),
-            &ancestor_hashes_request_socket,
-        )
-        .is_none());
+        assert!(
+            AncestorHashesService::verify_and_process_ancestor_response(
+                &packet,
+                &ancestor_hashes_request_statuses,
+                &mut AncestorHashesResponsesStats::default(),
+                &outstanding_requests,
+                &blockstore,
+                &repair_info.cluster_info.keypair(),
+                &ancestor_hashes_request_socket,
+            )
+            .is_none()
+        );
     }
 
     #[test]

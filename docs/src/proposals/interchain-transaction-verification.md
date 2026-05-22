@@ -68,7 +68,7 @@ A contract deployed on Solana which coordinates and intermediates the interactio
 
 ### Proof Request
 
-A message sent by the Client to the SPV engine denoting a request for a proof of a specific transaction or set of transactions. Proof Requests can either manually specify a certain transaction by its hash or can elect to submit a filter that matches multiple transactions or classes of transactions. For example, a filter matching “any transaction from address xxx to address yyy” could be used to detect payment of a debt or settlement of an inter-chain swap. Likewise, a filter matching “any transaction from address xxx” could be used by a lending or synthetic token minting contract to monitor and react to changes in collateralization. Proof Requests are sent with a fee, which is disbursed by the SPV engine contract to the appropriate Prover once a proof matching that request is validated.
+A message sent by the Client to the SPV engine denoting a request for a proof of a specific transaction or set of transactions. Proof Requests can either manually specify a certain transaction by its hash or can elect to submit a filter that matches multiple transactions or classes of transactions. For example, a filter matching "any transaction from address xxx to address yyy" could be used to detect payment of a debt or settlement of an inter-chain swap. Likewise, a filter matching "any transaction from address xxx" could be used by a lending or synthetic token minting contract to monitor and react to changes in collateralization. Proof Requests are sent with a fee, which is disbursed by the SPV engine contract to the appropriate Prover once a proof matching that request is validated.
 
 ### Request Book
 
@@ -100,6 +100,6 @@ Store Headers in program sub-accounts indexed by Public address:
 Linked List of multiple sub-accounts storing headers:
 
 - Maintain sequential index of storage accounts, many headers per storage account
-- Max 2 account data lookups for &gt;99.9% of verifications \(1 for most\)
+- Max 2 account data lookups for &gt;99.9% of verification \(1 for most\)
 - Compact sequential data address format allows any number of confirmations and fast lookups
 - Facilitates network-wide header duplication inefficiencies

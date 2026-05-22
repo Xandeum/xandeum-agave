@@ -3,16 +3,16 @@ use {
     crate::{
         blockstore::{
             column::{
-                columns, Column, ColumnIndexDeprecation, ColumnName, ProtobufColumn, TypedColumn,
-                DEPRECATED_PROGRAM_COSTS_COLUMN_NAME,
+                Column, ColumnName, DEPRECATED_PROGRAM_COSTS_COLUMN_NAME,
+                DEPRECATED_TRANSACTION_STATUS_INDEX_NAME, ProtobufColumn, TypedColumn, columns,
             },
             error::{BlockstoreError, Result},
         },
         blockstore_metrics::{
-            maybe_enable_rocksdb_perf, report_rocksdb_read_perf, report_rocksdb_write_perf,
-            BlockstoreRocksDbColumnFamilyMetrics, PerfSamplingStatus, PERF_METRIC_OP_NAME_GET,
+            BlockstoreRocksDbColumnFamilyMetrics, PERF_METRIC_OP_NAME_GET,
             PERF_METRIC_OP_NAME_MULTI_GET, PERF_METRIC_OP_NAME_PUT,
-            PERF_METRIC_OP_NAME_WRITE_BATCH,
+            PERF_METRIC_OP_NAME_WRITE_BATCH, PerfSamplingStatus, maybe_enable_rocksdb_perf,
+            report_rocksdb_read_perf, report_rocksdb_write_perf,
         },
         blockstore_options::{AccessType, BlockstoreOptions, LedgerColumnOptions},
     },
@@ -20,12 +20,12 @@ use {
     log::*,
     prost::Message,
     rocksdb::{
-        self,
+        self, ColumnFamily, ColumnFamilyDescriptor, CompactionDecision, DB, DBCompressionType,
+        DBIterator, DBPinnableSlice, DBRawIterator, IteratorMode as RocksIteratorMode, LiveFile,
+        Options, WriteBatch as RWriteBatch,
         compaction_filter::CompactionFilter,
         compaction_filter_factory::{CompactionFilterContext, CompactionFilterFactory},
-        properties as RocksProperties, ColumnFamily, ColumnFamilyDescriptor, CompactionDecision,
-        DBCompressionType, DBIterator, DBPinnableSlice, DBRawIterator,
-        IteratorMode as RocksIteratorMode, LiveFile, Options, WriteBatch as RWriteBatch, DB,
+        properties as RocksProperties,
     },
     serde::de::DeserializeOwned,
     solana_clock::Slot,
@@ -37,8 +37,8 @@ use {
         num::NonZeroUsize,
         path::{Path, PathBuf},
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc,
+            atomic::{AtomicU64, Ordering},
         },
     },
 };
@@ -64,7 +64,6 @@ pub enum IteratorMode<Index> {
 #[derive(Default, Clone, Debug)]
 struct OldestSlot {
     slot: Arc<AtomicU64>,
-    clean_slot_0: Arc<AtomicBool>,
 }
 
 impl OldestSlot {
@@ -84,20 +83,11 @@ impl OldestSlot {
         // require strictly synchronized semantics in this regard
         self.slot.load(Ordering::Relaxed)
     }
-
-    pub(crate) fn set_clean_slot_0(&self, clean_slot_0: bool) {
-        self.clean_slot_0.store(clean_slot_0, Ordering::Relaxed);
-    }
-
-    pub(crate) fn get_clean_slot_0(&self) -> bool {
-        self.clean_slot_0.load(Ordering::Relaxed)
-    }
 }
 
 #[derive(Debug)]
 pub(crate) struct Rocks {
     db: rocksdb::DB,
-    path: PathBuf,
     access_type: AccessType,
     oldest_slot: OldestSlot,
     column_options: Arc<LedgerColumnOptions>,
@@ -124,18 +114,17 @@ impl Rocks {
             AccessType::Primary | AccessType::PrimaryForMaintenance => {
                 DB::open_cf_descriptors(&db_options, &path, cf_descriptors)?
             }
-            AccessType::Secondary => {
-                let secondary_path = path.join("solana-secondary");
+            AccessType::ReadOnly => {
                 info!(
-                    "Opening Rocks with secondary (read only) access at: {secondary_path:?}. This \
-                     secondary access could temporarily degrade other accesses, such as by \
-                     agave-validator"
+                    "Opening Rocks with read only access. This additional access could \
+                     temporarily degrade other accesses, such as by agave-validator"
                 );
-                DB::open_cf_descriptors_as_secondary(
+                let error_if_log_file_exists = false;
+                DB::open_cf_descriptors_read_only(
                     &db_options,
                     &path,
-                    &secondary_path,
                     cf_descriptors,
+                    error_if_log_file_exists,
                 )?
             }
         };
@@ -144,10 +133,16 @@ impl Rocks {
         if db.cf_handle(DEPRECATED_PROGRAM_COSTS_COLUMN_NAME).is_some() {
             db.drop_cf(DEPRECATED_PROGRAM_COSTS_COLUMN_NAME)?;
         }
+        // Delete the now unused transaction status index column if it is present
+        if db
+            .cf_handle(DEPRECATED_TRANSACTION_STATUS_INDEX_NAME)
+            .is_some()
+        {
+            db.drop_cf(DEPRECATED_TRANSACTION_STATUS_INDEX_NAME)?;
+        }
 
         let rocks = Rocks {
             db,
-            path,
             access_type: options.access_type,
             oldest_slot,
             column_options,
@@ -187,7 +182,6 @@ impl Rocks {
             new_cf_descriptor::<columns::TransactionStatus>(options, oldest_slot),
             new_cf_descriptor::<columns::AddressSignatures>(options, oldest_slot),
             new_cf_descriptor::<columns::TransactionMemos>(options, oldest_slot),
-            new_cf_descriptor::<columns::TransactionStatusIndex>(options, oldest_slot),
             new_cf_descriptor::<columns::Rewards>(options, oldest_slot),
             new_cf_descriptor::<columns::Blocktime>(options, oldest_slot),
             new_cf_descriptor::<columns::PerfSamples>(options, oldest_slot),
@@ -196,13 +190,9 @@ impl Rocks {
             new_cf_descriptor::<columns::MerkleRootMeta>(options, oldest_slot),
         ];
 
-        // If the access type is Secondary, we don't need to open all of the
-        // columns so we can just return immediately.
-        match options.access_type {
-            AccessType::Secondary => {
-                return cf_descriptors;
-            }
-            AccessType::Primary | AccessType::PrimaryForMaintenance => {}
+        // When remaining columns are optional we can just return immediately here.
+        if !must_open_all_column_families(&options.access_type) {
+            return cf_descriptors;
         }
 
         // Attempt to detect the column families that are present. It is not a
@@ -242,7 +232,7 @@ impl Rocks {
         cf_descriptors
     }
 
-    const fn columns() -> [&'static str; 20] {
+    const fn columns() -> [&'static str; 19] {
         [
             columns::ErasureMeta::NAME,
             columns::DeadSlots::NAME,
@@ -257,7 +247,6 @@ impl Rocks {
             columns::TransactionStatus::NAME,
             columns::AddressSignatures::NAME,
             columns::TransactionMemos::NAME,
-            columns::TransactionStatusIndex::NAME,
             columns::Rewards::NAME,
             columns::Blocktime::NAME,
             columns::PerfSamples::NAME,
@@ -286,7 +275,7 @@ impl Rocks {
         // opposed to manual compaction requests on a range.
         // - Periodic compaction operates on individual files once the file
         //   has reached a certain (configurable) age. See comments at
-        //   PERIODIC_COMPACTION_SECONDS for some more deatil.
+        //   PERIODIC_COMPACTION_SECONDS for some more detail.
         // - Manual compaction operates on a range and could end up propagating
         //   through several files and/or levels of the db.
         //
@@ -363,7 +352,7 @@ impl Rocks {
         &self,
         cf: &ColumnFamily,
         keys: I,
-    ) -> impl Iterator<Item = Result<Option<DBPinnableSlice<'_>>>>
+    ) -> impl Iterator<Item = Result<Option<DBPinnableSlice<'_>>>> + use<'_, K, I>
     where
         K: AsRef<[u8]> + 'a + ?Sized,
         I: IntoIterator<Item = &'a K>,
@@ -453,16 +442,8 @@ impl Rocks {
         }
     }
 
-    pub(crate) fn storage_size(&self) -> Result<u64> {
-        Ok(fs_extra::dir::get_size(&self.path)?)
-    }
-
     pub(crate) fn set_oldest_slot(&self, oldest_slot: Slot) {
         self.oldest_slot.set(oldest_slot);
-    }
-
-    pub(crate) fn set_clean_slot_0(&self, clean_slot_0: bool) {
-        self.oldest_slot.set_clean_slot_0(clean_slot_0);
     }
 }
 
@@ -972,72 +953,10 @@ where
     }
 }
 
-impl<C> LedgerColumn<C>
-where
-    C: ColumnIndexDeprecation + ColumnName,
-{
-    pub(crate) fn iter_current_index_filtered(
-        &self,
-        iterator_mode: IteratorMode<C::Index>,
-    ) -> Result<impl Iterator<Item = (C::Index, Box<[u8]>)> + '_> {
-        let start_key: <C as Column>::Key;
-        let iterator_mode = match iterator_mode {
-            IteratorMode::Start => RocksIteratorMode::Start,
-            IteratorMode::End => RocksIteratorMode::End,
-            IteratorMode::From(start, direction) => {
-                start_key = <C as Column>::key(&start);
-                RocksIteratorMode::From(start_key.as_ref(), direction)
-            }
-        };
-
-        let iter = self.backend.iterator_cf(self.handle(), iterator_mode);
-        Ok(iter.filter_map(|pair| {
-            let (key, value) = pair.unwrap();
-            C::try_current_index(&key).ok().map(|index| (index, value))
-        }))
-    }
-
-    pub(crate) fn iter_deprecated_index_filtered(
-        &self,
-        iterator_mode: IteratorMode<C::DeprecatedIndex>,
-    ) -> Result<impl Iterator<Item = (C::DeprecatedIndex, Box<[u8]>)> + '_> {
-        let start_key: <C as ColumnIndexDeprecation>::DeprecatedKey;
-        let iterator_mode = match iterator_mode {
-            IteratorMode::Start => RocksIteratorMode::Start,
-            IteratorMode::End => RocksIteratorMode::End,
-            IteratorMode::From(start_from, direction) => {
-                start_key = C::deprecated_key(start_from);
-                RocksIteratorMode::From(start_key.as_ref(), direction)
-            }
-        };
-
-        let iterator = self.backend.iterator_cf(self.handle(), iterator_mode);
-        Ok(iterator.filter_map(|pair| {
-            let (key, value) = pair.unwrap();
-            C::try_deprecated_index(&key)
-                .ok()
-                .map(|index| (index, value))
-        }))
-    }
-
-    pub(crate) fn delete_deprecated_in_batch(
-        &self,
-        batch: &mut WriteBatch,
-        index: C::DeprecatedIndex,
-    ) -> Result<()> {
-        let key = C::deprecated_key(index);
-        batch.delete_cf(self.handle(), &key)
-    }
-}
-
 /// A CompactionFilter implementation to remove keys older than a given slot.
 struct PurgedSlotFilter<C: Column + ColumnName> {
     /// The oldest slot to keep; any slot < oldest_slot will be removed
     oldest_slot: Slot,
-    /// Whether to preserve keys that return slot 0, even when oldest_slot > 0.
-    // This is used to delete old column data that wasn't keyed with a Slot, and so always returns
-    // `C::slot() == 0`
-    clean_slot_0: bool,
     name: CString,
     _phantom: PhantomData<C>,
 }
@@ -1047,7 +966,7 @@ impl<C: Column + ColumnName> CompactionFilter for PurgedSlotFilter<C> {
         use rocksdb::CompactionDecision::*;
 
         let slot_in_key = C::slot(C::index(key));
-        if slot_in_key >= self.oldest_slot || (slot_in_key == 0 && !self.clean_slot_0) {
+        if slot_in_key >= self.oldest_slot {
             Keep
         } else {
             Remove
@@ -1070,10 +989,8 @@ impl<C: Column + ColumnName> CompactionFilterFactory for PurgedSlotFilterFactory
 
     fn create(&mut self, _context: CompactionFilterContext) -> Self::Filter {
         let copied_oldest_slot = self.oldest_slot.get();
-        let copied_clean_slot_0 = self.oldest_slot.get_clean_slot_0();
         PurgedSlotFilter::<C> {
             oldest_slot: copied_oldest_slot,
-            clean_slot_0: copied_clean_slot_0,
             name: CString::new(format!(
                 "purged_slot_filter({}, {:?})",
                 C::NAME,
@@ -1185,8 +1102,7 @@ fn get_db_options(blockstore_options: &BlockstoreOptions) -> Options {
     options.set_keep_log_file_num(10);
 
     // Allow Rocks to open/keep open as many files as it needs for performance;
-    // however, this is also explicitly required for a secondary instance.
-    // See https://github.com/facebook/rocksdb/wiki/Secondary-instance
+    // it is not required for read-only access, but should be fine with our high ulimit.
     options.set_max_open_files(-1);
 
     options
@@ -1243,6 +1159,11 @@ fn should_enable_compression<C: 'static + Column + ColumnName>() -> bool {
     C::NAME == columns::TransactionStatus::NAME
 }
 
+// If the access type is read-only, we don't need to open all of the columns
+fn must_open_all_column_families(access_type: &AccessType) -> bool {
+    !matches!(access_type, AccessType::ReadOnly)
+}
+
 #[cfg(test)]
 pub mod tests {
     use {
@@ -1257,7 +1178,6 @@ pub mod tests {
             is_manual_compaction: true,
         };
         let oldest_slot = OldestSlot::default();
-        oldest_slot.set_clean_slot_0(true);
 
         let mut factory = PurgedSlotFilterFactory::<ShredData> {
             oldest_slot: oldest_slot.clone(),
@@ -1318,7 +1238,7 @@ pub mod tests {
         assert!(should_disable_auto_compactions(
             &AccessType::PrimaryForMaintenance
         ));
-        assert!(should_disable_auto_compactions(&AccessType::Secondary));
+        assert!(should_disable_auto_compactions(&AccessType::ReadOnly));
     }
 
     #[test]
@@ -1355,11 +1275,11 @@ pub mod tests {
                 .unwrap();
         }
 
-        // Opening with either Secondary or Primary access should succeed,
+        // Opening with any access mode should succeed,
         // even though the Rocks code is unaware of "new_column"
         {
             let options = BlockstoreOptions {
-                access_type: AccessType::Secondary,
+                access_type: AccessType::ReadOnly,
                 ..BlockstoreOptions::default()
             };
             let _ = Rocks::open(db_path.to_path_buf(), options).unwrap();
@@ -1414,37 +1334,10 @@ pub mod tests {
 
         // Reopen the database which has logic to delete program_costs column
         {
-            let _rocks = Rocks::open(db_path.to_path_buf(), options.clone()).unwrap();
+            let _rocks = Rocks::open(db_path.to_path_buf(), options).unwrap();
         }
 
         // The deprecated column should have been dropped by Rocks::open()
         assert!(!is_program_costs_column_present(db_path));
-    }
-
-    impl<C> LedgerColumn<C>
-    where
-        C: ColumnIndexDeprecation + ProtobufColumn + ColumnName,
-    {
-        pub fn put_deprecated_protobuf(
-            &self,
-            index: C::DeprecatedIndex,
-            value: &C::Type,
-        ) -> Result<()> {
-            let mut buf = Vec::with_capacity(value.encoded_len());
-            value.encode(&mut buf)?;
-            self.backend
-                .put_cf(self.handle(), C::deprecated_key(index), &buf)
-        }
-    }
-
-    impl<C> LedgerColumn<C>
-    where
-        C: ColumnIndexDeprecation + TypedColumn + ColumnName,
-    {
-        pub fn put_deprecated(&self, index: C::DeprecatedIndex, value: &C::Type) -> Result<()> {
-            let serialized_value = C::serialize(value)?;
-            self.backend
-                .put_cf(self.handle(), C::deprecated_key(index), &serialized_value)
-        }
     }
 }

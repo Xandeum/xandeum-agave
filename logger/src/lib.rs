@@ -1,7 +1,6 @@
-//! The `logger` module configures `env_logger`
 #![cfg(feature = "agave-unstable-api")]
+//! The `logger` module configures `env_logger`
 use std::{
-    env,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, RwLock},
     thread::JoinHandle,
@@ -62,22 +61,24 @@ pub fn setup() {
 }
 
 // Configures file logging with a default filter if RUST_LOG is not set
-pub fn setup_file_with_default(logfile: &Path, filter: &str) {
-    use std::fs::OpenOptions;
-    let file = OpenOptions::new()
+#[cfg(not(unix))]
+fn setup_file_with_default_filter(logfile: &Path) {
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(logfile)
         .unwrap();
-    let logger = env_logger::Builder::from_env(env_logger::Env::new().default_filter_or(filter))
-        .format_timestamp_nanos()
-        .target(env_logger::Target::Pipe(Box::new(file)))
-        .build();
+
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::new().default_filter_or(DEFAULT_FILTER))
+            .format_timestamp_nanos()
+            .target(env_logger::Target::Pipe(Box::new(file)))
+            .build();
     replace_logger(logger);
 }
 
 #[cfg(unix)]
-fn redirect_stderr(filename: &Path) {
+pub fn redirect_stderr(filename: &Path) {
     use std::{fs::OpenOptions, os::unix::io::AsRawFd};
     match OpenOptions::new().create(true).append(true).open(filename) {
         Ok(file) => unsafe {
@@ -87,15 +88,27 @@ fn redirect_stderr(filename: &Path) {
     }
 }
 
-// Redirect stderr to a file with support for logrotate by sending a SIGUSR1 to the process.
-//
-// Upon success, future `log` macros and `eprintln!()` can be found in the specified log file.
-pub fn redirect_stderr_to_file(logfile: Option<PathBuf>) -> Option<JoinHandle<()>> {
-    // Default to RUST_BACKTRACE=1 for more informative validator logs
-    if env::var_os("RUST_BACKTRACE").is_none() {
-        env::set_var("RUST_BACKTRACE", "1")
-    }
+pub fn initialize_logging(logfile: Option<PathBuf>) {
+    let Some(logfile) = logfile else {
+        setup_with_default_filter();
+        return;
+    };
 
+    #[cfg(unix)]
+    {
+        setup_with_default_filter();
+        redirect_stderr(&logfile);
+    }
+    #[cfg(not(unix))]
+    {
+        setup_file_with_default_filter(&logfile);
+    }
+}
+
+/// Redirect stderr to a file with support for logrotate by sending a SIGUSR1 to the process.
+///
+/// Upon success, future `log` macros and `eprintln!()` can be found in the specified log file.
+pub fn redirect_stderr_to_file(logfile: Option<PathBuf>) -> Option<JoinHandle<()>> {
     match logfile {
         None => {
             setup_with_default_filter();
@@ -131,7 +144,7 @@ pub fn redirect_stderr_to_file(logfile: Option<PathBuf>) -> Option<JoinHandle<()
             #[cfg(not(unix))]
             {
                 println!("logrotate is not supported on this platform");
-                setup_file_with_default(&logfile, DEFAULT_FILTER);
+                setup_file_with_default_filter(&logfile);
                 None
             }
         }

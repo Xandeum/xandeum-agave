@@ -5,8 +5,8 @@ use {
         transaction_priority_id::TransactionPriorityId,
         transaction_state::TransactionState,
         transaction_state_container::{
-            SharedBytes, StateContainer, TransactionViewState, TransactionViewStateContainer,
-            EXTRA_CAPACITY,
+            EXTRA_CAPACITY, SharedBytes, StateContainer, TransactionViewState,
+            TransactionViewStateContainer,
         },
     },
     crate::banking_stage::{
@@ -22,11 +22,14 @@ use {
     crossbeam_channel::{RecvTimeoutError, TryRecvError},
     solana_accounts_db::account_locks::validate_account_locks,
     solana_address_lookup_table_interface::state::estimate_last_valid_slot,
-    solana_clock::{Epoch, Slot, MAX_PROCESSING_AGE},
+    solana_clock::{Epoch, MAX_PROCESSING_AGE, Slot},
     solana_cost_model::cost_model::CostModel,
     solana_fee_structure::FeeBudgetLimits,
     solana_message::v0::LoadedAddresses,
-    solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_runtime::{
+        bank::Bank,
+        bank_forks::{BankPair, SharableBanks},
+    },
     solana_runtime_transaction::{
         runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
         transaction_with_meta::TransactionWithMeta,
@@ -35,10 +38,7 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransactionError,
-    std::{
-        sync::{Arc, RwLock},
-        time::Instant,
-    },
+    std::time::Instant,
 };
 
 #[derive(Debug)]
@@ -104,7 +104,7 @@ pub(crate) trait ReceiveAndBuffer {
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 pub(crate) struct TransactionViewReceiveAndBuffer {
     pub receiver: BankingPacketReceiver,
-    pub bank_forks: Arc<RwLock<BankForks>>,
+    pub sharable_banks: SharableBanks,
 }
 
 impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
@@ -116,12 +116,10 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
         container: &mut Self::Container,
         decision: &BufferedPacketsDecision,
     ) -> Result<ReceivingStats, DisconnectedError> {
-        let (root_bank, working_bank) = {
-            let bank_forks = self.bank_forks.read().unwrap();
-            let root_bank = bank_forks.root_bank();
-            let working_bank = bank_forks.working_bank();
-            (root_bank, working_bank)
-        };
+        let BankPair {
+            root_bank,
+            working_bank,
+        } = self.sharable_banks.load();
 
         // Receive packet batches.
         const TIMEOUT: Duration = Duration::from_millis(10);
@@ -180,9 +178,10 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
 
         if !timed_out {
             while start.elapsed() < TIMEOUT && stats.num_received < PACKET_BURST_LIMIT {
+                let receive_start = Instant::now();
                 match self.receiver.try_recv() {
                     Ok(packet_batch_message) => {
-                        stats.receive_time_us += start.elapsed().as_micros() as u64;
+                        stats.receive_time_us += receive_start.elapsed().as_micros() as u64;
                         received_message = true;
                         let batch_stats = self.handle_packet_batch_message(
                             container,
@@ -246,6 +245,9 @@ impl TransactionViewReceiveAndBuffer {
         let enable_static_instruction_limit = root_bank
             .feature_set
             .is_active(&agave_feature_set::static_instruction_limit::ID);
+        let enable_instruction_accounts_limit = root_bank
+            .feature_set
+            .is_active(&agave_feature_set::limit_instruction_accounts::ID);
         let transaction_account_lock_limit = working_bank.get_transaction_account_lock_limit();
 
         // Create temporary batches of transactions to be age-checked.
@@ -349,6 +351,7 @@ impl TransactionViewReceiveAndBuffer {
                             working_bank,
                             enable_static_instruction_limit,
                             transaction_account_lock_limit,
+                            enable_instruction_accounts_limit,
                         ) {
                             Ok(state) => Ok(state),
                             Err(
@@ -409,22 +412,15 @@ impl TransactionViewReceiveAndBuffer {
         working_bank: &Bank,
         enable_static_instruction_limit: bool,
         transaction_account_lock_limit: usize,
+        enable_instruction_accounts_limit: bool,
     ) -> Result<TransactionViewState, PacketHandlingError> {
         let (view, deactivation_slot) = translate_to_runtime_view(
             bytes,
-            working_bank,
             root_bank,
             enable_static_instruction_limit,
             transaction_account_lock_limit,
+            enable_instruction_accounts_limit,
         )?;
-        if validate_account_locks(
-            view.account_keys(),
-            root_bank.get_transaction_account_lock_limit(),
-        )
-        .is_err()
-        {
-            return Err(PacketHandlingError::LockValidation);
-        }
 
         let Ok(compute_budget_limits) = view
             .compute_budget_instruction_details()
@@ -446,19 +442,21 @@ impl TransactionViewReceiveAndBuffer {
 /// ALT deactivation, if any. If no minimum slot, Slot::MAX is returned.
 pub(crate) fn translate_to_runtime_view<D: TransactionData>(
     data: D,
-    working_bank: &Bank,
-    root_bank: &Bank,
+    bank: &Bank,
     enable_static_instruction_limit: bool,
     transaction_account_lock_limit: usize,
+    enable_instruction_accounts_limit: bool,
 ) -> Result<(RuntimeTransaction<ResolvedTransactionView<D>>, u64), PacketHandlingError> {
     // Parsing and basic sanitization checks
-    let Ok(view) =
-        SanitizedTransactionView::try_new_sanitized(data, enable_static_instruction_limit)
-    else {
+    let Ok(view) = SanitizedTransactionView::try_new_sanitized(
+        data,
+        enable_static_instruction_limit,
+        enable_instruction_accounts_limit,
+    ) else {
         return Err(PacketHandlingError::Sanitization);
     };
 
-    let Ok(view) = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
+    let Ok(view) = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
         view,
         MessageHash::Compute,
         None,
@@ -467,7 +465,7 @@ pub(crate) fn translate_to_runtime_view<D: TransactionData>(
     };
 
     // Discard non-vote packets if in vote-only mode.
-    if working_bank.vote_only_bank() && !view.is_simple_vote_transaction() {
+    if bank.vote_only_bank() && !view.is_simple_vote_transaction() {
         return Err(PacketHandlingError::Sanitization);
     }
 
@@ -475,15 +473,20 @@ pub(crate) fn translate_to_runtime_view<D: TransactionData>(
         return Err(PacketHandlingError::LockValidation);
     }
 
-    let (loaded_addresses, deactivation_slot) = load_addresses_for_view(&view, root_bank)?;
+    let (loaded_addresses, deactivation_slot) = load_addresses_for_view(&view, bank)?;
 
-    let Ok(view) = RuntimeTransaction::<ResolvedTransactionView<_>>::try_from(
+    let Ok(view) = RuntimeTransaction::<ResolvedTransactionView<_>>::try_new(
         view,
         loaded_addresses,
-        root_bank.get_reserved_account_keys(),
+        bank.get_reserved_account_keys(),
     ) else {
         return Err(PacketHandlingError::Sanitization);
     };
+
+    // Validate no duplicate accounts (must be after resolution to catch ALT duplicates)
+    if validate_account_locks(view.account_keys(), transaction_account_lock_limit).is_err() {
+        return Err(PacketHandlingError::LockValidation);
+    }
 
     Ok((view, deactivation_slot))
 }
@@ -577,21 +580,23 @@ mod tests {
     use {
         super::*,
         crate::banking_stage::tests::create_slow_genesis_config,
-        crossbeam_channel::{unbounded, Receiver},
+        crossbeam_channel::{Receiver, unbounded},
         solana_hash::Hash,
         solana_instruction::{AccountMeta, Instruction},
         solana_keypair::Keypair,
         solana_ledger::genesis_utils::GenesisConfigInfo,
         solana_message::{
-            v0, AccountMeta, AddressLookupTableAccount, Instruction, VersionedMessage,
+            AccountMeta, AddressLookupTableAccount, Instruction, VersionedMessage, v0,
         },
         solana_packet::{Meta, PACKET_DATA_SIZE},
-        solana_perf::packet::{to_packet_batches, Packet, PacketBatch, PinnedPacketBatch},
+        solana_perf::packet::{Packet, PacketBatch, RecycledPacketBatch, to_packet_batches},
         solana_pubkey::Pubkey,
+        solana_runtime::bank_forks::BankForks,
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_system_transaction::transfer,
         solana_transaction::versioned::VersionedTransaction,
+        std::sync::{Arc, RwLock},
     };
 
     fn test_bank_forks() -> (Arc<RwLock<BankForks>>, Keypair) {
@@ -601,7 +606,7 @@ mod tests {
             ..
         } = create_slow_genesis_config(u64::MAX);
 
-        let (_bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (_bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         (bank_forks, mint_keypair)
     }
 
@@ -616,7 +621,7 @@ mod tests {
     ) {
         let receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver,
-            bank_forks,
+            sharable_banks: bank_forks.read().unwrap().sharable_banks(),
         };
         let container = TransactionViewStateContainer::with_capacity(TEST_CONTAINER_CAPACITY);
         (receive_and_buffer, container)
@@ -786,9 +791,9 @@ mod tests {
         let (sender, receiver) = unbounded();
         let (bank_forks, _mint_keypair) = test_bank_forks();
         let (mut receive_and_buffer, mut container) =
-            setup_transaction_view_receive_and_buffer(receiver, bank_forks.clone());
+            setup_transaction_view_receive_and_buffer(receiver, bank_forks);
 
-        let packet_batches = Arc::new(vec![PacketBatch::from(PinnedPacketBatch::new(vec![
+        let packet_batches = Arc::new(vec![PacketBatch::from(RecycledPacketBatch::new(vec![
             Packet::new([1u8; PACKET_DATA_SIZE], Meta::default()),
         ]))]);
         sender.send(packet_batches).unwrap();
@@ -829,7 +834,7 @@ mod tests {
         let (sender, receiver) = unbounded();
         let (bank_forks, mint_keypair) = test_bank_forks();
         let (mut receive_and_buffer, mut container) =
-            setup_transaction_view_receive_and_buffer(receiver, bank_forks.clone());
+            setup_transaction_view_receive_and_buffer(receiver, bank_forks);
 
         let transaction = transfer(&mint_keypair, &Pubkey::new_unique(), 1, Hash::new_unique());
         let packet_batches = Arc::new(to_packet_batches(&[transaction], 1));

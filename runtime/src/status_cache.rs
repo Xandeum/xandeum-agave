@@ -5,13 +5,13 @@ use {
     log::*,
     serde::Serialize,
     solana_accounts_db::ancestors::Ancestors,
-    solana_clock::{Slot, MAX_RECENT_BLOCKHASHES},
+    solana_clock::{MAX_RECENT_BLOCKHASHES, Slot},
     solana_hash::Hash,
-    std::collections::{hash_map::Entry, HashSet},
+    std::collections::{HashSet, hash_map::Entry},
 };
 #[cfg(not(feature = "shuttle-test"))]
 use {
-    rand::{thread_rng, Rng},
+    rand::{Rng, rng},
     std::sync::{Arc, Mutex},
 };
 
@@ -81,6 +81,7 @@ impl<T: Serialize + Clone> StatusCache<T> {
         let slot_deltas = self.slot_deltas.remove(&slot);
         if let Some(slot_deltas) = slot_deltas {
             let slot_deltas = slot_deltas.lock().unwrap();
+            let mut warned = false;
             for (blockhash, (_, key_list)) in slot_deltas.iter() {
                 // Any blockhash that exists in self.slot_deltas must also exist
                 // in self.cache, because in self.purge_roots(), when an entry
@@ -96,11 +97,32 @@ impl<T: Serialize + Clone> StatusCache<T> {
                             if key_list.is_empty() {
                                 o_key_list.remove_entry();
                             }
-                        } else {
-                            panic!(
-                                "Map for key must exist if key exists in self.slot_deltas, slot: \
-                                 {slot}"
-                            )
+                        } else if !warned {
+                            // On invalid blocks, we can have:
+                            //
+                            // slot_deltas[slot_1][blockhash] => [
+                            //     (signature, tx1_result), // dup
+                            //     (signature, tx2_result), // dup
+                            // ];
+                            // cache[blockhash][signature] => [
+                            //     (slot_1, tx1_result), // dup
+                            //     (slot_1, tx2_result), // dup
+                            // ];
+                            //
+                            // this can happen because tx execution and signature verification run
+                            // in parallel, so tx1 and tx2 can finish executing and get inserted
+                            // into the cache before their signatures are verified.
+                            //
+                            // This is an invalid condition that we eventually detect and mark the
+                            // slot as dead. If clear_slot_entries() is called on such a slot,
+                            // iterating on the first element of slot_deltas[slot_1][blockhash] will
+                            // (correctly) remove the whole cache[blockhash][signature] entry, and
+                            // then on the 2nd element we get here.
+                            warn!(
+                                "signature found more than once in the same slot, this means \
+                                 we're clearing a dead slot: {slot}"
+                            );
+                            warned = true;
                         }
                     }
 
@@ -190,7 +212,7 @@ impl<T: Serialize + Clone> StatusCache<T> {
                 #[cfg(feature = "shuttle-test")]
                 let key_index = 0;
                 #[cfg(not(feature = "shuttle-test"))]
-                let key_index = thread_rng().gen_range(0..max_key_index + 1);
+                let key_index = rng().random_range(0..max_key_index + 1);
                 (slot, key_index, HashMap::new())
             });
 
@@ -417,9 +439,11 @@ mod tests {
         for i in 0..(MAX_CACHE_ENTRIES + 1) {
             status_cache.add_root(i as u64);
         }
-        assert!(status_cache
-            .get_status(sig, &blockhash, &ancestors)
-            .is_some());
+        assert!(
+            status_cache
+                .get_status(sig, &blockhash, &ancestors)
+                .is_some()
+        );
     }
 
     #[test]
@@ -456,9 +480,11 @@ mod tests {
         status_cache.add_root(0);
         status_cache.clear();
         status_cache.insert(&blockhash, sig, 0, ());
-        assert!(status_cache
-            .get_status(sig, &blockhash, &ancestors)
-            .is_some());
+        assert!(
+            status_cache
+                .get_status(sig, &blockhash, &ancestors)
+                .is_some()
+        );
     }
 
     #[test]
@@ -531,19 +557,27 @@ mod tests {
         ancestors1.insert(1, 0);
 
         // Clear slot 0 related data
-        assert!(status_cache
-            .get_status(sig, &blockhash, &ancestors0)
-            .is_some());
+        assert!(
+            status_cache
+                .get_status(sig, &blockhash, &ancestors0)
+                .is_some()
+        );
         status_cache.clear_slot_entries(0);
-        assert!(status_cache
-            .get_status(sig, &blockhash, &ancestors0)
-            .is_none());
-        assert!(status_cache
-            .get_status(sig, &blockhash, &ancestors1)
-            .is_some());
-        assert!(status_cache
-            .get_status(sig, &blockhash2, &ancestors1)
-            .is_some());
+        assert!(
+            status_cache
+                .get_status(sig, &blockhash, &ancestors0)
+                .is_none()
+        );
+        assert!(
+            status_cache
+                .get_status(sig, &blockhash, &ancestors1)
+                .is_some()
+        );
+        assert!(
+            status_cache
+                .get_status(sig, &blockhash2, &ancestors1)
+                .is_some()
+        );
 
         // Check that the slot delta for slot 0 is gone, but slot 1 still
         // exists
@@ -553,13 +587,30 @@ mod tests {
         // Clear slot 1 related data
         status_cache.clear_slot_entries(1);
         assert!(status_cache.slot_deltas.is_empty());
-        assert!(status_cache
-            .get_status(sig, &blockhash, &ancestors1)
-            .is_none());
-        assert!(status_cache
-            .get_status(sig, &blockhash2, &ancestors1)
-            .is_none());
+        assert!(
+            status_cache
+                .get_status(sig, &blockhash, &ancestors1)
+                .is_none()
+        );
+        assert!(
+            status_cache
+                .get_status(sig, &blockhash2, &ancestors1)
+                .is_none()
+        );
         assert!(status_cache.cache.is_empty());
+    }
+
+    #[test]
+    fn test_clear_invalid_slot_signatures() {
+        let mut status_cache = BankStatusCache::default();
+        let blockhash = hash(Hash::default().as_ref());
+        let sig = Signature::default();
+        status_cache.insert(&blockhash, sig, 0, ());
+        // Insert the same signature for the same blockhash and slot twice to
+        // model dead slots with duplicate signatures
+        status_cache.insert(&blockhash, sig, 0, ());
+        // ensure that clear_slot_entries() doesn't panic
+        status_cache.clear_slot_entries(0);
     }
 
     // Status cache uses a random key offset for each blockhash. Ensure that shorter
@@ -575,12 +626,16 @@ mod tests {
             let hash_key = Hash::new_unique();
             status_cache.insert(&blockhash, sig_key, 0, ());
             status_cache.insert(&blockhash, hash_key, 0, ());
-            assert!(status_cache
-                .get_status(sig_key, &blockhash, &ancestors)
-                .is_some());
-            assert!(status_cache
-                .get_status(hash_key, &blockhash, &ancestors)
-                .is_some());
+            assert!(
+                status_cache
+                    .get_status(sig_key, &blockhash, &ancestors)
+                    .is_some()
+            );
+            assert!(
+                status_cache
+                    .get_status(hash_key, &blockhash, &ancestors)
+                    .is_some()
+            );
         }
     }
 }
@@ -634,11 +689,13 @@ mod shuttle_tests {
         let mut ancestors2 = Ancestors::default();
         ancestors2.insert(2, 0);
 
-        assert!(status_cache
-            .read()
-            .unwrap()
-            .get_status(key2, &blockhash1, &ancestors2)
-            .is_some());
+        assert!(
+            status_cache
+                .read()
+                .unwrap()
+                .get_status(key2, &blockhash1, &ancestors2)
+                .is_some()
+        );
     }
     #[test]
     fn test_shuttle_clear_slots_blockhash_overlap_random() {
@@ -705,16 +762,20 @@ mod shuttle_tests {
         let mut ancestors2 = Ancestors::default();
         ancestors2.insert(MAX_CACHE_ENTRIES as Slot + 2, 0);
 
-        assert!(status_cache
-            .read()
-            .unwrap()
-            .get_status(key1, &blockhash1, &ancestors2)
-            .is_none());
-        assert!(status_cache
-            .read()
-            .unwrap()
-            .get_status(key2, &blockhash1, &ancestors2)
-            .is_some());
+        assert!(
+            status_cache
+                .read()
+                .unwrap()
+                .get_status(key1, &blockhash1, &ancestors2)
+                .is_none()
+        );
+        assert!(
+            status_cache
+                .read()
+                .unwrap()
+                .get_status(key2, &blockhash1, &ancestors2)
+                .is_some()
+        );
     }
 
     #[test]

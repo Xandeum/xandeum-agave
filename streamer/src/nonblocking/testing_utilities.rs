@@ -1,23 +1,25 @@
 //! Contains utility functions to create server and client for test purposes.
 use {
-    super::quic::{SpawnNonBlockingServerResult, ALPN_TPU_PROTOCOL_ID},
+    super::quic::{ALPN_TPU_PROTOCOL_ID, SpawnNonBlockingServerResult},
     crate::{
-        nonblocking::{quic::spawn_server_with_cancel, swqos::SwQosConfig},
-        quic::{QuicStreamerConfig, StreamerStats},
+        nonblocking::{
+            quic::spawn_server,
+            swqos::{SwQos, SwQosConfig},
+        },
+        quic::{QUIC_MAX_TIMEOUT, QuicServerError, QuicStreamerConfig, StreamerStats},
         streamer::StakedNodes,
     },
-    crossbeam_channel::{unbounded, Receiver},
+    crossbeam_channel::{Receiver, Sender, unbounded},
     quinn::{
-        crypto::rustls::QuicClientConfig, ClientConfig, Connection, EndpointConfig, IdleTimeout,
-        TokioRuntime, TransportConfig,
+        ClientConfig, Connection, EndpointConfig, IdleTimeout, TokioRuntime, TransportConfig,
+        crypto::rustls::QuicClientConfig,
     },
     solana_keypair::Keypair,
     solana_net_utils::sockets::{
-        bind_to_localhost_unique, localhost_port_range_for_tests, multi_bind_in_range_with_config,
-        SocketConfiguration as SocketConfig,
+        SocketConfiguration as SocketConfig, bind_to_localhost_unique,
+        localhost_port_range_for_tests, multi_bind_in_range_with_config,
     },
     solana_perf::packet::PacketBatch,
-    solana_quic_definitions::{QUIC_KEEP_ALIVE, QUIC_MAX_TIMEOUT, QUIC_SEND_FAIRNESS},
     solana_tls_utils::{new_dummy_x509_certificate, tls_client_config_builder},
     std::{
         net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
@@ -27,6 +29,45 @@ use {
     tokio::{task::JoinHandle, time::sleep},
     tokio_util::sync::CancellationToken,
 };
+
+/// Duration for QUIC keep-alive in tests. Typically tests are running for shorter duration that
+/// connection timeout and keep-alive is not strictly necessary. But for longer running tests, it
+/// makes sense to have keep-alive enable and set the value to be around half of the connection timeout.
+const QUIC_KEEP_ALIVE_FOR_TESTS: Duration = Duration::from_secs(5);
+
+/// Spawn a streamer instance in the current tokio runtime.
+pub fn spawn_stake_weighted_qos_server(
+    name: &'static str,
+    sockets: impl IntoIterator<Item = UdpSocket>,
+    keypair: &Keypair,
+    packet_sender: Sender<PacketBatch>,
+    staked_nodes: Arc<RwLock<StakedNodes>>,
+    quic_server_params: QuicStreamerConfig,
+    qos_config: SwQosConfig,
+    cancel: CancellationToken,
+) -> Result<SpawnNonBlockingServerResult, QuicServerError>
+where
+{
+    let stats = Arc::<StreamerStats>::default();
+
+    let swqos = Arc::new(SwQos::new(
+        qos_config,
+        stats.clone(),
+        staked_nodes,
+        cancel.clone(),
+    ));
+
+    spawn_server(
+        name,
+        stats,
+        sockets,
+        keypair,
+        packet_sender,
+        quic_server_params,
+        swqos,
+        cancel,
+    )
+}
 
 pub fn get_client_config(keypair: &Keypair) -> ClientConfig {
     let (cert, key) = new_dummy_x509_certificate(keypair);
@@ -43,8 +84,8 @@ pub fn get_client_config(keypair: &Keypair) -> ClientConfig {
     let mut transport_config = TransportConfig::default();
     let timeout = IdleTimeout::try_from(QUIC_MAX_TIMEOUT).unwrap();
     transport_config.max_idle_timeout(Some(timeout));
-    transport_config.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
-    transport_config.send_fairness(QUIC_SEND_FAIRNESS);
+    transport_config.keep_alive_interval(Some(QUIC_KEEP_ALIVE_FOR_TESTS));
+    transport_config.send_fairness(false);
     config.transport_config(Arc::new(transport_config));
 
     config
@@ -81,15 +122,6 @@ pub fn setup_quic_server(
     qos_config: SwQosConfig,
 ) -> SpawnTestServerResult {
     let sockets = create_quic_server_sockets();
-    setup_quic_server_with_sockets(sockets, option_staked_nodes, quic_server_params, qos_config)
-}
-
-pub fn setup_quic_server_with_sockets(
-    sockets: Vec<UdpSocket>,
-    option_staked_nodes: Option<StakedNodes>,
-    quic_server_params: QuicStreamerConfig,
-    qos_config: SwQosConfig,
-) -> SpawnTestServerResult {
     let (sender, receiver) = unbounded();
     let keypair = Keypair::new();
     let server_address = sockets[0].local_addr().unwrap();
@@ -101,7 +133,7 @@ pub fn setup_quic_server_with_sockets(
         stats,
         thread: handle,
         max_concurrent_connections: _,
-    } = spawn_server_with_cancel(
+    } = spawn_stake_weighted_qos_server(
         "quic_streamer_test",
         sockets,
         &keypair,

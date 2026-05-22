@@ -1,9 +1,9 @@
 use {
     agave_snapshots::{
+        SnapshotArchiveKind, SnapshotKind,
         snapshot_hash::{
             FullSnapshotHash, IncrementalSnapshotHash, SnapshotHash, StartingSnapshotHashes,
         },
-        SnapshotKind,
     },
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
@@ -41,7 +41,7 @@ impl SnapshotGossipManager {
         if let Some(starting_incremental_snapshot_hash) = starting_snapshot_hashes.incremental {
             self.update_latest_incremental_snapshot_hash(
                 starting_incremental_snapshot_hash,
-                starting_snapshot_hashes.full.0 .0,
+                starting_snapshot_hashes.full.0.0,
             );
         }
         self.push_latest_snapshot_hashes_to_cluster();
@@ -54,14 +54,17 @@ impl SnapshotGossipManager {
         snapshot_hash: (Slot, SnapshotHash),
     ) {
         match snapshot_kind {
-            SnapshotKind::FullSnapshot => {
+            SnapshotKind::Archive(SnapshotArchiveKind::Full) => {
                 self.push_full_snapshot_hash(FullSnapshotHash(snapshot_hash));
             }
-            SnapshotKind::IncrementalSnapshot(base_slot) => {
+            SnapshotKind::Archive(SnapshotArchiveKind::Incremental(base_slot)) => {
                 self.push_incremental_snapshot_hash(
                     IncrementalSnapshotHash(snapshot_hash),
                     base_slot,
                 );
+            }
+            SnapshotKind::Fastboot => {
+                // Fastboot snapshots are not gossiped
             }
         }
     }
@@ -103,10 +106,10 @@ impl SnapshotGossipManager {
             .as_mut()
             .expect("there must already be a full snapshot hash");
         assert_eq!(
-            base_slot, latest_snapshot_hashes.full.0 .0,
+            base_slot, latest_snapshot_hashes.full.0.0,
             "the incremental snapshot's base slot ({}) must match the latest full snapshot's slot \
              ({})",
-            base_slot, latest_snapshot_hashes.full.0 .0,
+            base_slot, latest_snapshot_hashes.full.0.0,
         );
         latest_snapshot_hashes.incremental = Some(incremental_snapshot_hash);
     }

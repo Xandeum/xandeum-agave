@@ -4,29 +4,30 @@ mod serde_snapshot_tests {
         crate::{
             bank::BankHashStats,
             serde_snapshot::{
-                deserialize_accounts_db_fields, reconstruct_accountsdb_from_fields,
-                remap_append_vec_file, SerializableAccountsDb, SnapshotAccountsDbFields,
+                SerializableAccountsDb, SnapshotAccountsDbFields, deserialize_accounts_db_fields,
+                reconstruct_accountsdb_from_fields, remap_append_vec_file,
             },
-            snapshot_utils::{get_storages_to_serialize, StorageAndNextAccountsFileId},
+            snapshot_utils::StorageAndNextAccountsFileId,
         },
-        bincode::{serialize_into, Error},
+        agave_fs::FileInfo,
+        bincode::{Error, serialize_into},
         log::info,
-        rand::{thread_rng, Rng},
+        rand::{Rng, rng},
         solana_account::{AccountSharedData, ReadableAccount},
         solana_accounts_db::{
+            ObsoleteAccounts,
             account_storage::AccountStorageMap,
+            account_storage_entry::AccountStorageEntry,
             account_storage_reader::AccountStorageReader,
             accounts::Accounts,
             accounts_db::{
-                get_temp_accounts_paths, AccountStorageEntry, AccountsDb, AccountsDbConfig,
-                AtomicAccountsFileId, MarkObsoleteAccounts, ACCOUNTS_DB_CONFIG_FOR_TESTING,
+                ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDb, AccountsDbConfig, AtomicAccountsFileId,
+                MarkObsoleteAccounts, get_temp_accounts_paths,
             },
             accounts_file::{AccountsFile, AccountsFileError, StorageAccess},
             ancestors::Ancestors,
-            ObsoleteAccounts,
         },
         solana_clock::Slot,
-        solana_epoch_schedule::EpochSchedule,
         solana_pubkey::Pubkey,
         std::{
             fs::File,
@@ -34,8 +35,8 @@ mod serde_snapshot_tests {
             ops::RangeFull,
             path::{Path, PathBuf},
             sync::{
-                atomic::{AtomicUsize, Ordering},
                 Arc,
+                atomic::{AtomicUsize, Ordering},
             },
         },
         tempfile::TempDir,
@@ -95,24 +96,21 @@ mod serde_snapshot_tests {
         )
     }
 
-    fn accountsdb_to_stream<W>(
+    fn account_storages_to_stream<W>(
         stream: &mut W,
-        accounts_db: &AccountsDb,
         slot: Slot,
-        account_storage_entries: &[Vec<Arc<AccountStorageEntry>>],
+        account_storage_entries: &[Arc<AccountStorageEntry>],
     ) -> Result<(), Error>
     where
         W: Write,
     {
         let bank_hash_stats = BankHashStats::default();
-        let write_version = accounts_db.write_version.load(Ordering::Acquire);
         serialize_into(
             stream,
             &SerializableAccountsDb {
                 slot,
                 account_storage_entries,
                 bank_hash_stats,
-                write_version,
             },
         )
     }
@@ -161,13 +159,7 @@ mod serde_snapshot_tests {
     ) -> AccountsDb {
         let mut writer = Cursor::new(vec![]);
         let snapshot_storages = accounts.get_storages(..=slot).0;
-        accountsdb_to_stream(
-            &mut writer,
-            accounts,
-            slot,
-            &get_storages_to_serialize(&snapshot_storages),
-        )
-        .unwrap();
+        account_storages_to_stream(&mut writer, slot, &snapshot_storages).unwrap();
 
         let buf = writer.into_inner();
         let mut reader = BufReader::new(&buf[..]);
@@ -197,7 +189,7 @@ mod serde_snapshot_tests {
 
     fn check_accounts_local(accounts: &Accounts, pubkeys: &[Pubkey], num: usize) {
         for _ in 1..num {
-            let idx = thread_rng().gen_range(0..num - 1);
+            let idx = rng().random_range(0..num - 1);
             let ancestors = vec![(0, 0)].into_iter().collect();
             let account = accounts.load_without_fixed_root(&ancestors, &pubkeys[idx]);
             let account1 = Some((
@@ -208,7 +200,7 @@ mod serde_snapshot_tests {
         }
     }
 
-    #[test_case(StorageAccess::Mmap)]
+    #[test_case(#[allow(deprecated)] StorageAccess::Mmap)]
     fn test_accounts_serialize(storage_access: StorageAccess) {
         agave_logger::setup();
         let (_accounts_dir, paths) = get_temp_accounts_paths(4).unwrap();
@@ -221,7 +213,7 @@ mod serde_snapshot_tests {
             .collect();
         for (i, pubkey) in pubkeys.iter().enumerate() {
             let account = AccountSharedData::new(i as u64 + 1, 0, &Pubkey::default());
-            accounts.store_accounts_seq((slot, [(pubkey, &account)].as_slice()), None);
+            accounts.store_accounts_seq((slot, [(pubkey, &account)].as_slice()), None, None);
         }
         check_accounts_local(&accounts, &pubkeys, 100);
         accounts.accounts_db.add_root_and_flush_write_cache(slot);
@@ -230,11 +222,10 @@ mod serde_snapshot_tests {
             .calculate_accounts_lt_hash_at_startup_from_index(&Ancestors::default(), slot);
 
         let mut writer = Cursor::new(vec![]);
-        accountsdb_to_stream(
+        account_storages_to_stream(
             &mut writer,
-            &accounts.accounts_db,
             slot,
-            &get_storages_to_serialize(&accounts.accounts_db.get_storages(..=slot).0),
+            &accounts.accounts_db.get_storages(..=slot).0,
         )
         .unwrap();
 
@@ -267,7 +258,7 @@ mod serde_snapshot_tests {
         assert_eq!(accounts_hash, daccounts_hash);
     }
 
-    #[test_case(StorageAccess::Mmap)]
+    #[test_case(#[allow(deprecated)] StorageAccess::Mmap)]
     #[test_case(StorageAccess::File)]
     fn test_remove_unrooted_slot_snapshot(storage_access: StorageAccess) {
         agave_logger::setup();
@@ -300,13 +291,14 @@ mod serde_snapshot_tests {
 
         // Check purged account stays gone
         let unrooted_slot_ancestors = vec![(unrooted_slot, 1)].into_iter().collect();
-        assert!(db
-            .load_without_fixed_root(&unrooted_slot_ancestors, &key)
-            .is_none());
+        assert!(
+            db.load_without_fixed_root(&unrooted_slot_ancestors, &key)
+                .is_none()
+        );
     }
 
     #[test_matrix(
-        [StorageAccess::File, StorageAccess::Mmap],
+        [StorageAccess::File, #[allow(deprecated)] StorageAccess::Mmap],
         [MarkObsoleteAccounts::Enabled, MarkObsoleteAccounts::Disabled],
         [MarkObsoleteAccounts::Enabled, MarkObsoleteAccounts::Disabled]
     )]
@@ -442,7 +434,7 @@ mod serde_snapshot_tests {
         }
     }
 
-    #[test_case(StorageAccess::Mmap)]
+    #[test_case(#[allow(deprecated)] StorageAccess::Mmap)]
     #[test_case(StorageAccess::File)]
     fn test_accounts_db_serialize_zero_and_free(storage_access: StorageAccess) {
         agave_logger::setup();
@@ -556,7 +548,7 @@ mod serde_snapshot_tests {
         assert_eq!(calculated_capitalization, expected_capitalization);
     }
 
-    #[test_case(StorageAccess::Mmap)]
+    #[test_case(#[allow(deprecated)] StorageAccess::Mmap)]
     #[test_case(StorageAccess::File)]
     fn test_accounts_purge_chained_purge_before_snapshot_restore(storage_access: StorageAccess) {
         agave_logger::setup();
@@ -575,7 +567,7 @@ mod serde_snapshot_tests {
         });
     }
 
-    #[test_case(StorageAccess::Mmap)]
+    #[test_case(#[allow(deprecated)] StorageAccess::Mmap)]
     #[test_case(StorageAccess::File)]
     fn test_accounts_purge_chained_purge_after_snapshot_restore(storage_access: StorageAccess) {
         agave_logger::setup();
@@ -598,7 +590,7 @@ mod serde_snapshot_tests {
         });
     }
 
-    #[test_case(StorageAccess::Mmap)]
+    #[test_case(#[allow(deprecated)] StorageAccess::Mmap)]
     #[test_case(StorageAccess::File)]
     fn test_accounts_purge_long_chained_after_snapshot_restore(storage_access: StorageAccess) {
         agave_logger::setup();
@@ -672,7 +664,7 @@ mod serde_snapshot_tests {
         accounts.assert_load_account(current_slot, purged_pubkey2, 0);
     }
 
-    #[test_case(StorageAccess::Mmap)]
+    #[test_case(#[allow(deprecated)] StorageAccess::Mmap)]
     #[test_case(StorageAccess::File)]
     fn test_accounts_clean_after_snapshot_restore_then_old_revives(storage_access: StorageAccess) {
         agave_logger::setup();
@@ -804,7 +796,7 @@ mod serde_snapshot_tests {
         accounts.assert_load_account(current_slot, dummy_pubkey, dummy_lamport);
     }
 
-    #[test_case(StorageAccess::Mmap)]
+    #[test_case(#[allow(deprecated)] StorageAccess::Mmap)]
     #[test_case(StorageAccess::File)]
     fn test_shrink_stale_slots_processed(storage_access: StorageAccess) {
         agave_logger::setup();
@@ -847,14 +839,13 @@ mod serde_snapshot_tests {
                 pubkey_count,
                 accounts.all_account_count_in_accounts_file(shrink_slot)
             );
-            accounts.shrink_all_slots(*startup, &EpochSchedule::default(), None);
+            accounts.shrink_all_slots(*startup, None);
             assert_eq!(
                 pubkey_count_after_shrink,
                 accounts.all_account_count_in_accounts_file(shrink_slot)
             );
 
             let no_ancestors = Ancestors::default();
-            let epoch_schedule = EpochSchedule::default();
 
             let calculated_capitalization = accounts
                 .calculate_capitalization_at_startup_from_index(&no_ancestors, current_slot);
@@ -874,7 +865,7 @@ mod serde_snapshot_tests {
             assert_eq!(accounts_lt_hash_pre, accounts_lt_hash_post);
 
             // repeating should be no-op
-            accounts.shrink_all_slots(*startup, &epoch_schedule, None);
+            accounts.shrink_all_slots(*startup, None);
             assert_eq!(
                 pubkey_count_after_shrink,
                 accounts.all_account_count_in_accounts_file(shrink_slot)
@@ -899,18 +890,27 @@ mod serde_snapshot_tests {
     ) {
         let tmp = tempfile::tempdir().unwrap();
         let old_path = tmp.path().join(format!("123.{old_id}"));
+        let old_file_info = FileInfo {
+            file: File::create(&old_path).unwrap(),
+            path: old_path,
+            size: 0,
+        };
         let expected_remapped_path = tmp.path().join(format!("123.{expected_remapped_id}"));
-        File::create(&old_path).unwrap();
 
         become_ungovernable(tmp.path());
 
         let next_append_vec_id = AtomicAccountsFileId::new(next_id as u32);
         let num_collisions = AtomicUsize::new(0);
-        let (remapped_id, remapped_path) =
-            remap_append_vec_file(123, old_id, &old_path, &next_append_vec_id, &num_collisions)
-                .unwrap();
+        let (remapped_id, remapped_file_info) = remap_append_vec_file(
+            123,
+            old_id,
+            old_file_info,
+            &next_append_vec_id,
+            &num_collisions,
+        )
+        .unwrap();
         assert_eq!(remapped_id as usize, expected_remapped_id);
-        assert_eq!(&remapped_path, &expected_remapped_path);
+        assert_eq!(&remapped_file_info.path, &expected_remapped_path);
         assert_eq!(num_collisions.load(Ordering::Relaxed), expected_collisions);
     }
 
@@ -919,6 +919,12 @@ mod serde_snapshot_tests {
     fn test_remap_append_vec_file_error() {
         let tmp = tempfile::tempdir().unwrap();
         let original_path = tmp.path().join("123.456");
+        // there won't be any file at `original_path`, so rename should generate error
+        let original_file_info = FileInfo {
+            file: File::create(tmp.path().join("wrong_name")).unwrap(),
+            path: original_path,
+            size: 0,
+        };
 
         // In remap_append_vec_file() we want to handle EEXIST (collisions), but we want to return all
         // other errors
@@ -927,7 +933,7 @@ mod serde_snapshot_tests {
         remap_append_vec_file(
             123,
             456,
-            &original_path,
+            original_file_info,
             &next_append_vec_id,
             &num_collisions,
         )

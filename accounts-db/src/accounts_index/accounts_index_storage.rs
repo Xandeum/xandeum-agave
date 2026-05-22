@@ -1,15 +1,15 @@
 use {
     super::{
-        bucket_map_holder::BucketMapHolder, in_mem_accounts_index::InMemAccountsIndex,
         AccountsIndexConfig, DiskIndexValue, IndexValue, Startup,
+        bucket_map_holder::BucketMapHolder, in_mem_accounts_index::InMemAccountsIndex,
     },
     crate::{accounts_index, waitable_condvar::WaitableCondvar},
     std::{
         fmt::Debug,
         num::NonZeroUsize,
         sync::{
+            Arc,
             atomic::{AtomicBool, Ordering},
-            Arc, Mutex,
         },
         thread::{Builder, JoinHandle},
     },
@@ -21,10 +21,6 @@ pub struct AccountsIndexStorage<T: IndexValue, U: DiskIndexValue + From<T> + Int
 
     pub storage: Arc<BucketMapHolder<T, U>>,
     pub in_mem: Box<[Arc<InMemAccountsIndex<T, U>>]>,
-    exit: Arc<AtomicBool>,
-
-    /// set_startup(true) creates bg threads which are kept alive until set_startup(false)
-    startup_worker_threads: Mutex<Option<BgThreads>>,
 }
 
 impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> Debug for AccountsIndexStorage<T, U> {
@@ -57,7 +53,6 @@ impl BgThreads {
         storage: &Arc<BucketMapHolder<T, U>>,
         in_mem: &[Arc<InMemAccountsIndex<T, U>>],
         threads: NonZeroUsize,
-        can_advance_age: bool,
         exit: Arc<AtomicBool>,
     ) -> Self {
         let is_disk_index_enabled = storage.is_disk_index_enabled();
@@ -74,7 +69,7 @@ impl BgThreads {
             (0..num_threads)
                 .map(|idx| {
                     // the first thread we start is special
-                    let can_advance_age = can_advance_age && idx == 0;
+                    let can_advance_age = idx == 0;
                     let storage_ = Arc::clone(storage);
                     let local_exit = local_exit.clone();
                     let system_exit = exit.clone();
@@ -106,41 +101,10 @@ impl BgThreads {
 impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndexStorage<T, U> {
     /// startup=true causes:
     ///      in mem to act in a way that flushes to disk asap
-    ///      also creates some additional bg threads to facilitate flushing to disk asap
     /// startup=false is 'normal' operation
     pub(crate) fn set_startup(&self, startup: Startup) {
-        if startup == Startup::StartupWithExtraThreads && self.storage.is_disk_index_enabled() {
-            // create some additional bg threads to help get things to the disk index asap
-            *self.startup_worker_threads.lock().unwrap() = Some(BgThreads::new(
-                &self.storage,
-                &self.in_mem,
-                accounts_index::default_num_flush_threads(),
-                false, // cannot advance age from any of these threads
-                self.exit.clone(),
-            ));
-        }
         let is_startup = startup != Startup::Normal;
         self.storage.set_startup(is_startup);
-        if !is_startup {
-            // transitioning from startup to !startup (ie. steady state)
-            // shutdown the bg threads
-            *self.startup_worker_threads.lock().unwrap() = None;
-            // maybe shrink hashmaps
-            self.shrink_to_fit();
-        }
-    }
-
-    /// estimate how many items are still needing to be flushed to the disk cache.
-    pub fn get_startup_remaining_items_to_flush_estimate(&self) -> usize {
-        self.storage
-            .disk
-            .as_ref()
-            .map(|_| self.storage.stats.get_remaining_items_to_flush_estimate())
-            .unwrap_or_default()
-    }
-
-    fn shrink_to_fit(&self) {
-        self.in_mem.iter().for_each(|mem| mem.shrink_to_fit())
     }
 
     /// allocate BucketMapHolder and InMemAccountsIndex[]
@@ -157,11 +121,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndexStorage<
             .collect();
 
         Self {
-            _bg_threads: BgThreads::new(&storage, &in_mem, num_flush_threads, true, exit.clone()),
+            _bg_threads: BgThreads::new(&storage, &in_mem, num_flush_threads, exit),
             storage,
             in_mem,
-            startup_worker_threads: Mutex::default(),
-            exit,
         }
     }
 }

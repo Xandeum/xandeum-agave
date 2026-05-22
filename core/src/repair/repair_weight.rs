@@ -83,17 +83,15 @@ impl RepairWeight {
         }
     }
 
-    pub fn add_votes<I>(
+    pub fn add_voters(
         &mut self,
         blockstore: &Blockstore,
-        votes: I,
+        voters: impl Iterator<Item = (Slot, Vec<Pubkey>)>,
         epoch_stakes: &HashMap<Epoch, VersionedEpochStakes>,
         epoch_schedule: &EpochSchedule,
-    ) where
-        I: Iterator<Item = (Slot, Vec<Pubkey>)>,
-    {
+    ) {
         let mut all_subtree_updates: HashMap<TreeRoot, HashMap<Pubkey, Slot>> = HashMap::new();
-        for (slot, pubkey_votes) in votes {
+        for (slot, pubkey_voters) in voters {
             if slot < self.root {
                 continue;
             }
@@ -179,7 +177,7 @@ impl RepairWeight {
             // Now we know which subtree this slot chains to,
             // add the votes to the list of updates
             let subtree_updates = all_subtree_updates.entry(tree_root).or_default();
-            for pubkey in pubkey_votes {
+            for pubkey in pubkey_voters {
                 let cur_max = subtree_updates.entry(pubkey).or_default();
                 *cur_max = std::cmp::max(*cur_max, slot);
             }
@@ -730,10 +728,11 @@ impl RepairWeight {
                             &orphan_tree,
                             TreeRoot::PrunedRoot(*next_earliest_ancestor),
                         );
-                        assert!(self
-                            .pruned_trees
-                            .insert(*next_earliest_ancestor, orphan_tree)
-                            .is_none());
+                        assert!(
+                            self.pruned_trees
+                                .insert(*next_earliest_ancestor, orphan_tree)
+                                .is_none()
+                        );
                         return None;
                     }
                 }
@@ -991,7 +990,7 @@ mod test {
         solana_accounts_db::contains::Contains,
         solana_hash::Hash,
         solana_ledger::{
-            blockstore::{make_chaining_slot_entries, Blockstore},
+            blockstore::{Blockstore, make_chaining_slot_entries},
             get_tmp_ledger_path,
         },
         solana_runtime::{bank::Bank, bank_utils},
@@ -1014,16 +1013,18 @@ mod test {
         // Try to add a vote for slot < root and a slot that is unrooted
         for old_slot in &[2, 4] {
             if *old_slot > root {
-                assert!(repair_weight
-                    .slot_to_tree
-                    .get(old_slot)
-                    .unwrap()
-                    .is_pruned());
+                assert!(
+                    repair_weight
+                        .slot_to_tree
+                        .get(old_slot)
+                        .unwrap()
+                        .is_pruned()
+                );
             } else {
                 assert!(!repair_weight.slot_to_tree.contains(old_slot));
             }
             let votes = vec![(*old_slot, vec![Pubkey::default()])];
-            repair_weight.add_votes(
+            repair_weight.add_voters(
                 &blockstore,
                 votes.into_iter(),
                 bank.epoch_stakes_map(),
@@ -1031,11 +1032,13 @@ mod test {
             );
             if *old_slot > root {
                 assert!(repair_weight.pruned_trees.contains_key(old_slot));
-                assert!(repair_weight
-                    .slot_to_tree
-                    .get(old_slot)
-                    .unwrap()
-                    .is_pruned());
+                assert!(
+                    repair_weight
+                        .slot_to_tree
+                        .get(old_slot)
+                        .unwrap()
+                        .is_pruned()
+                );
             } else {
                 assert!(!repair_weight.trees.contains_key(old_slot));
                 assert!(!repair_weight.slot_to_tree.contains_key(old_slot));
@@ -1051,7 +1054,7 @@ mod test {
         let votes = vec![(1, vote_pubkeys.clone())];
 
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1079,7 +1082,7 @@ mod test {
         // should discover the rest of the tree and the weights,
         // and should only count the latest votes
         let votes = vec![(4, vote_pubkeys.clone()), (6, vote_pubkeys)];
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1154,7 +1157,7 @@ mod test {
         let votes = vec![(1, vote_pubkeys.clone()), (8, vote_pubkeys.clone())];
 
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1172,16 +1175,18 @@ mod test {
                 .ancestors((1, Hash::default())),
             vec![(0, Hash::default())]
         );
-        assert!(repair_weight
-            .trees
-            .get(&8)
-            .unwrap()
-            .ancestors((8, Hash::default()))
-            .is_empty());
+        assert!(
+            repair_weight
+                .trees
+                .get(&8)
+                .unwrap()
+                .ancestors((8, Hash::default()))
+                .is_empty()
+        );
 
         let votes = vec![(1, vote_pubkeys.clone()), (10, vote_pubkeys.clone())];
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1218,7 +1223,7 @@ mod test {
 
         // Should not resolve orphans because `update_orphan_ancestors` has
         // not been called, but should add to the orphan branch
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1278,7 +1283,7 @@ mod test {
         let votes = vec![(6, vote_pubkeys.clone()), (11, vote_pubkeys.clone())];
 
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1306,7 +1311,7 @@ mod test {
         // Add a vote to a slot chaining to pruned
         blockstore.add_tree(tr(6) / tr(20), true, true, 2, Hash::default());
         let votes = vec![(23, vote_pubkeys.iter().take(1).copied().collect_vec())];
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1353,7 +1358,7 @@ mod test {
 
         // Add the rest of the stake
         let votes = vec![(23, vote_pubkeys.iter().skip(1).copied().collect_vec())];
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1391,7 +1396,7 @@ mod test {
             Hash::default(),
         );
         let votes = vec![(13, vote_pubkeys)];
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1434,7 +1439,7 @@ mod test {
         ];
 
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1486,7 +1491,7 @@ mod test {
         let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys_for_tests(2, stake);
         let votes = vec![(8, vec![vote_pubkeys[0]]), (20, vec![vote_pubkeys[1]])];
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1531,7 +1536,7 @@ mod test {
         outstanding_repairs = HashMap::new();
         processed_slots = vec![repair_weight.root].into_iter().collect();
         let votes = vec![(10, vec![vote_pubkeys[0]])];
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1586,7 +1591,7 @@ mod test {
         outstanding_repairs = HashMap::new();
         processed_slots = vec![repair_weight.root].into_iter().collect();
         let votes = vec![(20, vec![vote_pubkeys[0]])];
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1632,7 +1637,7 @@ mod test {
         let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys_for_tests(2, stake);
         let votes = vec![(8, vec![vote_pubkeys[0]])];
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1803,11 +1808,13 @@ mod test {
             assert!(!repair_weight.trees.contains_key(&purged_slot));
         }
         for pruned_slot in &[4, 8, 10] {
-            assert!(repair_weight
-                .slot_to_tree
-                .get(pruned_slot)
-                .unwrap()
-                .is_pruned());
+            assert!(
+                repair_weight
+                    .slot_to_tree
+                    .get(pruned_slot)
+                    .unwrap()
+                    .is_pruned()
+            );
         }
         assert_eq!(
             repair_weight.pruned_trees.keys().copied().collect_vec(),
@@ -1822,8 +1829,8 @@ mod test {
             TreeRoot::Root(20)
         );
 
-        // Now set root at a slot 30 that doesnt exist in `repair_weight`, but is
-        // higher than the remaining orphan
+        // Now set root at a slot 30 that doesn't exist in `repair_weight`, but
+        // is higher than the remaining orphan
         assert!(!repair_weight.slot_to_tree.contains_key(&30));
         repair_weight.set_root(30);
         check_old_root_purged_verify_new_root(3, 30, &repair_weight);
@@ -1851,7 +1858,7 @@ mod test {
         ];
 
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -1954,7 +1961,7 @@ mod test {
         ];
 
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -2052,11 +2059,13 @@ mod test {
             // Check
             assert_eq!(repair_weight.pruned_trees.len(), 1);
             if *old_parent > root {
-                assert!(repair_weight
-                    .slot_to_tree
-                    .get(old_parent)
-                    .unwrap()
-                    .is_pruned());
+                assert!(
+                    repair_weight
+                        .slot_to_tree
+                        .get(old_parent)
+                        .unwrap()
+                        .is_pruned()
+                );
                 assert_eq!(
                     repair_weight
                         .pruned_trees
@@ -2166,18 +2175,20 @@ mod test {
                 2,
                 Hash::default(),
             );
-            repair_weight.add_votes(
+            repair_weight.add_voters(
                 &blockstore,
                 vec![(new_vote_slot, vec![Pubkey::default()])].into_iter(),
                 bank.epoch_stakes_map(),
                 bank.epoch_schedule(),
             );
 
-            assert!(repair_weight
-                .slot_to_tree
-                .get(&new_vote_slot)
-                .unwrap()
-                .is_pruned());
+            assert!(
+                repair_weight
+                    .slot_to_tree
+                    .get(&new_vote_slot)
+                    .unwrap()
+                    .is_pruned()
+            );
             if *old_parent > root {
                 // Adds to new tree
                 assert_eq!(repair_weight.pruned_trees.len(), 1);
@@ -2313,7 +2324,7 @@ mod test {
         let (blockstore, _, mut repair_weight) = setup_orphan_repair_weight();
         let stake = 100;
         let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys_for_tests(1, stake);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             vec![(6, vote_pubkeys)].into_iter(),
             bank.epoch_stakes_map(),
@@ -2387,7 +2398,7 @@ mod test {
         let stake = 100;
         let (bank, vote_pubkeys) = bank_utils::setup_bank_and_vote_pubkeys_for_tests(1, stake);
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             vec![(6, vote_pubkeys)].into_iter(),
             bank.epoch_stakes_map(),
@@ -2469,7 +2480,7 @@ mod test {
             (23, vec![vote_pubkeys[3]]),
         ];
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -2480,35 +2491,40 @@ mod test {
         repair_weight.set_root(4);
         assert_eq!(repair_weight.trees.len(), 1);
         assert_eq!(repair_weight.pruned_trees.len(), 3);
-        assert!(repair_weight
-            .pruned_trees
-            .iter()
-            .all(
-                |(root, pruned_tree)| pruned_tree.stake_voted_subtree(&(*root, Hash::default()))
-                    == Some(stake)
-            ));
+        assert!(
+            repair_weight
+                .pruned_trees
+                .iter()
+                .all(|(root, pruned_tree)| pruned_tree
+                    .stake_voted_subtree(&(*root, Hash::default()))
+                    == Some(stake))
+        );
 
         // No fork has DUPLICATE_THRESHOLD, should not be any popular forks
-        assert!(repair_weight
-            .get_popular_pruned_forks(epoch_stakes, epoch_schedule)
-            .is_empty());
+        assert!(
+            repair_weight
+                .get_popular_pruned_forks(epoch_stakes, epoch_schedule)
+                .is_empty()
+        );
 
         // 500 stake, still less than DUPLICATE_THRESHOLD, should not be any popular forks
         let five_votes = vote_pubkeys.iter().copied().take(5).collect_vec();
         let votes = vec![(11, five_votes.clone()), (6, five_votes)];
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
             bank.epoch_schedule(),
         );
-        assert!(repair_weight
-            .get_popular_pruned_forks(epoch_stakes, epoch_schedule)
-            .is_empty());
+        assert!(
+            repair_weight
+                .get_popular_pruned_forks(epoch_stakes, epoch_schedule)
+                .is_empty()
+        );
 
         // 600 stake, since we voted for leaf, leaf should be returned
         let votes = vec![(11, vec![vote_pubkeys[5]]), (6, vec![vote_pubkeys[6]])];
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -2527,7 +2543,7 @@ mod test {
         // should return 20 and not traverse the tree deeper
         let six_votes = vote_pubkeys.iter().copied().take(6).collect_vec();
         let votes = vec![(20, six_votes)];
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -2559,7 +2575,7 @@ mod test {
             (23, vec![vote_pubkeys[3]]),
         ];
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -2575,7 +2591,7 @@ mod test {
 
         // Traverse to 20
         let mut repair_weight_20 = repair_weight.clone();
-        repair_weight_20.add_votes(
+        repair_weight_20.add_voters(
             &blockstore,
             vec![(20, vote_pubkeys.clone())].into_iter(),
             bank.epoch_stakes_map(),
@@ -2588,7 +2604,7 @@ mod test {
 
         // 4 and 8 individually do not have enough stake, but 2 is popular
         let votes = vec![(10, vote_pubkeys.iter().copied().skip(6).collect_vec())];
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -2646,7 +2662,7 @@ mod test {
             (23, vec![vote_pubkeys[3]]),
         ];
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -2657,18 +2673,21 @@ mod test {
         repair_weight.set_root(4);
         assert_eq!(repair_weight.trees.len(), 1);
         assert_eq!(repair_weight.pruned_trees.len(), 3);
-        assert!(repair_weight
-            .pruned_trees
-            .iter()
-            .all(
-                |(root, pruned_tree)| pruned_tree.stake_voted_subtree(&(*root, Hash::default()))
-                    == Some(stake)
-            ));
+        assert!(
+            repair_weight
+                .pruned_trees
+                .iter()
+                .all(|(root, pruned_tree)| pruned_tree
+                    .stake_voted_subtree(&(*root, Hash::default()))
+                    == Some(stake))
+        );
 
         // No fork hash `DUPLICATE_THRESHOLD`, should not be any popular forks
-        assert!(repair_weight
-            .get_popular_pruned_forks(&epoch_stakes, &epoch_schedule)
-            .is_empty());
+        assert!(
+            repair_weight
+                .get_popular_pruned_forks(&epoch_stakes, &epoch_schedule)
+                .is_empty()
+        );
 
         // 400 stake, For the 6 tree it will be less than `DUPLICATE_THRESHOLD`, however 11
         // has epoch modifications where at some point 400 stake is enough. For 22, although it
@@ -2680,7 +2699,7 @@ mod test {
             (6, four_votes.clone()),
             (22, four_votes),
         ];
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),
@@ -2706,7 +2725,7 @@ mod test {
         ];
 
         let mut repair_weight = RepairWeight::new(0);
-        repair_weight.add_votes(
+        repair_weight.add_voters(
             &blockstore,
             votes.into_iter(),
             bank.epoch_stakes_map(),

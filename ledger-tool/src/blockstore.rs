@@ -5,25 +5,25 @@ use {
         error::{LedgerToolError, Result},
         ledger_path::canonicalize_ledger_path,
         ledger_utils::get_program_ids,
-        output::{output_ledger, output_slot, CliDuplicateSlotProof, SlotBounds, SlotInfo},
+        output::{CliDuplicateSlotProof, SlotBounds, SlotInfo, output_ledger, output_slot},
     },
     chrono::{DateTime, Utc},
     clap::{
-        value_t, value_t_or_exit, values_t_or_exit, App, AppSettings, Arg, ArgMatches, SubCommand,
+        App, AppSettings, Arg, ArgMatches, SubCommand, value_t, value_t_or_exit, values_t_or_exit,
     },
     itertools::Itertools,
     log::*,
     regex::Regex,
     serde_json::json,
-    solana_clap_utils::{hidden_unless_forced, input_validators::is_slot},
+    solana_clap_utils::input_validators::is_slot,
     solana_cli_output::OutputFormat,
     solana_clock::{Slot, UnixTimestamp},
     solana_hash::Hash,
     solana_ledger::{
         ancestor_iterator::AncestorIterator,
         blockstore::{
+            Blockstore, BlockstoreError, PurgeType,
             column::{Column, ColumnName},
-            Blockstore, PurgeType,
         },
         blockstore_options::AccessType,
         shred::Shred,
@@ -32,7 +32,7 @@ use {
         borrow::Cow,
         collections::{BTreeMap, BTreeSet, HashMap},
         fs::File,
-        io::{stdout, BufRead, BufReader, Write},
+        io::{BufRead, BufReader, Write, stdout},
         path::{Path, PathBuf},
         sync::atomic::AtomicBool,
         time::{Duration, UNIX_EPOCH},
@@ -125,7 +125,6 @@ fn analyze_storage(blockstore: &Blockstore) -> Result<()> {
     analyze_column(blockstore, TransactionStatus::NAME)?;
     analyze_column(blockstore, AddressSignatures::NAME)?;
     analyze_column(blockstore, TransactionMemos::NAME)?;
-    analyze_column(blockstore, TransactionStatusIndex::NAME)?;
     analyze_column(blockstore, Rewards::NAME)?;
     analyze_column(blockstore, Blocktime::NAME)?;
     analyze_column(blockstore, PerfSamples::NAME)?;
@@ -153,7 +152,6 @@ fn raw_key_to_slot(key: &[u8], column_name: &str) -> Option<Slot> {
             cf::AddressSignatures::index(key),
         )),
         cf::TransactionMemos::NAME => None, // does not implement slot()
-        cf::TransactionStatusIndex::NAME => None, // does not implement slot()
         cf::Rewards::NAME => Some(cf::Rewards::slot(cf::Rewards::index(key))),
         cf::Blocktime::NAME => Some(cf::Blocktime::slot(cf::Blocktime::index(key))),
         cf::PerfSamples::NAME => Some(cf::PerfSamples::slot(cf::PerfSamples::index(key))),
@@ -478,29 +476,6 @@ pub fn blockstore_subcommands<'a, 'b>(hidden: bool) -> Vec<App<'a, 'b>> {
                     .help("Removes at most BATCH_SIZE slots while purging in loop"),
             )
             .arg(
-                Arg::with_name("no_compaction")
-                    .long("no-compaction")
-                    .required(false)
-                    .takes_value(false)
-                    .help(
-                        "--no-compaction is deprecated, ledger compaction after purge is disabled \
-                         by default",
-                    )
-                    .conflicts_with("enable_compaction")
-                    .hidden(hidden_unless_forced()),
-            )
-            .arg(
-                Arg::with_name("enable_compaction")
-                    .long("enable-compaction")
-                    .required(false)
-                    .takes_value(false)
-                    .help(
-                        "Perform ledger compaction after purge. Compaction will optimize storage \
-                         space, but may take a long time to complete.",
-                    )
-                    .conflicts_with("no_compaction"),
-            )
-            .arg(
                 Arg::with_name("dead_slots_only")
                     .long("dead-slots-only")
                     .required(false)
@@ -599,14 +574,14 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
         ("analyze-storage", Some(arg_matches)) => analyze_storage(&crate::open_blockstore(
             &ledger_path,
             arg_matches,
-            AccessType::Secondary,
+            AccessType::ReadOnly,
         ))?,
         ("bounds", Some(arg_matches)) => {
             let output_format = OutputFormat::from_matches(arg_matches, "output_format", false);
             let all = arg_matches.is_present("all");
 
             let blockstore =
-                crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
+                crate::open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly);
             let slot_meta_iterator = blockstore.slot_meta_iterator(0)?;
             let slots: Vec<_> = slot_meta_iterator.map(|(slot, _)| slot).collect();
 
@@ -665,7 +640,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
             let target_ledger =
                 PathBuf::from(value_t_or_exit!(arg_matches, "target_ledger", String));
 
-            let source = crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
+            let source = crate::open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly);
             let target = crate::open_blockstore(
                 &target_ledger,
                 arg_matches,
@@ -685,7 +660,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
         }
         ("dead-slots", Some(arg_matches)) => {
             let blockstore =
-                crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
+                crate::open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly);
             let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
             for slot in blockstore.dead_slots_iterator(starting_slot)? {
                 println!("{slot}");
@@ -693,7 +668,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
         }
         ("duplicate-slots", Some(arg_matches)) => {
             let blockstore =
-                crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
+                crate::open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly);
             let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
             let output_format =
                 OutputFormat::from_matches(arg_matches, "output_format", verbose_level > 1);
@@ -708,7 +683,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
         }
         ("latest-optimistic-slots", Some(arg_matches)) => {
             let blockstore =
-                crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
+                crate::open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly);
             let num_slots = value_t_or_exit!(arg_matches, "num_slots", usize);
             let exclude_vote_only_slots = arg_matches.is_present("exclude_vote_only_slots");
             let slots =
@@ -738,7 +713,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
         }
         ("list-roots", Some(arg_matches)) => {
             let blockstore =
-                crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
+                crate::open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly);
 
             let max_height = value_t!(arg_matches, "max_height", usize).unwrap_or(usize::MAX);
             let start_root = value_t!(arg_matches, "start_root", Slot).unwrap_or(0);
@@ -770,7 +745,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
             let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
             let ending_slot = value_t_or_exit!(arg_matches, "ending_slot", Slot);
             let blockstore =
-                crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
+                crate::open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly);
             let mut ancestors = BTreeSet::new();
             assert!(
                 blockstore.meta(ending_slot)?.is_some(),
@@ -835,7 +810,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
             let output_format = OutputFormat::from_matches(arg_matches, "output_format", false);
 
             output_ledger(
-                crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary),
+                crate::open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly),
                 starting_slot,
                 ending_slot,
                 allow_dead_slots,
@@ -847,17 +822,13 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
         }
         ("print-file-metadata", Some(arg_matches)) => {
             let blockstore =
-                crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
+                crate::open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly);
             let sst_file_name = arg_matches.value_of("file_name");
             print_blockstore_file_metadata(&blockstore, &sst_file_name)?;
         }
         ("purge", Some(arg_matches)) => {
             let start_slot = value_t_or_exit!(arg_matches, "start_slot", Slot);
             let end_slot = value_t!(arg_matches, "end_slot", Slot).ok();
-            let perform_compaction = arg_matches.is_present("enable_compaction");
-            if arg_matches.is_present("no_compaction") {
-                warn!("--no-compaction is deprecated and is now the default behavior.");
-            }
             let dead_slots_only = arg_matches.is_present("dead_slots_only");
             let batch_size = value_t_or_exit!(arg_matches, "batch_size", usize);
 
@@ -886,22 +857,17 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
             }
 
             info!(
-                "Purging data from slots {} to {} ({} slots) (do compaction: {}) (dead slot only: \
-                 {})",
+                "Purging data from slots {} to {} ({} slots) (dead slot only: {})",
                 start_slot,
                 end_slot,
                 end_slot - start_slot,
-                perform_compaction,
                 dead_slots_only,
             );
-            let purge_from_blockstore = |start_slot, end_slot| {
-                blockstore.purge_from_next_slots(start_slot, end_slot);
-                if perform_compaction {
-                    blockstore.purge_and_compact_slots(start_slot, end_slot);
-                } else {
-                    blockstore.purge_slots(start_slot, end_slot, PurgeType::Exact);
-                }
-            };
+            let purge_from_blockstore =
+                |start_slot, end_slot| -> std::result::Result<(), BlockstoreError> {
+                    blockstore.purge_from_next_slots(start_slot, end_slot);
+                    blockstore.purge_slots(start_slot, end_slot, PurgeType::Exact)
+                };
             if !dead_slots_only {
                 let slots_iter = &(start_slot..=end_slot).chunks(batch_size);
                 for slots in slots_iter {
@@ -916,7 +882,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
                         end_slot,
                         end_slot - start_slot
                     );
-                    purge_from_blockstore(start_slot, end_slot);
+                    purge_from_blockstore(start_slot, end_slot)?;
                 }
             } else {
                 let dead_slots_iter = blockstore
@@ -924,7 +890,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
                     .take_while(|s| *s <= end_slot);
                 for dead_slot in dead_slots_iter {
                     info!("Purging dead slot {dead_slot}");
-                    purge_from_blockstore(dead_slot, dead_slot);
+                    purge_from_blockstore(dead_slot, dead_slot)?;
                 }
             }
         }
@@ -998,7 +964,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
             }
             let starting_slot = value_t_or_exit!(arg_matches, "starting_slot", Slot);
             let ending_slot = value_t!(arg_matches, "ending_slot", Slot).unwrap_or(Slot::MAX);
-            let ledger = crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
+            let ledger = crate::open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly);
             for (slot, _meta) in ledger
                 .slot_meta_iterator(starting_slot)?
                 .take_while(|(slot, _)| *slot <= ending_slot)
@@ -1029,7 +995,7 @@ fn do_blockstore_process_command(ledger_path: &Path, matches: &ArgMatches<'_>) -
             let output_format = OutputFormat::from_matches(arg_matches, "output_format", false);
 
             let blockstore =
-                crate::open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
+                crate::open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly);
             for slot in slots {
                 output_slot(
                     &blockstore,

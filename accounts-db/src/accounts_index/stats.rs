@@ -1,10 +1,9 @@
 use {
     super::{
+        DiskIndexValue, IndexValue, SlotListItem,
         bucket_map_holder::{Age, AtomicAge, BucketMapHolder},
         in_mem_accounts_index::InMemAccountsIndex,
-        DiskIndexValue, IndexValue,
     },
-    solana_clock::Slot,
     solana_time_utils::AtomicInterval,
     std::{
         fmt::Debug,
@@ -17,6 +16,8 @@ const STATS_INTERVAL_MS: u64 = 10_000;
 
 #[derive(Debug, Default)]
 pub struct HeldInMemStats {
+    pub clean: AtomicU64,
+    pub age: AtomicU64,
     pub ref_count: AtomicU64,
     pub slot_list_len: AtomicU64,
     pub slot_list_cached: AtomicU64,
@@ -134,13 +135,13 @@ impl Stats {
             age_now += Age::MAX as u64 + 1;
         }
         let age_delta = age_now.saturating_sub(last_age);
-        if age_delta > 0 {
-            return elapsed_ms / age_delta;
+        if let Some(v) = elapsed_ms.checked_div(age_delta) {
+            return v;
         } else {
             // did not advance an age, but probably did partial work, so report that
             let bin_delta = ages_flushed.saturating_sub(last_ages_flushed);
-            if bin_delta > 0 {
-                return elapsed_ms * self.bins / bin_delta;
+            if let Some(v) = (elapsed_ms * self.bins).checked_div(bin_delta) {
+                return v;
             }
         }
         0 // avoid crazy numbers
@@ -178,17 +179,6 @@ impl Stats {
         self.count.load(Ordering::Relaxed)
     }
 
-    /// This is an estimate of the # of items in mem that are awaiting flushing to disk.
-    /// returns (# items in mem) - (# items we intend to hold in mem for performance heuristics)
-    /// The result is also an estimate because 'held_in_mem' is based on a stat that is swapped out when stats are reported.
-    pub fn get_remaining_items_to_flush_estimate(&self) -> usize {
-        let in_mem = self.count_in_mem.load(Ordering::Relaxed) as u64;
-        let held_in_mem = self.held_in_mem.slot_list_cached.load(Ordering::Relaxed)
-            + self.held_in_mem.slot_list_len.load(Ordering::Relaxed)
-            + self.held_in_mem.ref_count.load(Ordering::Relaxed);
-        in_mem.saturating_sub(held_in_mem) as usize
-    }
-
     pub fn report_stats<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>>(
         &self,
         storage: &BucketMapHolder<T, U>,
@@ -224,9 +214,8 @@ impl Stats {
         let capacity_in_mem = self.capacity_in_mem.load(Ordering::Relaxed);
 
         // sum of elapsed time in each thread
-        let mut thread_time_elapsed_ms = elapsed_ms * storage.threads as u64;
+        let thread_time_elapsed_ms = elapsed_ms * storage.threads as u64;
         let datapoint_name = if startup || was_startup {
-            thread_time_elapsed_ms *= 2; // more threads are allocated during startup
             "accounts_index_startup"
         } else {
             "accounts_index"
@@ -260,9 +249,13 @@ impl Stats {
                     ),
                 );
             }
+            let held_in_mem_clean = self.held_in_mem.clean.swap(0, Ordering::Relaxed);
+            let held_in_mem_age = self.held_in_mem.age.swap(0, Ordering::Relaxed);
             let held_in_mem_ref_count = self.held_in_mem.ref_count.swap(0, Ordering::Relaxed);
             let held_in_mem_slot_list_len =
                 self.held_in_mem.slot_list_len.swap(0, Ordering::Relaxed);
+            let held_in_mem_slot_list_cached =
+                self.held_in_mem.slot_list_cached.swap(0, Ordering::Relaxed);
             // If an entry is held in-mem due to ref count or slot list length,
             // then assume it has two slot list entries.
             // Since `approx_size_of_one_entry()` assumes 'regular' entries
@@ -278,7 +271,7 @@ impl Stats {
                 // and for entries held in mem due to ref count or slot list length, assume
                 // conservatively a slot list with two entries
                 + (held_in_mem_ref_count + held_in_mem_slot_list_len) as usize
-                    * size_of::<(Slot, T)>() // <-- size of one slot list entry
+                    * size_of::<SlotListItem<T>>() // <-- size of one slot list entry
                     * 2; // <-- and assume there are two entries
             datapoint_info!(
                 datapoint_name,
@@ -307,11 +300,17 @@ impl Stats {
                     ),
                     f64
                 ),
-                ("slot_list_len", held_in_mem_slot_list_len, i64),
-                ("ref_count", held_in_mem_ref_count, i64),
+                ("num_not_flushed_clean", held_in_mem_clean, i64),
+                ("num_not_flushed_age", held_in_mem_age, i64),
+                ("num_not_flushed_ref_count", held_in_mem_ref_count, i64),
                 (
-                    "slot_list_cached",
-                    self.held_in_mem.slot_list_cached.swap(0, Ordering::Relaxed),
+                    "num_not_flushed_slot_list_len",
+                    held_in_mem_slot_list_len,
+                    i64
+                ),
+                (
+                    "num_not_flushed_slot_list_cached",
+                    held_in_mem_slot_list_cached,
                     i64
                 ),
                 ("min_in_bin_disk", disk_stats.0, i64),
@@ -464,30 +463,8 @@ impl Stats {
                     i64
                 ),
                 (
-                    "disk_index_index_file_size",
+                    "disk_index_file_size",
                     disk.map(|disk| disk.stats.index.total_file_size.load(Ordering::Relaxed))
-                        .unwrap_or_default(),
-                    i64
-                ),
-                (
-                    "index_exceptional_entry",
-                    disk.map(|disk| disk
-                        .stats
-                        .index
-                        .index_uses_uncommon_slot_list_len_or_refcount
-                        .load(Ordering::Relaxed))
-                        .unwrap_or_default(),
-                    i64
-                ),
-                (
-                    "disk_index_data_file_size",
-                    disk.map(|disk| disk.stats.data.total_file_size.load(Ordering::Relaxed))
-                        .unwrap_or_default(),
-                    i64
-                ),
-                (
-                    "disk_index_data_file_count",
-                    disk.map(|disk| disk.stats.data.file_count.load(Ordering::Relaxed))
                         .unwrap_or_default(),
                     i64
                 ),
@@ -504,6 +481,28 @@ impl Stats {
                 (
                     "disk_index_flush_mmap_us",
                     disk.map(|disk| disk.stats.index.mmap_us.swap(0, Ordering::Relaxed))
+                        .unwrap_or_default(),
+                    i64
+                ),
+                (
+                    "index_exceptional_entry",
+                    disk.map(|disk| disk
+                        .stats
+                        .index
+                        .index_uses_uncommon_slot_list_len_or_refcount
+                        .load(Ordering::Relaxed))
+                        .unwrap_or_default(),
+                    i64
+                ),
+                (
+                    "disk_data_file_size",
+                    disk.map(|disk| disk.stats.data.total_file_size.load(Ordering::Relaxed))
+                        .unwrap_or_default(),
+                    i64
+                ),
+                (
+                    "disk_data_file_count",
+                    disk.map(|disk| disk.stats.data.file_count.load(Ordering::Relaxed))
                         .unwrap_or_default(),
                     i64
                 ),

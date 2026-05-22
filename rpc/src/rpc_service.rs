@@ -11,24 +11,22 @@ use {
         rpc_subscriptions::RpcSubscriptions,
     },
     agave_snapshots::{
-        paths as snapshot_paths, snapshot_archive_info::SnapshotArchiveInfoGetter,
-        snapshot_config::SnapshotConfig, SnapshotInterval,
+        SnapshotInterval, paths as snapshot_paths,
+        snapshot_archive_info::SnapshotArchiveInfoGetter, snapshot_config::SnapshotConfig,
     },
     crossbeam_channel::unbounded,
-    jsonrpc_core::{futures::prelude::*, MetaIoHandler},
+    jsonrpc_core::{MetaIoHandler, futures::prelude::*},
     jsonrpc_http_server::{
-        hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
-        RequestMiddlewareAction, ServerBuilder,
+        AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
+        RequestMiddlewareAction, ServerBuilder, hyper,
     },
     regex::Regex,
     solana_cli_output::display::build_balance_message,
-    solana_client::{
-        client_option::ClientOption,
-        connection_cache::{ConnectionCache, Protocol},
-    },
+    solana_client::connection_cache::Protocol,
     solana_genesis_config::DEFAULT_GENESIS_DOWNLOAD_PATH,
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
+    solana_keypair::Keypair,
     solana_ledger::{
         bigtable_upload::ConfirmedBlockUploadConfig,
         bigtable_upload_service::BigTableUploadService,
@@ -38,7 +36,6 @@ use {
     solana_metrics::inc_new_counter_info,
     solana_perf::thread::renice_this_thread,
     solana_poh::poh_recorder::PohRecorder,
-    solana_quic_definitions::NotifyKeyUpdate,
     solana_runtime::{
         bank::Bank, bank_forks::BankForks, commitment::BlockCommitmentCache,
         non_circulating_supply::calculate_non_circulating_supply,
@@ -46,17 +43,18 @@ use {
     },
     solana_send_transaction_service::{
         send_transaction_service::{self, SendTransactionService},
-        transaction_client::{ConnectionCacheClient, TpuClientNextClient, TransactionClient},
+        transaction_client::{TpuClientNextClient, TransactionClient},
     },
     solana_signature::Signature,
     solana_transaction_status::TransactionStatusMeta,
     solana_message::v0::LoadedAddresses,
     prost::Message,
     solana_storage_bigtable::CredentialType,
+    solana_tls_utils::NotifyKeyUpdate,
     solana_validator_exit::Exit,
     std::{
         collections::HashMap,
-        net::SocketAddr,
+        net::{SocketAddr, UdpSocket},
         path::{Path, PathBuf},
         pin::Pin,
         str::FromStr,
@@ -69,6 +67,7 @@ use {
     }, tokio::runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime}, tokio_util::{
         bytes::Bytes,
         codec::{BytesCodec, FramedRead},
+        sync::CancellationToken,
     },
     xandeum_protos::response::{ResponseWrapper, TxResponse, response::{self}}
 };
@@ -494,11 +493,19 @@ pub struct JsonRpcServiceConfig<'a> {
     pub max_slots: Arc<MaxSlots>,
     pub leader_schedule_cache: Arc<LeaderScheduleCache>,
     pub max_complete_transaction_status_slot: Arc<AtomicU64>,
-    pub prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+    pub prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+    pub rpc_tpu_client_args: RpcTpuClientArgs<'a>,
     pub transaction_results: Arc<Mutex<HashMap<String, TxResponse>>>,
     pub rpc_subscriptions: Arc<RpcSubscriptions>,
-    pub client_option: ClientOption<'a>,
 }
+
+/// Arguments required to create a TPU client for the RPC service.
+pub struct RpcTpuClientArgs<'a>(
+    pub &'a Keypair,
+    pub UdpSocket,
+    pub RuntimeHandle,
+    pub CancellationToken,
+);
 
 impl JsonRpcService {
     pub fn new_with_config(config: JsonRpcServiceConfig) -> Result<Self, String> {
@@ -511,182 +518,56 @@ impl JsonRpcService {
             .poh_recorder
             .map(|recorder| ClusterTpuInfo::new(config.cluster_info.clone(), recorder));
 
-        match config.client_option {
-            ClientOption::ConnectionCache(connection_cache) => {
-                let my_tpu_address = config
-                    .cluster_info
-                    .my_contact_info()
-                    .tpu(connection_cache.protocol())
-                    .ok_or(format!(
-                        "Invalid {:?} socket address for TPU",
-                        connection_cache.protocol()
-                    ))?;
-                let client = ConnectionCacheClient::new(
-                    connection_cache,
-                    my_tpu_address,
-                    config.send_transaction_service_config.tpu_peers.clone(),
-                    leader_info,
-                    config.send_transaction_service_config.leader_forward_count,
-                );
-                let json_rpc_service = Self::new_with_client(
-                    config.rpc_addr,
-                    config.rpc_config,
-                    config.snapshot_config,
-                    config.bank_forks,
-                    config.block_commitment_cache,
-                    config.blockstore,
-                    config.cluster_info,
-                    config.genesis_hash,
-                    config.ledger_path.as_path(),
-                    config.validator_exit,
-                    config.exit,
-                    config.override_health_check,
-                    config.optimistically_confirmed_bank,
-                    config.send_transaction_service_config,
-                    config.max_slots,
-                    config.leader_schedule_cache,
-                    client.clone(),
-                    config.max_complete_transaction_status_slot,
-                    config.prioritization_fee_cache,
-                    runtime,
-                    config.transaction_results,
-                    config.rpc_subscriptions,
-                )?;
-                Ok(json_rpc_service)
-            }
-            ClientOption::TpuClientNext(
-                identity_keypair,
-                tpu_client_socket,
-                client_runtime,
-                cancel,
-            ) => {
-                let my_tpu_address = config
-                    .cluster_info
-                    .my_contact_info()
-                    .tpu(Protocol::QUIC)
-                    .ok_or(format!(
-                        "Invalid {:?} socket address for TPU",
-                        Protocol::QUIC
-                    ))?;
-                let client = TpuClientNextClient::new(
-                    client_runtime,
-                    my_tpu_address,
-                    config.send_transaction_service_config.tpu_peers.clone(),
-                    leader_info,
-                    config.send_transaction_service_config.leader_forward_count,
-                    Some(identity_keypair),
-                    tpu_client_socket,
-                    cancel,
-                );
-
-                let json_rpc_service = Self::new_with_client(
-                    config.rpc_addr,
-                    config.rpc_config.clone(),
-                    config.snapshot_config,
-                    config.bank_forks.clone(),
-                    config.block_commitment_cache.clone(),
-                    config.blockstore.clone(),
-                    config.cluster_info.clone(),
-                    config.genesis_hash,
-                    config.ledger_path.as_path(),
-                    config.validator_exit,
-                    config.exit,
-                    config.override_health_check,
-                    config.optimistically_confirmed_bank,
-                    config.send_transaction_service_config,
-                    config.max_slots,
-                    config.leader_schedule_cache,
-                    client,
-                    config.max_complete_transaction_status_slot,
-                    config.prioritization_fee_cache,
-                    runtime,
-                    config.transaction_results,
-                    config.rpc_subscriptions,
-                )?;
-                Ok(json_rpc_service)
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        rpc_addr: SocketAddr,
-        config: JsonRpcConfig,
-        snapshot_config: Option<SnapshotConfig>,
-        bank_forks: Arc<RwLock<BankForks>>,
-        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
-        blockstore: Arc<Blockstore>,
-        cluster_info: Arc<ClusterInfo>,
-        poh_recorder: Option<Arc<RwLock<PohRecorder>>>,
-        genesis_hash: Hash,
-        ledger_path: &Path,
-        validator_exit: Arc<RwLock<Exit>>,
-        exit: Arc<AtomicBool>,
-        override_health_check: Arc<AtomicBool>,
-        optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
-        send_transaction_service_config: send_transaction_service::Config,
-        max_slots: Arc<MaxSlots>,
-        leader_schedule_cache: Arc<LeaderScheduleCache>,
-        connection_cache: Arc<ConnectionCache>,
-        max_complete_transaction_status_slot: Arc<AtomicU64>,
-        prioritization_fee_cache: Arc<PrioritizationFeeCache>,
-        transaction_results: Arc<Mutex<HashMap<String, TxResponse>>>,
-        rpc_subscriptions: &Arc<RpcSubscriptions>,
-    ) -> Result<Self, String> {
-        let runtime = service_runtime(
-            config.rpc_threads,
-            config.rpc_blocking_threads,
-            config.rpc_niceness_adj,
-        );
-
-        let tpu_address = cluster_info
+        let RpcTpuClientArgs(identity_keypair, tpu_client_socket, client_runtime, cancel) =
+            config.rpc_tpu_client_args;
+        let my_tpu_address = config
+            .cluster_info
             .my_contact_info()
-            .tpu(connection_cache.protocol())
-            .ok_or_else(|| {
-                format!(
-                    "Invalid {:?} socket address for TPU",
-                    connection_cache.protocol()
-                )
-            })?;
-
-        let leader_info =
-            poh_recorder.map(|recorder| ClusterTpuInfo::new(cluster_info.clone(), recorder));
-        let client = ConnectionCacheClient::new(
-            connection_cache,
-            tpu_address,
-            send_transaction_service_config.tpu_peers.clone(),
+            .tpu(Protocol::QUIC)
+            .ok_or(format!(
+                "Invalid {:?} socket address for TPU",
+                Protocol::QUIC
+            ))?;
+        let client = TpuClientNextClient::new(
+            client_runtime,
+            my_tpu_address,
+            config.send_transaction_service_config.tpu_peers.clone(),
             leader_info,
-            send_transaction_service_config.leader_forward_count,
+            config.send_transaction_service_config.leader_forward_count,
+            Some(identity_keypair),
+            tpu_client_socket,
+            cancel,
         );
-        let json_rpc_service = Self::new_with_client(
-            rpc_addr,
-            config,
-            snapshot_config,
-            bank_forks,
-            block_commitment_cache,
-            blockstore,
-            cluster_info,
-            genesis_hash,
-            ledger_path,
-            validator_exit,
-            exit,
-            override_health_check,
-            optimistically_confirmed_bank,
-            send_transaction_service_config,
-            max_slots,
-            leader_schedule_cache,
-            client.clone(),
-            max_complete_transaction_status_slot,
-            prioritization_fee_cache,
+
+        let json_rpc_service: JsonRpcService = Self::new(
+            config.rpc_addr,
+            config.rpc_config.clone(),
+            config.snapshot_config,
+            config.bank_forks.clone(),
+            config.block_commitment_cache.clone(),
+            config.blockstore.clone(),
+            config.cluster_info.clone(),
+            config.genesis_hash,
+            config.ledger_path.as_path(),
+            config.validator_exit,
+            config.exit,
+            config.override_health_check,
+            config.optimistically_confirmed_bank,
+            config.send_transaction_service_config,
+            config.max_slots,
+            config.leader_schedule_cache,
+            client,
+            config.max_complete_transaction_status_slot,
+            config.prioritization_fee_cache,
             runtime,
-            transaction_results,
-            rpc_subscriptions.clone(),
+            config.transaction_results,
+            config.rpc_subscriptions.clone(),
         )?;
         Ok(json_rpc_service)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn new_with_client<
+    fn new<
         Client: TransactionClient
             + NotifyKeyUpdate
             + Clone
@@ -712,7 +593,7 @@ impl JsonRpcService {
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         client: Client,
         max_complete_transaction_status_slot: Arc<AtomicU64>,
-        prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+        prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
         runtime: Arc<TokioRuntime>,
         transaction_results: Arc<Mutex<HashMap<String, TxResponse>>>,
         rpc_subscriptions: Arc<RpcSubscriptions>,
@@ -844,7 +725,7 @@ impl JsonRpcService {
             request_id_counter,
         );
 
-        let _send_transaction_service = Arc::new(SendTransactionService::new_with_client(
+        let _send_transaction_service = Arc::new(SendTransactionService::new(
             &bank_forks,
             receiver,
             client.clone(),
@@ -1129,7 +1010,7 @@ pub fn service_runtime(
     // negatively impact performance.
     let rpc_threads = 1.max(rpc_threads);
     let rpc_blocking_threads = 1.max(rpc_blocking_threads);
-    let runtime = Arc::new(
+    Arc::new(
         TokioBuilder::new_multi_thread()
             .worker_threads(rpc_threads)
             .max_blocking_threads(rpc_blocking_threads)
@@ -1138,8 +1019,7 @@ pub fn service_runtime(
             .enable_all()
             .build()
             .expect("Runtime"),
-    );
-    runtime
+    )
 }
 
 #[cfg(test)]
@@ -1150,11 +1030,12 @@ mod tests {
         solana_cluster_type::ClusterType,
         solana_genesis_config::DEFAULT_GENESIS_ARCHIVE,
         solana_ledger::{
-            genesis_utils::{create_genesis_config, GenesisConfigInfo},
+            genesis_utils::{GenesisConfigInfo, create_genesis_config},
             get_tmp_ledger_path_auto_delete,
         },
         solana_rpc_client_api::config::RpcContextConfig,
         solana_runtime::bank::Bank,
+        solana_send_transaction_service::test_utils::create_client_for_tests,
         solana_signer::Signer,
         std::{
             io::Write,
@@ -1186,35 +1067,43 @@ mod tests {
         let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
-        let connection_cache = Arc::new(ConnectionCache::new("connection_cache_test"));
-        let exit_for_test = Arc::new(AtomicBool::new(false));
-        let rpc_subscriptions = Arc::new(RpcSubscriptions::new_for_tests_with_blockstore(
-            exit_for_test,
-            blockstore.clone(),
-        ));
+        let json_rpc_config = JsonRpcConfig::default();
+        let runtime = service_runtime(
+            json_rpc_config.rpc_threads,
+            json_rpc_config.rpc_blocking_threads,
+            json_rpc_config.rpc_niceness_adj,
+        );
+        let tpu_address = cluster_info.my_contact_info().tpu(Protocol::QUIC).unwrap();
+        let send_transaction_service_config = send_transaction_service::Config {
+            retry_rate_ms: 1000,
+            leader_forward_count: 1,
+            ..send_transaction_service::Config::default()
+        };
+
+        let client = create_client_for_tests(
+            runtime.handle().clone(),
+            tpu_address,
+            send_transaction_service_config.tpu_peers.clone(),
+            send_transaction_service_config.leader_forward_count,
+        );
         let mut rpc_service = JsonRpcService::new(
             rpc_addr,
-            JsonRpcConfig::default(),
+            json_rpc_config,
             None,
             bank_forks,
             block_commitment_cache,
             blockstore,
             cluster_info,
-            None,
             Hash::default(),
             &PathBuf::from("farf"),
             validator_exit,
             exit,
             Arc::new(AtomicBool::new(false)),
             optimistically_confirmed_bank,
-            send_transaction_service::Config {
-                retry_rate_ms: 1000,
-                leader_forward_count: 1,
-                ..send_transaction_service::Config::default()
-            },
+            send_transaction_service_config,
             Arc::new(MaxSlots::default()),
             Arc::new(LeaderScheduleCache::default()),
-            connection_cache,
+            client,
             Arc::new(AtomicU64::default()),
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
@@ -1347,10 +1236,15 @@ mod tests {
         assert!(!rrm_with_snapshot_config.is_file_get_path(
             "/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
         ));
-        assert!(!rrm_with_snapshot_config
-            .is_file_get_path("/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.gz"));
-        assert!(!rrm_with_snapshot_config
-            .is_file_get_path("/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"));
+        assert!(
+            !rrm_with_snapshot_config.is_file_get_path(
+                "/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.gz"
+            )
+        );
+        assert!(
+            !rrm_with_snapshot_config
+                .is_file_get_path("/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar")
+        );
 
         assert!(rrm_with_snapshot_config.is_file_get_path(
             "/incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
@@ -1381,8 +1275,10 @@ mod tests {
         assert!(
             !rrm_with_snapshot_config.is_file_get_path("../../../test/snapshot-123-xxx.tar.zst")
         );
-        assert!(!rrm_with_snapshot_config
-            .is_file_get_path("../../../test/incremental-snapshot-123-456-xxx.tar.zst"));
+        assert!(
+            !rrm_with_snapshot_config
+                .is_file_get_path("../../../test/incremental-snapshot-123-456-xxx.tar.zst")
+        );
 
         assert!(!rrm.is_file_get_path("/"));
         assert!(!rrm.is_file_get_path("//"));

@@ -52,11 +52,7 @@ impl<'a> Proof<'a> {
             let rsib = pe.2.unwrap_or(&candidate);
             let hash = hash_intermediate!(lsib, rsib);
 
-            if hash == *pe.0 {
-                Some(hash)
-            } else {
-                None
-            }
+            if hash == *pe.0 { Some(hash) } else { None }
         });
         result.is_some()
     }
@@ -157,7 +153,7 @@ impl MerkleTree {
             if lsib.is_some() || rsib.is_some() {
                 path.push(ProofEntry::new(target, lsib, rsib));
             }
-            if node_index % 2 == 0 {
+            if node_index.is_multiple_of(2) {
                 lsib = None;
                 rsib = if node_index + 1 < level.len() {
                     Some(&level[node_index + 1])

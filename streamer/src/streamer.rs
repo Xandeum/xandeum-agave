@@ -4,17 +4,20 @@
 use {
     crate::{
         packet::{
-            self, PacketBatch, PacketBatchRecycler, PacketRef, PinnedPacketBatch, PACKETS_PER_BATCH,
+            self, PACKETS_PER_BATCH, Packet, PacketBatch, PacketBatchRecycler, PacketRef,
+            RecycledPacketBatch,
         },
-        sendmmsg::{batch_send, SendPktsError},
-        socket::SocketAddrSpace,
+        sendmmsg::{SendPktsError, batch_send},
     },
     crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender, TrySendError},
     histogram::Histogram,
-    solana_net_utils::multihomed_sockets::{
-        BindIpAddrs, CurrentSocket, FixedSocketProvider, MultihomedSocketProvider, SocketProvider,
+    solana_net_utils::{
+        SocketAddrSpace,
+        multihomed_sockets::{
+            BindIpAddrs, CurrentSocket, FixedSocketProvider, MultihomedSocketProvider,
+            SocketProvider,
+        },
     },
-    solana_packet::Packet,
     solana_pubkey::Pubkey,
     solana_time_utils::timestamp,
     std::{
@@ -22,10 +25,10 @@ use {
         collections::HashMap,
         net::{IpAddr, UdpSocket},
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
-        thread::{sleep, Builder, JoinHandle},
+        thread::{Builder, JoinHandle},
         time::{Duration, Instant},
     },
     thiserror::Error,
@@ -162,7 +165,6 @@ fn recv_loop<P: SocketProvider>(
     stats: &StreamerReceiveStats,
     coalesce: Option<Duration>,
     use_pinned_memory: bool,
-    in_vote_only_mode: Option<Arc<AtomicBool>>,
     is_staked_service: bool,
 ) -> Result<()> {
     fn setup_socket(socket: &UdpSocket) -> Result<()> {
@@ -184,9 +186,9 @@ fn recv_loop<P: SocketProvider>(
 
     loop {
         let mut packet_batch = if use_pinned_memory {
-            PinnedPacketBatch::new_with_recycler(recycler, PACKETS_PER_BATCH, stats.name)
+            RecycledPacketBatch::new_with_recycler(recycler, PACKETS_PER_BATCH, stats.name)
         } else {
-            PinnedPacketBatch::with_capacity(PACKETS_PER_BATCH)
+            RecycledPacketBatch::with_capacity(PACKETS_PER_BATCH)
         };
         packet_batch.resize(PACKETS_PER_BATCH, Packet::default());
 
@@ -195,13 +197,6 @@ fn recv_loop<P: SocketProvider>(
             // (for instance the leader transaction socket)
             if exit.load(Ordering::Relaxed) {
                 return Ok(());
-            }
-
-            if let Some(ref in_vote_only_mode) = in_vote_only_mode {
-                if in_vote_only_mode.load(Ordering::Relaxed) {
-                    sleep(Duration::from_millis(1));
-                    continue;
-                }
             }
 
             #[cfg(unix)]
@@ -234,7 +229,7 @@ fn recv_loop<P: SocketProvider>(
                             stats.num_packets_dropped.fetch_add(len, Ordering::Relaxed);
                         }
                         Err(TrySendError::Disconnected(err)) => {
-                            return Err(StreamerError::Send(SendError(err)))
+                            return Err(StreamerError::Send(SendError(err)));
                         }
                     }
                 }
@@ -264,7 +259,6 @@ pub fn receiver(
     stats: Arc<StreamerReceiveStats>,
     coalesce: Option<Duration>,
     use_pinned_memory: bool,
-    in_vote_only_mode: Option<Arc<AtomicBool>>,
     is_staked_service: bool,
 ) -> JoinHandle<()> {
     Builder::new()
@@ -279,7 +273,6 @@ pub fn receiver(
                 &stats,
                 coalesce,
                 use_pinned_memory,
-                in_vote_only_mode,
                 is_staked_service,
             );
         })
@@ -297,7 +290,6 @@ pub fn receiver_atomic(
     stats: Arc<StreamerReceiveStats>,
     coalesce: Option<Duration>,
     use_pinned_memory: bool,
-    in_vote_only_mode: Option<Arc<AtomicBool>>,
     is_staked_service: bool,
 ) -> JoinHandle<()> {
     Builder::new()
@@ -312,7 +304,6 @@ pub fn receiver_atomic(
                 &stats,
                 coalesce,
                 use_pinned_memory,
-                in_vote_only_mode,
                 is_staked_service,
             );
         })
@@ -607,7 +598,7 @@ mod test {
     use {
         super::*,
         crate::{
-            packet::{Packet, PinnedPacketBatch, PACKET_DATA_SIZE},
+            packet::{PACKET_DATA_SIZE, Packet, RecycledPacketBatch},
             streamer::{receiver, responder},
         },
         crossbeam_channel::unbounded,
@@ -616,8 +607,8 @@ mod test {
         std::{
             io::{self, Write},
             sync::{
-                atomic::{AtomicBool, Ordering},
                 Arc,
+                atomic::{AtomicBool, Ordering},
             },
             time::Duration,
         },
@@ -641,7 +632,7 @@ mod test {
     #[test]
     fn streamer_debug() {
         write!(io::sink(), "{:?}", Packet::default()).unwrap();
-        write!(io::sink(), "{:?}", PinnedPacketBatch::default()).unwrap();
+        write!(io::sink(), "{:?}", RecycledPacketBatch::default()).unwrap();
     }
     #[test]
     fn streamer_send_test() {
@@ -661,7 +652,6 @@ mod test {
             stats.clone(),
             Some(Duration::from_millis(1)), // coalesce
             true,
-            None,
             false,
         );
         const NUM_PACKETS: usize = 5;
@@ -674,7 +664,7 @@ mod test {
                 SocketAddrSpace::Unspecified,
                 None,
             );
-            let mut packet_batch = PinnedPacketBatch::default();
+            let mut packet_batch = RecycledPacketBatch::default();
             for i in 0..NUM_PACKETS {
                 let mut p = Packet::default();
                 {

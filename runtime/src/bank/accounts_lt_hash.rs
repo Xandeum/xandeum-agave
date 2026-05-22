@@ -1,7 +1,7 @@
 use {
     super::Bank,
     rayon::prelude::*,
-    solana_account::{accounts_equal, AccountSharedData},
+    solana_account::{AccountSharedData, accounts_equal},
     solana_accounts_db::accounts_db::AccountsDb,
     solana_hash::Hash,
     solana_lattice_hash::lt_hash::LtHash,
@@ -368,7 +368,7 @@ pub struct Stats {
 /// The initial state of an account prior to being modified in this slot/transaction
 #[derive(Debug, Clone, PartialEq)]
 pub enum InitialStateOfAccount {
-    /// The account was initiall dead
+    /// The account was initially dead
     Dead,
     /// The account was initially alive
     Alive(AccountSharedData),
@@ -393,10 +393,8 @@ mod tests {
         agave_snapshots::snapshot_config::SnapshotConfig,
         solana_account::{ReadableAccount as _, WritableAccount as _},
         solana_accounts_db::{
-            accounts_db::{AccountsDbConfig, MarkObsoleteAccounts, ACCOUNTS_DB_CONFIG_FOR_TESTING},
-            accounts_index::{
-                AccountsIndexConfig, IndexLimitMb, ACCOUNTS_INDEX_CONFIG_FOR_TESTING,
-            },
+            accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDbConfig, MarkObsoleteAccounts},
+            accounts_index::{ACCOUNTS_INDEX_CONFIG_FOR_TESTING, AccountsIndexConfig, IndexLimit},
         },
         solana_fee_calculator::FeeRateGovernor,
         solana_genesis_config::{self, GenesisConfig},
@@ -548,7 +546,7 @@ mod tests {
             .collect();
 
         let mut expected_delta_lt_hash = LtHash::identity();
-        let mut expected_accounts_lt_hash = prev_accounts_lt_hash.clone();
+        let mut expected_accounts_lt_hash = prev_accounts_lt_hash;
         let mut updater =
             |address: &Pubkey, prev: Option<AccountSharedData>, post: Option<AccountSharedData>| {
                 // if there was an alive account, mix out
@@ -778,12 +776,12 @@ mod tests {
 
     #[test_matrix(
         [Features::None, Features::All],
-        [IndexLimitMb::Minimal, IndexLimitMb::InMemOnly],
+        [IndexLimit::Minimal, IndexLimit::InMemOnly],
         [MarkObsoleteAccounts::Disabled, MarkObsoleteAccounts::Enabled]
     )]
     fn test_verify_accounts_lt_hash_at_startup(
         features: Features,
-        accounts_index_limit: IndexLimitMb,
+        accounts_index_limit: IndexLimit,
         mark_obsolete_accounts: MarkObsoleteAccounts,
     ) {
         let (mut genesis_config, mint_keypair) = genesis_config_with(features);
@@ -870,7 +868,7 @@ mod tests {
         .unwrap();
         let (_accounts_tempdir, accounts_dir) = snapshot_utils::create_tmp_accounts_dir_for_tests();
         let accounts_index_config = AccountsIndexConfig {
-            index_limit_mb: accounts_index_limit,
+            index_limit: accounts_index_limit,
             ..ACCOUNTS_INDEX_CONFIG_FOR_TESTING
         };
         let accounts_db_config = AccountsDbConfig {
@@ -932,7 +930,7 @@ mod tests {
             .iter()
             .map(|entry| (*entry.key(), entry.value().clone()))
             .collect();
-        actual_cache.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        actual_cache.sort_unstable_by_key(|a| a.0);
         assert_eq!(expected_cache, actual_cache.as_slice());
     }
 

@@ -10,42 +10,41 @@ use {
     },
     solana_vote::vote_transaction::new_tower_sync_transaction,
     solana_vote_program::vote_state::TowerSync,
+    tokio::sync::mpsc,
 };
 
 extern crate test;
 
 use {
-    crossbeam_channel::{unbounded, Receiver},
+    crossbeam_channel::{Receiver, unbounded},
     log::*,
-    rand::{thread_rng, Rng},
+    rand::{Rng, rng},
     rayon::prelude::*,
     solana_core::{banking_stage::BankingStage, banking_trace::BankingTracer},
-    solana_entry::entry::{next_hash, Entry},
+    solana_entry::entry::{Entry, next_hash},
     solana_genesis_config::GenesisConfig,
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore::Blockstore,
         blockstore_processor::process_entries_for_tests,
-        genesis_utils::{create_genesis_config, GenesisConfigInfo},
+        genesis_utils::{GenesisConfigInfo, create_genesis_config},
         get_tmp_ledger_path_auto_delete,
     },
     solana_message::Message,
     solana_perf::packet::to_packet_batches,
-    solana_poh::poh_recorder::{create_test_recorder, WorkingBankEntry},
+    solana_poh::poh_recorder::{WorkingBankEntry, create_test_recorder},
     solana_pubkey as pubkey,
-    solana_runtime::{
-        bank::Bank, bank_forks::BankForks, prioritization_fee_cache::PrioritizationFeeCache,
-    },
+    solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_signature::Signature,
     solana_signer::Signer,
     solana_system_interface::instruction as system_instruction,
     solana_system_transaction as system_transaction,
     solana_time_utils::timestamp,
-    solana_transaction::{versioned::VersionedTransaction, Transaction},
+    solana_transaction::{Transaction, versioned::VersionedTransaction},
     std::{
         iter::repeat_with,
-        sync::{atomic::Ordering, Arc},
+        sync::{Arc, atomic::Ordering},
         time::{Duration, Instant},
     },
     test::Bencher,
@@ -75,7 +74,7 @@ fn make_accounts_txs(txes: usize, mint_keypair: &Keypair, hash: Hash) -> Vec<Tra
         .into_par_iter()
         .map(|_| {
             let mut new = dummy.clone();
-            let sig: [u8; 64] = std::array::from_fn(|_| thread_rng().gen::<u8>());
+            let sig: [u8; 64] = std::array::from_fn(|_| rng().random::<u8>());
             new.message.account_keys[0] = pubkey::new_rand();
             new.message.account_keys[1] = pubkey::new_rand();
             new.signatures = vec![Signature::from(sig)];
@@ -164,7 +163,7 @@ fn bench_banking(
         tpu_vote_receiver,
         gossip_vote_sender,
         gossip_vote_receiver,
-    } = banking_tracer.create_channels(false);
+    } = banking_tracer.create_channels();
 
     let mut bank = Bank::new_for_benches(&genesis_config);
     // Allow arbitrary transaction processing time for the purposes of this bench
@@ -237,11 +236,12 @@ fn bench_banking(
     let (s, _r) = unbounded();
     let _banking_stage = BankingStage::new_num_threads(
         block_production_method,
-        poh_recorder.clone(),
+        poh_recorder,
         transaction_recorder,
         non_vote_receiver,
         tpu_vote_receiver,
         gossip_vote_receiver,
+        mpsc::channel(1).1,
         num_threads,
         SchedulerConfig {
             scheduler_pacing: SchedulerPacing::Disabled,
@@ -250,7 +250,7 @@ fn bench_banking(
         s,
         None,
         bank_forks,
-        Arc::new(PrioritizationFeeCache::new(0u64)),
+        None,
     );
 
     let chunk_len = verified.len() / CHUNKS;
@@ -296,7 +296,7 @@ fn bench_banking(
 
         // This signature clear may not actually clear the signatures
         // in this chunk, but since we rotate between CHUNKS then
-        // we should clear them by the time we come around again to re-use that chunk.
+        // we should clear them by the time we come around again to reuse that chunk.
         bank.clear_signatures();
         trace!(
             "time: {} checked: {} sent: {}",

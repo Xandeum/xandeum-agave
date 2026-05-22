@@ -7,39 +7,23 @@ use {
     crossbeam_channel::{Receiver, Sender},
     dlopen2::symbor::{Container, SymBorApi, Symbol},
     log::*,
-    rand::{thread_rng, Rng},
-    rayon::{prelude::*, ThreadPool},
+    rayon::{ThreadPool, prelude::*},
     serde::{Deserialize, Serialize},
+    smallvec::SmallVec,
+    solana_address::Address,
     solana_hash::Hash,
-    solana_measure::measure::Measure,
     solana_merkle_tree::MerkleTree,
-    solana_metrics::*,
-    solana_packet::Meta,
-    solana_perf::{
-        cuda_runtime::PinnedVec,
-        packet::{Packet, PacketBatch, PacketBatchRecycler, PinnedPacketBatch, PACKETS_PER_BATCH},
-        perf_libs,
-        recycler::Recycler,
-        sigverify,
-    },
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
-    solana_transaction::{
-        versioned::VersionedTransaction, Transaction, TransactionVerificationMode,
-    },
+    solana_signature::Signature,
+    solana_transaction::{Transaction, versioned::VersionedTransaction},
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::{
-        cmp,
         ffi::OsStr,
         iter::repeat_with,
-        sync::{Arc, Mutex, Once, OnceLock},
-        thread::{self, JoinHandle},
+        sync::{Once, OnceLock},
         time::Instant,
     },
-    wincode::{
-        containers::{Elem, Pod, Vec as WincodeVec},
-        len::BincodeLen,
-        SchemaRead, SchemaWrite,
-    },
+    wincode::{SchemaRead, SchemaWrite, containers::Vec as WincodeVec, len::BincodeLen},
 };
 
 pub type EntrySender = Sender<Vec<Entry>>;
@@ -132,14 +116,60 @@ pub struct Entry {
     pub num_hashes: u64,
 
     /// The SHA-256 hash `num_hashes` after the previous Entry ID.
-    #[wincode(with = "Pod<Hash>")]
     pub hash: Hash,
 
     /// An unordered list of transactions that were observed before the Entry ID was
     /// generated. They may have been observed before a previous Entry ID but were
     /// pushed back into this list to ensure deterministic interpretation of the ledger.
-    #[wincode(with = "WincodeVec<Elem<crate::wincode::VersionedTransaction>, MaxDataShredsLen>")]
+    #[wincode(with = "WincodeVec<crate::wincode::VersionedTransaction, MaxDataShredsLen>")]
     pub transactions: Vec<VersionedTransaction>,
+}
+
+// The data needed to verify an Entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntryVerificationData {
+    pub num_hashes: u64,
+    pub hash: Hash,
+    pub num_transactions: usize,
+    pub signatures: Vec<Signature>,
+}
+
+impl From<&Entry> for EntryVerificationData {
+    fn from(entry: &Entry) -> Self {
+        Self {
+            num_hashes: entry.num_hashes,
+            hash: entry.hash,
+            num_transactions: entry.transactions.len(),
+            signatures: entry
+                .transactions
+                .iter()
+                .flat_map(|tx| tx.signatures.iter().copied())
+                .collect(),
+        }
+    }
+}
+
+impl EntryVerificationData {
+    pub fn verify(&self, start_hash: &Hash) -> bool {
+        let ref_hash = next_hash_with_signatures(
+            start_hash,
+            self.num_hashes,
+            self.num_transactions,
+            &self.signatures,
+        );
+        if self.hash != ref_hash {
+            warn!(
+                "next_hash is invalid expected: {:?} actual: {:?}",
+                self.hash, ref_hash
+            );
+            return false;
+        }
+        true
+    }
+}
+
+pub fn entries_to_verification_data(entries: &[Entry]) -> Vec<EntryVerificationData> {
+    entries.iter().map(Into::into).collect()
 }
 
 pub struct EntrySummary {
@@ -162,6 +192,62 @@ impl From<&Entry> for EntrySummary {
 pub enum EntryType<Tx: TransactionWithMeta> {
     Transactions(Vec<Tx>),
     Tick(Hash),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TxVerificationData {
+    is_simple_vote: bool,
+    signatures: SmallVec<[Signature; 2]>,
+    signer_pubkeys: SmallVec<[Address; 2]>,
+    message_hash: Hash,
+    serialized_message: Vec<u8>,
+}
+
+pub struct UnverifiedSignatures {
+    signatures: Vec<TxVerificationData>,
+}
+
+impl UnverifiedSignatures {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            signatures: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        self.signatures.par_iter().try_for_each(|tx_signatures| {
+            if tx_signatures
+                .signatures
+                .iter()
+                .zip(tx_signatures.signer_pubkeys.iter())
+                .all(|(signature, pubkey)| {
+                    signature.verify(pubkey.as_ref(), &tx_signatures.serialized_message)
+                })
+            {
+                Ok(())
+            } else {
+                Err(TransactionError::SignatureFailure)
+            }
+        })
+    }
+
+    pub fn vote_transaction_message_hashes(&self) -> Vec<Hash> {
+        self.signatures
+            .iter()
+            .filter(|tx_signatures| tx_signatures.is_simple_vote)
+            .filter_map(|tx_signatures| {
+                tx_signatures
+                    .signatures
+                    .first()
+                    .map(|_| tx_signatures.message_hash)
+            })
+            .collect()
+    }
+}
+
+pub struct ValidatedHashedTransactions<Tx: TransactionWithMeta> {
+    pub entries: Vec<EntryType<Tx>>,
+    pub unverified_signatures: UnverifiedSignatures,
 }
 
 impl Entry {
@@ -206,19 +292,20 @@ impl Entry {
     /// Verifies self.hash is the result of hashing a `start_hash` `self.num_hashes` times.
     /// If the transaction is not a Tick, then hash that as well.
     pub fn verify(&self, start_hash: &Hash) -> bool {
-        let ref_hash = next_hash(start_hash, self.num_hashes, &self.transactions);
-        if self.hash != ref_hash {
-            warn!(
-                "next_hash is invalid expected: {:?} actual: {:?}",
-                self.hash, ref_hash
-            );
-            return false;
-        }
-        true
+        EntryVerificationData::from(self).verify(start_hash)
     }
 
     pub fn is_tick(&self) -> bool {
         self.transactions.is_empty()
+    }
+}
+
+pub fn hash_signatures(signatures: &[impl AsRef<[u8]>]) -> Hash {
+    let merkle_tree = MerkleTree::new(signatures);
+    if let Some(root_hash) = merkle_tree.get_root() {
+        *root_hash
+    } else {
+        Hash::default()
     }
 }
 
@@ -228,376 +315,159 @@ pub fn hash_transactions(transactions: &[VersionedTransaction]) -> Hash {
         .iter()
         .flat_map(|tx| tx.signatures.iter())
         .collect();
-    let merkle_tree = MerkleTree::new(&signatures);
-    if let Some(root_hash) = merkle_tree.get_root() {
-        *root_hash
-    } else {
-        Hash::default()
-    }
+    hash_signatures(&signatures)
 }
 
-/// Creates the hash `num_hashes` after `start_hash`. If the transaction contains
-/// a signature, the final hash will be a hash of both the previous ID and
-/// the signature.  If num_hashes is zero and there's no transaction data,
-///  start_hash is returned.
-pub fn next_hash(
+fn next_hash_with_signatures(
     start_hash: &Hash,
     num_hashes: u64,
-    transactions: &[VersionedTransaction],
+    num_transactions: usize,
+    signatures: &[Signature],
 ) -> Hash {
-    if num_hashes == 0 && transactions.is_empty() {
+    if num_hashes == 0 && num_transactions == 0 {
         return *start_hash;
     }
 
     let mut poh = Poh::new(*start_hash, None);
     poh.hash(num_hashes.saturating_sub(1));
-    if transactions.is_empty() {
+    if num_transactions == 0 {
         poh.tick().unwrap().hash
     } else {
-        poh.record(hash_transactions(transactions)).unwrap().hash
+        poh.record(hash_signatures(signatures)).unwrap().hash
     }
 }
 
-/// Last action required to verify an entry
-enum VerifyAction {
-    /// Mixin a hash before computing the last hash for a transaction entry
-    Mixin(Hash),
-    /// Compute one last hash for a tick entry
-    Tick,
-    /// No action needed (tick entry with no hashes)
-    None,
-}
-
-pub struct GpuVerificationData {
-    thread_h: Option<JoinHandle<u64>>,
-    hashes: Option<Arc<Mutex<PinnedVec<Hash>>>>,
-    verifications: Option<Vec<(VerifyAction, Hash)>>,
-}
-
-pub enum DeviceVerificationData {
-    Cpu(),
-    Gpu(GpuVerificationData),
+/// Creates the hash `num_hashes` after `start_hash`. If the transaction contains a signature, the
+/// final hash will be a hash of both the previous ID and the signature.  If num_hashes is zero and
+/// there's no transaction data, start_hash is returned.
+pub fn next_hash(
+    start_hash: &Hash,
+    num_hashes: u64,
+    transactions: &[VersionedTransaction],
+) -> Hash {
+    let signatures: Vec<_> = transactions
+        .iter()
+        .flat_map(|tx| tx.signatures.iter().copied())
+        .collect();
+    next_hash_with_signatures(start_hash, num_hashes, transactions.len(), &signatures)
 }
 
 pub struct EntryVerificationState {
-    verification_status: EntryVerificationStatus,
+    verification_status: bool,
     poh_duration_us: u64,
-    device_verification_data: DeviceVerificationData,
-}
-
-pub struct GpuSigVerificationData {
-    thread_h: Option<JoinHandle<(bool, u64)>>,
-}
-
-pub enum DeviceSigVerificationData {
-    Cpu(),
-    Gpu(GpuSigVerificationData),
-}
-
-pub struct EntrySigVerificationState<Tx: TransactionWithMeta> {
-    verification_status: EntryVerificationStatus,
-    entries: Option<Vec<EntryType<Tx>>>,
-    device_verification_data: DeviceSigVerificationData,
-    gpu_verify_duration_us: u64,
-}
-
-impl<Tx: TransactionWithMeta> EntrySigVerificationState<Tx> {
-    pub fn entries(&mut self) -> Option<Vec<EntryType<Tx>>> {
-        self.entries.take()
-    }
-    pub fn finish_verify(&mut self) -> bool {
-        match &mut self.device_verification_data {
-            DeviceSigVerificationData::Gpu(verification_state) => {
-                let (verified, gpu_time_us) =
-                    verification_state.thread_h.take().unwrap().join().unwrap();
-                self.gpu_verify_duration_us = gpu_time_us;
-                self.verification_status = if verified {
-                    EntryVerificationStatus::Success
-                } else {
-                    EntryVerificationStatus::Failure
-                };
-                verified
-            }
-            DeviceSigVerificationData::Cpu() => {
-                self.verification_status == EntryVerificationStatus::Success
-            }
-        }
-    }
-    pub fn status(&self) -> EntryVerificationStatus {
-        self.verification_status
-    }
-    pub fn gpu_verify_duration(&self) -> u64 {
-        self.gpu_verify_duration_us
-    }
-}
-
-#[derive(Default, Clone)]
-pub struct VerifyRecyclers {
-    hash_recycler: Recycler<PinnedVec<Hash>>,
-    tick_count_recycler: Recycler<PinnedVec<u64>>,
-    packet_recycler: PacketBatchRecycler,
-    out_recycler: Recycler<PinnedVec<u8>>,
-    tx_offset_recycler: Recycler<sigverify::TxOffset>,
-}
-
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-pub enum EntryVerificationStatus {
-    Failure,
-    Success,
-    Pending,
 }
 
 impl EntryVerificationState {
-    pub fn status(&self) -> EntryVerificationStatus {
+    pub fn status(&self) -> bool {
         self.verification_status
     }
 
     pub fn poh_duration_us(&self) -> u64 {
         self.poh_duration_us
     }
+}
 
-    pub fn finish_verify(&mut self, thread_pool: &ThreadPool) -> bool {
-        match &mut self.device_verification_data {
-            DeviceVerificationData::Gpu(verification_state) => {
-                let gpu_time_us = verification_state.thread_h.take().unwrap().join().unwrap();
-
-                let mut verify_check_time = Measure::start("verify_check");
-                let hashes = verification_state.hashes.take().unwrap();
-                let hashes = Arc::try_unwrap(hashes)
-                    .expect("unwrap Arc")
-                    .into_inner()
-                    .expect("into_inner");
-                let res = thread_pool.install(|| {
-                    hashes
-                        .into_par_iter()
-                        .cloned()
-                        .zip(verification_state.verifications.take().unwrap())
-                        .all(|(hash, (action, expected))| {
-                            let actual = match action {
-                                VerifyAction::Mixin(mixin) => {
-                                    Poh::new(hash, None).record(mixin).unwrap().hash
-                                }
-                                VerifyAction::Tick => Poh::new(hash, None).tick().unwrap().hash,
-                                VerifyAction::None => hash,
-                            };
-                            actual == expected
-                        })
-                });
-                verify_check_time.stop();
-                self.poh_duration_us += gpu_time_us + verify_check_time.as_us();
-
-                self.verification_status = if res {
-                    EntryVerificationStatus::Success
-                } else {
-                    EntryVerificationStatus::Failure
-                };
-                res
-            }
-            DeviceVerificationData::Cpu() => {
-                self.verification_status == EntryVerificationStatus::Success
-            }
-        }
+fn validate_and_hash_entry_transactions<Tx: TransactionWithMeta, F>(
+    entry: Entry,
+    verify: &F,
+    unverified_signatures: &mut UnverifiedSignatures,
+) -> Result<EntryType<Tx>>
+where
+    F: Fn(VersionedTransaction, &[u8]) -> Result<Tx>,
+{
+    if entry.transactions.is_empty() {
+        return Ok(EntryType::Tick(entry.hash));
     }
-}
 
-pub fn verify_transactions<Tx: TransactionWithMeta + Send + Sync>(
-    entries: Vec<Entry>,
-    thread_pool: &ThreadPool,
-    verify: Arc<dyn Fn(VersionedTransaction) -> Result<Tx> + Send + Sync>,
-) -> Result<Vec<EntryType<Tx>>> {
-    thread_pool.install(|| {
-        entries
-            .into_par_iter()
-            .map(|entry| {
-                if entry.transactions.is_empty() {
-                    Ok(EntryType::Tick(entry.hash))
-                } else {
-                    Ok(EntryType::Transactions(
-                        entry
-                            .transactions
-                            .into_par_iter()
-                            .map(verify.as_ref())
-                            .collect::<Result<Vec<_>>>()?,
-                    ))
-                }
-            })
-            .collect()
-    })
-}
+    let verified_transactions = entry
+        .transactions
+        .into_iter()
+        .map(|versioned_tx| {
+            let num_signers = usize::from(versioned_tx.message.header().num_required_signatures);
+            let static_account_keys = versioned_tx.message.static_account_keys();
+            if static_account_keys.len() < num_signers {
+                return Err(TransactionError::SanitizeFailure);
+            }
+            let signatures = versioned_tx.signatures.iter().copied().collect();
+            let signer_pubkeys = static_account_keys[..num_signers].iter().copied().collect();
+            let serialized_message = versioned_tx.message.serialize();
+            let verified_transaction = verify(versioned_tx, &serialized_message)?;
+            let message_hash = *verified_transaction.message_hash();
+            unverified_signatures.signatures.push(TxVerificationData {
+                is_simple_vote: verified_transaction.is_simple_vote_transaction(),
+                signatures,
+                message_hash,
+                serialized_message,
+                signer_pubkeys,
+            });
 
-pub fn start_verify_transactions<Tx: TransactionWithMeta + Send + Sync + 'static>(
-    entries: Vec<Entry>,
-    skip_verification: bool,
-    thread_pool: &ThreadPool,
-    verify_recyclers: VerifyRecyclers,
-    verify: Arc<
-        dyn Fn(VersionedTransaction, TransactionVerificationMode) -> Result<Tx> + Send + Sync,
-    >,
-) -> Result<EntrySigVerificationState<Tx>> {
-    let api = perf_libs::api();
-
-    // Use the CPU if we have too few transactions for GPU signature verification to be worth it.
-    // We will also use the CPU if no acceleration API is used or if we're skipping
-    // the signature verification as we'd have nothing to do on the GPU in that case.
-    // TODO: make the CPU-to GPU crossover point dynamic, perhaps based on similar future
-    // heuristics to what might be used in sigverify::ed25519_verify when a dynamic crossover
-    // is introduced for that function (see TODO in sigverify::ed25519_verify)
-    let use_cpu = skip_verification
-        || api.is_none()
-        || entries
-            .iter()
-            .try_fold(0, |accum: usize, entry: &Entry| -> Option<usize> {
-                if accum.saturating_add(entry.transactions.len()) < 512 {
-                    Some(accum.saturating_add(entry.transactions.len()))
-                } else {
-                    None
-                }
-            })
-            .is_some();
-
-    if use_cpu {
-        start_verify_transactions_cpu(entries, skip_verification, thread_pool, verify)
-    } else {
-        start_verify_transactions_gpu(entries, verify_recyclers, thread_pool, verify)
-    }
-}
-
-fn start_verify_transactions_cpu<Tx: TransactionWithMeta + Send + Sync + 'static>(
-    entries: Vec<Entry>,
-    skip_verification: bool,
-    thread_pool: &ThreadPool,
-    verify: Arc<
-        dyn Fn(VersionedTransaction, TransactionVerificationMode) -> Result<Tx> + Send + Sync,
-    >,
-) -> Result<EntrySigVerificationState<Tx>> {
-    let verify_func = {
-        let mode = if skip_verification {
-            TransactionVerificationMode::HashOnly
-        } else {
-            TransactionVerificationMode::FullVerification
-        };
-
-        move |versioned_tx| verify(versioned_tx, mode)
-    };
-
-    let entries = verify_transactions(entries, thread_pool, Arc::new(verify_func))?;
-
-    Ok(EntrySigVerificationState {
-        verification_status: EntryVerificationStatus::Success,
-        entries: Some(entries),
-        device_verification_data: DeviceSigVerificationData::Cpu(),
-        gpu_verify_duration_us: 0,
-    })
-}
-
-fn start_verify_transactions_gpu<Tx: TransactionWithMeta + Send + Sync + 'static>(
-    entries: Vec<Entry>,
-    verify_recyclers: VerifyRecyclers,
-    thread_pool: &ThreadPool,
-    verify: Arc<
-        dyn Fn(VersionedTransaction, TransactionVerificationMode) -> Result<Tx> + Send + Sync,
-    >,
-) -> Result<EntrySigVerificationState<Tx>> {
-    let verify_func = {
-        move |versioned_tx: VersionedTransaction| -> Result<Tx> {
-            verify(versioned_tx, TransactionVerificationMode::HashOnly)
-        }
-    };
-
-    let entries = verify_transactions(entries, thread_pool, Arc::new(verify_func))?;
-
-    let transactions = entries
-        .iter()
-        .filter_map(|entry_type| match entry_type {
-            EntryType::Tick(_) => None,
-            EntryType::Transactions(transactions) => Some(transactions),
+            Ok(verified_transaction)
         })
-        .flatten()
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
+    Ok(EntryType::Transactions(verified_transactions))
+}
 
-    if transactions.is_empty() {
-        return Ok(EntrySigVerificationState {
-            verification_status: EntryVerificationStatus::Success,
-            entries: Some(entries),
-            device_verification_data: DeviceSigVerificationData::Cpu(),
-            gpu_verify_duration_us: 0,
+/// Validates and hashes the transactions included in the given entries.
+///
+/// The function does NOT verify transaction signatures. The caller is expected to call
+/// `UnverifiedSignatures::verify()` on the returned `unverified_signatures`.
+pub fn validate_and_hash_transactions<Tx: TransactionWithMeta + Send + Sync, F>(
+    entries: Vec<Entry>,
+    num_txs: usize,
+    thread_pool: &ThreadPool,
+    verify: F,
+) -> Result<ValidatedHashedTransactions<Tx>>
+where
+    F: Fn(VersionedTransaction, &[u8]) -> Result<Tx> + Send + Sync,
+{
+    const PARALLEL_VERIFY_THRESHOLD: usize = 200;
+    if num_txs < PARALLEL_VERIFY_THRESHOLD {
+        let mut unverified_signatures = UnverifiedSignatures::with_capacity(num_txs);
+        let entries = entries
+            .into_iter()
+            .map(|entry| {
+                validate_and_hash_entry_transactions(entry, &verify, &mut unverified_signatures)
+            })
+            .collect::<Result<_>>()?;
+        return Ok(ValidatedHashedTransactions {
+            entries,
+            unverified_signatures,
         });
     }
 
-    let packet_batches = thread_pool.install(|| {
-        transactions
-            .par_chunks(PACKETS_PER_BATCH)
-            .map(|transaction_chunk| {
-                let num_transactions = transaction_chunk.len();
-                let mut packet_batch = PinnedPacketBatch::new_with_recycler(
-                    &verify_recyclers.packet_recycler,
-                    num_transactions,
-                    "entry-sig-verify",
-                );
-                // We use set_len here instead of resize(num_txs, Packet::default()), to save
-                // memory bandwidth and avoid writing a large amount of data that will be overwritten
-                // soon afterwards. As well, Packet::default() actually leaves the packet data
-                // uninitialized, so the initialization would simply write junk into
-                // the vector anyway.
-                unsafe {
-                    packet_batch.set_len(num_transactions);
-                }
-                let transaction_iter = transaction_chunk
-                    .iter()
-                    .map(|tx| tx.to_versioned_transaction());
-
-                let res = packet_batch
-                    .iter_mut()
-                    .zip(transaction_iter)
-                    .all(|(packet, tx)| {
-                        *packet.meta_mut() = Meta::default();
-                        Packet::populate_packet(packet, None, &tx).is_ok()
-                    });
-                if res {
-                    Ok(PacketBatch::from(packet_batch))
-                } else {
-                    Err(TransactionError::SanitizeFailure)
-                }
+    let verified = thread_pool.install(|| {
+        entries
+            .into_par_iter()
+            .map(|entry| {
+                let mut unverified_signatures =
+                    UnverifiedSignatures::with_capacity(entry.transactions.len());
+                let verified_entry = validate_and_hash_entry_transactions(
+                    entry,
+                    &verify,
+                    &mut unverified_signatures,
+                )?;
+                Ok((verified_entry, unverified_signatures))
             })
             .collect::<Result<Vec<_>>>()
-    });
-    let mut packet_batches = packet_batches?;
+    })?;
 
-    let tx_offset_recycler = verify_recyclers.tx_offset_recycler;
-    let out_recycler = verify_recyclers.out_recycler;
-    let num_packets = transactions.len();
-    let gpu_verify_thread = thread::Builder::new()
-        .name("solGpuSigVerify".into())
-        .spawn(move || {
-            let mut verify_time = Measure::start("sigverify");
-            sigverify::ed25519_verify(
-                &mut packet_batches,
-                &tx_offset_recycler,
-                &out_recycler,
-                false,
-                num_packets,
-            );
-            let verified = packet_batches
-                .iter()
-                .all(|batch| batch.iter().all(|p| !p.meta().discard()));
-            verify_time.stop();
-            (verified, verify_time.as_us())
-        })
-        .unwrap();
-
-    Ok(EntrySigVerificationState {
-        verification_status: EntryVerificationStatus::Pending,
-        entries: Some(entries),
-        device_verification_data: DeviceSigVerificationData::Gpu(GpuSigVerificationData {
-            thread_h: Some(gpu_verify_thread),
-        }),
-        gpu_verify_duration_us: 0,
+    let mut entries = Vec::with_capacity(verified.len());
+    let mut unverified_signatures = UnverifiedSignatures::with_capacity(num_txs);
+    for (entry, mut tx_unverified_signatures) in verified {
+        entries.push(entry);
+        unverified_signatures
+            .signatures
+            .append(&mut tx_unverified_signatures.signatures);
+    }
+    Ok(ValidatedHashedTransactions {
+        entries,
+        unverified_signatures,
     })
 }
 
-fn compare_hashes(computed_hash: Hash, ref_entry: &Entry) -> bool {
-    let actual = if !ref_entry.transactions.is_empty() {
-        let tx_hash = hash_transactions(&ref_entry.transactions);
+fn compare_hashes(computed_hash: Hash, ref_entry: &EntryVerificationData) -> bool {
+    let actual = if ref_entry.num_transactions != 0 {
+        let tx_hash = hash_signatures(&ref_entry.signatures);
         let mut poh = Poh::new(computed_hash, None);
         poh.record(tx_hash).unwrap().hash
     } else if ref_entry.num_hashes > 0 {
@@ -609,28 +479,156 @@ fn compare_hashes(computed_hash: Hash, ref_entry: &Entry) -> bool {
     actual == ref_entry.hash
 }
 
+pub fn verify_entries_cpu_in_pool(
+    entries: &[EntryVerificationData],
+    start_hash: &Hash,
+    thread_pool: &ThreadPool,
+) -> EntryVerificationState {
+    thread_pool.install(|| verify_entries_cpu(entries, start_hash))
+}
+
+fn verify_entries_cpu_generic(
+    entries: &[EntryVerificationData],
+    start_hash: &Hash,
+) -> EntryVerificationState {
+    let now = Instant::now();
+    let genesis = [EntryVerificationData {
+        num_hashes: 0,
+        hash: *start_hash,
+        num_transactions: 0,
+        signatures: Vec::new(),
+    }];
+    let entry_pairs = genesis.par_iter().chain(entries).zip(entries);
+    let res = entry_pairs.all(|(x0, x1)| {
+        let r = x1.verify(&x0.hash);
+        if !r {
+            warn!(
+                "entry invalid!: x0: {:?}, x1: {:?} num txs: {}",
+                x0.hash, x1.hash, x1.num_transactions
+            );
+        }
+        r
+    });
+    let poh_duration_us = now.elapsed().as_micros() as u64;
+    EntryVerificationState {
+        verification_status: res,
+        poh_duration_us,
+    }
+}
+
+fn verify_entries_cpu_x86_simd(
+    entries: &[EntryVerificationData],
+    start_hash: &Hash,
+    simd_len: usize,
+) -> EntryVerificationState {
+    use solana_hash::HASH_BYTES;
+    let now = Instant::now();
+    let genesis = [EntryVerificationData {
+        num_hashes: 0,
+        hash: *start_hash,
+        num_transactions: 0,
+        signatures: Vec::new(),
+    }];
+
+    let aligned_len = entries.len().div_ceil(simd_len) * simd_len;
+    let mut hashes_bytes = vec![0u8; HASH_BYTES * aligned_len];
+    genesis
+        .iter()
+        .chain(entries)
+        .enumerate()
+        .for_each(|(i, entry)| {
+            if i < entries.len() {
+                let start = i * HASH_BYTES;
+                let end = start + HASH_BYTES;
+                hashes_bytes[start..end].copy_from_slice(&entry.hash.to_bytes());
+            }
+        });
+    let mut hashes_chunked: Vec<_> = hashes_bytes.chunks_mut(simd_len * HASH_BYTES).collect();
+
+    let mut num_hashes: Vec<u64> = entries
+        .iter()
+        .map(|entry| entry.num_hashes.saturating_sub(1))
+        .collect();
+    num_hashes.resize(aligned_len, 0);
+    let num_hashes: Vec<_> = num_hashes.chunks(simd_len).collect();
+
+    let res = hashes_chunked
+        .par_iter_mut()
+        .zip(num_hashes)
+        .enumerate()
+        .all(|(i, (chunk, num_hashes))| {
+            match simd_len {
+                8 => unsafe {
+                    (api().unwrap().poh_verify_many_simd_avx2)(
+                        chunk.as_mut_ptr(),
+                        num_hashes.as_ptr(),
+                    );
+                },
+                16 => unsafe {
+                    (api().unwrap().poh_verify_many_simd_avx512skx)(
+                        chunk.as_mut_ptr(),
+                        num_hashes.as_ptr(),
+                    );
+                },
+                _ => {
+                    panic!("unsupported simd len: {simd_len}");
+                }
+            }
+            let entry_start = i * simd_len;
+            // The last chunk may produce indexes larger than what we have in the reference entries
+            // because it is aligned to simd_len.
+            let entry_end = std::cmp::min(entry_start + simd_len, entries.len());
+            entries[entry_start..entry_end]
+                .iter()
+                .enumerate()
+                .all(|(j, ref_entry)| {
+                    let start = j * HASH_BYTES;
+                    let end = start + HASH_BYTES;
+                    let hash = <[u8; HASH_BYTES]>::try_from(&chunk[start..end])
+                        .map(Hash::new_from_array)
+                        .unwrap();
+                    compare_hashes(hash, ref_entry)
+                })
+        });
+    let poh_duration_us = now.elapsed().as_micros() as u64;
+    EntryVerificationState {
+        verification_status: res,
+        poh_duration_us,
+    }
+}
+
+pub fn verify_entries_cpu(
+    entries: &[EntryVerificationData],
+    start_hash: &Hash,
+) -> EntryVerificationState {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let (has_avx2, has_avx512) = (
+        is_x86_feature_detected!("avx2"),
+        is_x86_feature_detected!("avx512f"),
+    );
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let (has_avx2, has_avx512) = (false, false);
+
+    if api().is_some() {
+        if has_avx512 && entries.len() >= 128 {
+            verify_entries_cpu_x86_simd(entries, start_hash, 16)
+        } else if has_avx2 && entries.len() >= 48 {
+            verify_entries_cpu_x86_simd(entries, start_hash, 8)
+        } else {
+            verify_entries_cpu_generic(entries, start_hash)
+        }
+    } else {
+        verify_entries_cpu_generic(entries, start_hash)
+    }
+}
+
 // an EntrySlice is a slice of Entries
 pub trait EntrySlice {
     /// Verifies the hashes and counts of a slice of transactions are all consistent.
-    fn verify_cpu(&self, start_hash: &Hash, thread_pool: &ThreadPool) -> EntryVerificationState;
-    fn verify_cpu_generic(
-        &self,
-        start_hash: &Hash,
-        thread_pool: &ThreadPool,
-    ) -> EntryVerificationState;
-    fn verify_cpu_x86_simd(
-        &self,
-        start_hash: &Hash,
-        simd_len: usize,
-        thread_pool: &ThreadPool,
-    ) -> EntryVerificationState;
-    fn start_verify(
-        &self,
-        start_hash: &Hash,
-        thread_pool: &ThreadPool,
-        recyclers: VerifyRecyclers,
-    ) -> EntryVerificationState;
-    fn verify(&self, start_hash: &Hash, thread_pool: &ThreadPool) -> bool;
+    fn verify_cpu(&self, start_hash: &Hash) -> EntryVerificationState;
+    fn verify_cpu_generic(&self, start_hash: &Hash) -> EntryVerificationState;
+    fn verify_cpu_x86_simd(&self, start_hash: &Hash, simd_len: usize) -> EntryVerificationState;
+    fn verify(&self, start_hash: &Hash, thread_pool: &ThreadPool) -> EntryVerificationState;
     /// Checks that each entry tick has the correct number of hashes. Entry slices do not
     /// necessarily end in a tick, so `tick_hash_count` is used to carry over the hash count
     /// for the next entry slice.
@@ -640,251 +638,24 @@ pub trait EntrySlice {
 }
 
 impl EntrySlice for [Entry] {
-    fn verify(&self, start_hash: &Hash, thread_pool: &ThreadPool) -> bool {
-        self.start_verify(start_hash, thread_pool, VerifyRecyclers::default())
-            .finish_verify(thread_pool)
+    fn verify(&self, start_hash: &Hash, thread_pool: &ThreadPool) -> EntryVerificationState {
+        let verification_entries = entries_to_verification_data(self);
+        verify_entries_cpu_in_pool(&verification_entries, start_hash, thread_pool)
     }
 
-    fn verify_cpu_generic(
-        &self,
-        start_hash: &Hash,
-        thread_pool: &ThreadPool,
-    ) -> EntryVerificationState {
-        let now = Instant::now();
-        let genesis = [Entry {
-            num_hashes: 0,
-            hash: *start_hash,
-            transactions: vec![],
-        }];
-        let entry_pairs = genesis.par_iter().chain(self).zip(self);
-        let res = thread_pool.install(|| {
-            entry_pairs.all(|(x0, x1)| {
-                let r = x1.verify(&x0.hash);
-                if !r {
-                    warn!(
-                        "entry invalid!: x0: {:?}, x1: {:?} num txs: {}",
-                        x0.hash,
-                        x1.hash,
-                        x1.transactions.len()
-                    );
-                }
-                r
-            })
-        });
-        let poh_duration_us = now.elapsed().as_micros() as u64;
-        EntryVerificationState {
-            verification_status: if res {
-                EntryVerificationStatus::Success
-            } else {
-                EntryVerificationStatus::Failure
-            },
-            poh_duration_us,
-            device_verification_data: DeviceVerificationData::Cpu(),
-        }
+    fn verify_cpu_generic(&self, start_hash: &Hash) -> EntryVerificationState {
+        let verification_entries = entries_to_verification_data(self);
+        verify_entries_cpu_generic(&verification_entries, start_hash)
     }
 
-    fn verify_cpu_x86_simd(
-        &self,
-        start_hash: &Hash,
-        simd_len: usize,
-        thread_pool: &ThreadPool,
-    ) -> EntryVerificationState {
-        use solana_hash::HASH_BYTES;
-        let now = Instant::now();
-        let genesis = [Entry {
-            num_hashes: 0,
-            hash: *start_hash,
-            transactions: vec![],
-        }];
-
-        let aligned_len = self.len().div_ceil(simd_len) * simd_len;
-        let mut hashes_bytes = vec![0u8; HASH_BYTES * aligned_len];
-        genesis
-            .iter()
-            .chain(self)
-            .enumerate()
-            .for_each(|(i, entry)| {
-                if i < self.len() {
-                    let start = i * HASH_BYTES;
-                    let end = start + HASH_BYTES;
-                    hashes_bytes[start..end].copy_from_slice(&entry.hash.to_bytes());
-                }
-            });
-        let mut hashes_chunked: Vec<_> = hashes_bytes.chunks_mut(simd_len * HASH_BYTES).collect();
-
-        let mut num_hashes: Vec<u64> = self
-            .iter()
-            .map(|entry| entry.num_hashes.saturating_sub(1))
-            .collect();
-        num_hashes.resize(aligned_len, 0);
-        let num_hashes: Vec<_> = num_hashes.chunks(simd_len).collect();
-
-        let res = thread_pool.install(|| {
-            hashes_chunked
-                .par_iter_mut()
-                .zip(num_hashes)
-                .enumerate()
-                .all(|(i, (chunk, num_hashes))| {
-                    match simd_len {
-                        8 => unsafe {
-                            (api().unwrap().poh_verify_many_simd_avx2)(
-                                chunk.as_mut_ptr(),
-                                num_hashes.as_ptr(),
-                            );
-                        },
-                        16 => unsafe {
-                            (api().unwrap().poh_verify_many_simd_avx512skx)(
-                                chunk.as_mut_ptr(),
-                                num_hashes.as_ptr(),
-                            );
-                        },
-                        _ => {
-                            panic!("unsupported simd len: {simd_len}");
-                        }
-                    }
-                    let entry_start = i * simd_len;
-                    // The last chunk may produce indexes larger than what we have in the reference entries
-                    // because it is aligned to simd_len.
-                    let entry_end = std::cmp::min(entry_start + simd_len, self.len());
-                    self[entry_start..entry_end]
-                        .iter()
-                        .enumerate()
-                        .all(|(j, ref_entry)| {
-                            let start = j * HASH_BYTES;
-                            let end = start + HASH_BYTES;
-                            let hash = <[u8; HASH_BYTES]>::try_from(&chunk[start..end])
-                                .map(Hash::new_from_array)
-                                .unwrap();
-                            compare_hashes(hash, ref_entry)
-                        })
-                })
-        });
-        let poh_duration_us = now.elapsed().as_micros() as u64;
-        EntryVerificationState {
-            verification_status: if res {
-                EntryVerificationStatus::Success
-            } else {
-                EntryVerificationStatus::Failure
-            },
-            poh_duration_us,
-            device_verification_data: DeviceVerificationData::Cpu(),
-        }
+    fn verify_cpu_x86_simd(&self, start_hash: &Hash, simd_len: usize) -> EntryVerificationState {
+        let verification_entries = entries_to_verification_data(self);
+        verify_entries_cpu_x86_simd(&verification_entries, start_hash, simd_len)
     }
 
-    fn verify_cpu(&self, start_hash: &Hash, thread_pool: &ThreadPool) -> EntryVerificationState {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let (has_avx2, has_avx512) = (
-            is_x86_feature_detected!("avx2"),
-            is_x86_feature_detected!("avx512f"),
-        );
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        let (has_avx2, has_avx512) = (false, false);
-
-        if api().is_some() {
-            if has_avx512 && self.len() >= 128 {
-                self.verify_cpu_x86_simd(start_hash, 16, thread_pool)
-            } else if has_avx2 && self.len() >= 48 {
-                self.verify_cpu_x86_simd(start_hash, 8, thread_pool)
-            } else {
-                self.verify_cpu_generic(start_hash, thread_pool)
-            }
-        } else {
-            self.verify_cpu_generic(start_hash, thread_pool)
-        }
-    }
-
-    fn start_verify(
-        &self,
-        start_hash: &Hash,
-        thread_pool: &ThreadPool,
-        recyclers: VerifyRecyclers,
-    ) -> EntryVerificationState {
-        let start = Instant::now();
-        let Some(api) = perf_libs::api() else {
-            return self.verify_cpu(start_hash, thread_pool);
-        };
-        inc_new_counter_info!("entry_verify-num_entries", self.len());
-
-        let genesis = [Entry {
-            num_hashes: 0,
-            hash: *start_hash,
-            transactions: vec![],
-        }];
-
-        let hashes: Vec<Hash> = genesis
-            .iter()
-            .chain(self)
-            .map(|entry| entry.hash)
-            .take(self.len())
-            .collect();
-
-        let mut hashes_pinned = recyclers.hash_recycler.allocate("poh_verify_hash");
-        hashes_pinned.set_pinnable();
-        hashes_pinned.resize(hashes.len(), Hash::default());
-        hashes_pinned.copy_from_slice(&hashes);
-
-        let mut num_hashes_vec = recyclers
-            .tick_count_recycler
-            .allocate("poh_verify_num_hashes");
-        num_hashes_vec.reserve_and_pin(cmp::max(1, self.len()));
-        for entry in self {
-            num_hashes_vec.push(entry.num_hashes.saturating_sub(1));
-        }
-
-        let length = self.len();
-        let hashes = Arc::new(Mutex::new(hashes_pinned));
-        let hashes_clone = hashes.clone();
-
-        let gpu_verify_thread = thread::Builder::new()
-            .name("solGpuPohVerify".into())
-            .spawn(move || {
-                let mut hashes = hashes_clone.lock().unwrap();
-                let gpu_wait = Instant::now();
-                let res;
-                unsafe {
-                    res = (api.poh_verify_many)(
-                        hashes.as_mut_ptr() as *mut u8,
-                        num_hashes_vec.as_ptr(),
-                        length,
-                        1,
-                    );
-                }
-                assert!(res == 0, "GPU PoH verify many failed");
-                inc_new_counter_info!(
-                    "entry_verify-gpu_thread",
-                    gpu_wait.elapsed().as_micros() as usize
-                );
-                gpu_wait.elapsed().as_micros() as u64
-            })
-            .unwrap();
-
-        let verifications = thread_pool.install(|| {
-            self.into_par_iter()
-                .map(|entry| {
-                    let answer = entry.hash;
-                    let action = if entry.transactions.is_empty() {
-                        if entry.num_hashes == 0 {
-                            VerifyAction::None
-                        } else {
-                            VerifyAction::Tick
-                        }
-                    } else {
-                        VerifyAction::Mixin(hash_transactions(&entry.transactions))
-                    };
-                    (action, answer)
-                })
-                .collect()
-        });
-        let device_verification_data = DeviceVerificationData::Gpu(GpuVerificationData {
-            thread_h: Some(gpu_verify_thread),
-            verifications: Some(verifications),
-            hashes: Some(hashes),
-        });
-        EntryVerificationState {
-            verification_status: EntryVerificationStatus::Pending,
-            poh_duration_us: start.elapsed().as_micros() as u64,
-            device_verification_data,
-        }
+    fn verify_cpu(&self, start_hash: &Hash) -> EntryVerificationState {
+        let verification_entries = entries_to_verification_data(self);
+        verify_entries_cpu(&verification_entries, start_hash)
     }
 
     fn verify_tick_hash_count(&self, tick_hash_count: &mut u64, hashes_per_tick: u64) -> bool {
@@ -924,15 +695,6 @@ pub fn create_ticks(num_ticks: u64, hashes_per_tick: u64, mut hash: Hash) -> Vec
     repeat_with(|| next_entry_mut(&mut hash, hashes_per_tick, vec![]))
         .take(num_ticks as usize)
         .collect()
-}
-
-pub fn create_random_ticks(num_ticks: u64, max_hashes_per_tick: u64, mut hash: Hash) -> Vec<Entry> {
-    repeat_with(|| {
-        let hashes_per_tick = thread_rng().gen_range(1..max_hashes_per_tick);
-        next_entry_mut(&mut hash, hashes_per_tick, vec![])
-    })
-    .take(num_ticks as usize)
-    .collect()
 }
 
 /// Creates the next Tick or Transaction Entry `num_hashes` after `start_hash`.
@@ -981,10 +743,13 @@ mod tests {
     use {
         super::*,
         agave_reserved_account_keys::ReservedAccountKeys,
+        rand::{Rng, rng},
+        rayon::ThreadPoolBuilder,
         solana_hash::Hash,
         solana_keypair::Keypair,
+        solana_measure::measure::Measure,
         solana_message::SimpleAddressLoader,
-        solana_perf::test_tx::{test_invalid_tx, test_tx},
+        solana_perf::test_tx::test_tx,
         solana_pubkey::Pubkey,
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_sha256_hasher::hash,
@@ -996,6 +761,15 @@ mod tests {
         },
         solana_transaction_error::TransactionResult as Result,
     };
+
+    fn create_random_ticks(num_ticks: u64, max_hashes_per_tick: u64, mut hash: Hash) -> Vec<Entry> {
+        repeat_with(|| {
+            let hashes_per_tick = rng().random_range(1..max_hashes_per_tick);
+            next_entry_mut(&mut hash, hashes_per_tick, vec![])
+        })
+        .take(num_ticks as usize)
+        .collect()
+    }
 
     #[test]
     fn test_entry_verify() {
@@ -1010,121 +784,102 @@ mod tests {
     fn test_verify_transactions<Tx: TransactionWithMeta + Send + Sync + 'static>(
         entries: Vec<Entry>,
         skip_verification: bool,
-        verify_recyclers: VerifyRecyclers,
         thread_pool: &ThreadPool,
-        verify: Arc<
-            dyn Fn(VersionedTransaction, TransactionVerificationMode) -> Result<Tx> + Send + Sync,
-        >,
+        verify: impl Fn(VersionedTransaction, &[u8]) -> Result<Tx> + Send + Sync,
     ) -> bool {
-        let verify_func = {
-            let verify = verify.clone();
-            let verification_mode = if skip_verification {
-                TransactionVerificationMode::HashOnly
-            } else {
-                TransactionVerificationMode::FullVerification
-            };
-            move |versioned_tx: VersionedTransaction| -> Result<Tx> {
-                verify(versioned_tx, verification_mode)
-            }
+        let num_txs = entries.iter().map(|entry| entry.transactions.len()).sum();
+        let txs = validate_and_hash_transactions(entries, num_txs, thread_pool, verify);
+        let Ok(txs) = txs else {
+            return false;
         };
-
-        let cpu_verify_result =
-            verify_transactions(entries.clone(), thread_pool, Arc::new(verify_func));
-        let mut gpu_verify_result: EntrySigVerificationState<Tx> = {
-            let verify_result = start_verify_transactions(
-                entries,
-                skip_verification,
-                thread_pool,
-                verify_recyclers,
-                verify,
-            );
-            match verify_result {
-                Ok(res) => res,
-                _ => EntrySigVerificationState {
-                    verification_status: EntryVerificationStatus::Failure,
-                    entries: None,
-                    device_verification_data: DeviceSigVerificationData::Cpu(),
-                    gpu_verify_duration_us: 0,
-                },
-            }
-        };
-
-        match cpu_verify_result {
-            Ok(_) => {
-                assert!(gpu_verify_result.verification_status != EntryVerificationStatus::Failure);
-                assert!(gpu_verify_result.finish_verify());
-                true
-            }
-            _ => {
-                assert!(
-                    gpu_verify_result.verification_status == EntryVerificationStatus::Failure
-                        || !gpu_verify_result.finish_verify()
-                );
-                false
-            }
-        }
+        skip_verification || txs.unverified_signatures.verify().is_ok()
     }
 
     #[test]
-    fn test_entry_gpu_verify() {
-        let thread_pool = thread_pool_for_tests();
+    fn test_entry_transaction_verify() {
+        let zero = Hash::default();
 
+        // First, verify entries
+        let keypair = Keypair::new();
+        let tx0 = system_transaction::transfer(&keypair, &keypair.pubkey(), 0, zero);
+        let tx1 = system_transaction::transfer(&keypair, &keypair.pubkey(), 1, zero);
+        let e0 = Entry::new(&zero, 0, vec![tx0, tx1]);
+        assert!(e0.verify(&zero));
+        let tx2 = system_transaction::transfer(&keypair, &keypair.pubkey(), 2, zero);
+        let tx3 = system_transaction::transfer(&keypair, &keypair.pubkey(), 3, zero);
+        let e1 = Entry::new(&zero, 0, vec![tx2, tx3]);
+        assert!(e1.verify(&zero));
+
+        let es = vec![e0, e1];
+        let thread_pool = ThreadPoolBuilder::new().build().unwrap();
+
+        // Next, verify entry slice
         let verify_transaction = {
             move |versioned_tx: VersionedTransaction,
-                  verification_mode: TransactionVerificationMode|
+                  message_bytes: &[u8]|
                   -> Result<RuntimeTransaction<SanitizedTransaction>> {
-                let sanitized_tx = {
-                    let message_hash =
-                        if verification_mode == TransactionVerificationMode::FullVerification {
-                            versioned_tx.verify_and_hash_message()?
-                        } else {
-                            versioned_tx.message.hash()
-                        };
-
-                    RuntimeTransaction::try_create(
-                        versioned_tx,
-                        MessageHash::Precomputed(message_hash),
-                        None,
-                        SimpleAddressLoader::Disabled,
-                        &ReservedAccountKeys::empty_key_set(),
-                        true,
-                    )
-                }?;
-
-                Ok(sanitized_tx)
+                RuntimeTransaction::try_create(
+                    versioned_tx,
+                    MessageHash::Precomputed(solana_message::VersionedMessage::hash_raw_message(
+                        message_bytes,
+                    )),
+                    None,
+                    SimpleAddressLoader::Disabled,
+                    &ReservedAccountKeys::empty_key_set(),
+                    true,
+                    true,
+                )
             }
         };
 
-        let recycler = VerifyRecyclers::default();
-
-        // Make sure we test with a number of transactions that's not a multiple of PACKETS_PER_BATCH
-        let entries_invalid = (0..1025)
-            .map(|_| {
-                let transaction = test_invalid_tx();
-                next_entry_mut(&mut Hash::default(), 0, vec![transaction])
-            })
-            .collect::<Vec<_>>();
-
-        let entries_valid = (0..1025)
-            .map(|_| {
-                let transaction = test_tx();
-                next_entry_mut(&mut Hash::default(), 0, vec![transaction])
-            })
-            .collect::<Vec<_>>();
-
-        assert!(!test_verify_transactions(
-            entries_invalid,
-            false,
-            recycler.clone(),
-            &thread_pool,
-            Arc::new(verify_transaction)
-        ));
         assert!(test_verify_transactions(
-            entries_valid,
+            es,
             false,
-            recycler,
             &thread_pool,
-            Arc::new(verify_transaction)
+            verify_transaction
+        ));
+    }
+
+    #[test]
+    fn test_validate_and_hash_transactions_and_signatures() {
+        let thread_pool = ThreadPoolBuilder::new().build().unwrap();
+        let zero = Hash::default();
+        let keypair = Keypair::new();
+        let tx = system_transaction::transfer(&keypair, &keypair.pubkey(), 1, zero);
+        let entries = vec![Entry::new(&zero, 0, vec![tx])];
+
+        let validate_and_hash_transaction =
+            move |versioned_tx: VersionedTransaction,
+                  message_bytes: &[u8]|
+                  -> Result<RuntimeTransaction<SanitizedTransaction>> {
+                RuntimeTransaction::try_create(
+                    versioned_tx,
+                    MessageHash::Precomputed(solana_message::VersionedMessage::hash_raw_message(
+                        message_bytes,
+                    )),
+                    None,
+                    SimpleAddressLoader::Disabled,
+                    &ReservedAccountKeys::empty_key_set(),
+                    true,
+                    true,
+                )
+            };
+        let txs =
+            validate_and_hash_transactions(entries, 1, &thread_pool, validate_and_hash_transaction)
+                .expect("transaction validation and hashing must not verify signatures");
+        assert_eq!(txs.entries.len(), 1);
+        assert!(txs.unverified_signatures.verify().is_ok());
+
+        let mut tx = system_transaction::transfer(&keypair, &keypair.pubkey(), 1, zero);
+        tx.signatures[0] = solana_signature::Signature::default();
+        let entries = vec![Entry::new(&zero, 0, vec![tx])];
+        let txs =
+            validate_and_hash_transactions(entries, 1, &thread_pool, validate_and_hash_transaction)
+                .expect("transaction validation and hashing must not verify signatures");
+        assert_eq!(txs.entries.len(), 1);
+        assert!(matches!(
+            txs.unverified_signatures.verify(),
+            Err(solana_transaction_error::TransactionError::SignatureFailure)
         ));
     }
 
@@ -1158,27 +913,27 @@ mod tests {
 
         // Verify entry with 2 transactions
         let mut e0 = [Entry::new(&zero, 0, vec![tx0, tx1])];
-        assert!(e0.verify(&zero, &thread_pool));
+        assert!(e0.verify(&zero, &thread_pool).status());
 
         // Clear signature of the first transaction, see that it does not verify
         let orig_sig = e0[0].transactions[0].signatures[0];
         e0[0].transactions[0].signatures[0] = Signature::default();
-        assert!(!e0.verify(&zero, &thread_pool));
+        assert!(!e0.verify(&zero, &thread_pool).status());
 
         // restore original signature
         e0[0].transactions[0].signatures[0] = orig_sig;
-        assert!(e0.verify(&zero, &thread_pool));
+        assert!(e0.verify(&zero, &thread_pool).status());
 
         // Resize signatures and see verification fails.
         let len = e0[0].transactions[0].signatures.len();
         e0[0].transactions[0]
             .signatures
             .resize(len - 1, Signature::default());
-        assert!(!e0.verify(&zero, &thread_pool));
+        assert!(!e0.verify(&zero, &thread_pool).status());
 
         // Pass an entry with no transactions
         let e0 = [Entry::new(&zero, 0, vec![])];
-        assert!(e0.verify(&zero, &thread_pool));
+        assert!(e0.verify(&zero, &thread_pool).status());
     }
 
     #[test]
@@ -1216,18 +971,30 @@ mod tests {
         let zero = Hash::default();
         let one = hash(zero.as_ref());
         // base case
-        assert!(vec![][..].verify(&zero, &thread_pool));
+        assert!(vec![][..].verify(&zero, &thread_pool).status());
         // singleton case 1
-        assert!(vec![Entry::new_tick(0, &zero)][..].verify(&zero, &thread_pool));
+        assert!(
+            vec![Entry::new_tick(0, &zero)][..]
+                .verify(&zero, &thread_pool)
+                .status()
+        );
         // singleton case 2, bad
-        assert!(!vec![Entry::new_tick(0, &zero)][..].verify(&one, &thread_pool));
+        assert!(
+            !vec![Entry::new_tick(0, &zero)][..]
+                .verify(&one, &thread_pool)
+                .status()
+        );
         // inductive step
-        assert!(vec![next_entry(&zero, 0, vec![]); 2][..].verify(&zero, &thread_pool));
+        assert!(
+            vec![next_entry(&zero, 0, vec![]); 2][..]
+                .verify(&zero, &thread_pool)
+                .status()
+        );
 
         let mut bad_ticks = vec![next_entry(&zero, 0, vec![]); 2];
         bad_ticks[1].hash = one;
         // inductive step, bad
-        assert!(!bad_ticks.verify(&zero, &thread_pool));
+        assert!(!bad_ticks.verify(&zero, &thread_pool).status());
     }
 
     #[test]
@@ -1239,22 +1006,30 @@ mod tests {
         let one = hash(zero.as_ref());
         let two = hash(one.as_ref());
         // base case
-        assert!(vec![][..].verify(&one, &thread_pool));
+        assert!(vec![][..].verify(&one, &thread_pool).status());
         // singleton case 1
-        assert!(vec![Entry::new_tick(1, &two)][..].verify(&one, &thread_pool));
+        assert!(
+            vec![Entry::new_tick(1, &two)][..]
+                .verify(&one, &thread_pool)
+                .status()
+        );
         // singleton case 2, bad
-        assert!(!vec![Entry::new_tick(1, &two)][..].verify(&two, &thread_pool));
+        assert!(
+            !vec![Entry::new_tick(1, &two)][..]
+                .verify(&two, &thread_pool)
+                .status()
+        );
 
         let mut ticks = vec![next_entry(&one, 1, vec![])];
         ticks.push(next_entry(&ticks.last().unwrap().hash, 1, vec![]));
         // inductive step
-        assert!(ticks.verify(&one, &thread_pool));
+        assert!(ticks.verify(&one, &thread_pool).status());
 
         let mut bad_ticks = vec![next_entry(&one, 1, vec![])];
         bad_ticks.push(next_entry(&bad_ticks.last().unwrap().hash, 1, vec![]));
         bad_ticks[1].hash = one;
         // inductive step, bad
-        assert!(!bad_ticks.verify(&one, &thread_pool));
+        assert!(!bad_ticks.verify(&one, &thread_pool).status());
     }
 
     #[test]
@@ -1270,11 +1045,19 @@ mod tests {
         let tx0 = system_transaction::transfer(&alice_keypair, &bob_keypair.pubkey(), 1, one);
         let tx1 = system_transaction::transfer(&bob_keypair, &alice_keypair.pubkey(), 1, one);
         // base case
-        assert!(vec![][..].verify(&one, &thread_pool));
+        assert!(vec![][..].verify(&one, &thread_pool).status());
         // singleton case 1
-        assert!(vec![next_entry(&one, 1, vec![tx0.clone()])][..].verify(&one, &thread_pool));
+        assert!(
+            vec![next_entry(&one, 1, vec![tx0.clone()])][..]
+                .verify(&one, &thread_pool)
+                .status()
+        );
         // singleton case 2, bad
-        assert!(!vec![next_entry(&one, 1, vec![tx0.clone()])][..].verify(&two, &thread_pool));
+        assert!(
+            !vec![next_entry(&one, 1, vec![tx0.clone()])][..]
+                .verify(&two, &thread_pool)
+                .status()
+        );
 
         let mut ticks = vec![next_entry(&one, 1, vec![tx0.clone()])];
         ticks.push(next_entry(
@@ -1284,13 +1067,13 @@ mod tests {
         ));
 
         // inductive step
-        assert!(ticks.verify(&one, &thread_pool));
+        assert!(ticks.verify(&one, &thread_pool).status());
 
         let mut bad_ticks = vec![next_entry(&one, 1, vec![tx0])];
         bad_ticks.push(next_entry(&bad_ticks.last().unwrap().hash, 1, vec![tx1]));
         bad_ticks[1].hash = one;
         // inductive step, bad
-        assert!(!bad_ticks.verify(&one, &thread_pool));
+        assert!(!bad_ticks.verify(&one, &thread_pool).status());
     }
 
     #[test]
@@ -1415,21 +1198,23 @@ mod tests {
         agave_logger::setup();
         for _ in 0..100 {
             let mut time = Measure::start("ticks");
-            let num_ticks = thread_rng().gen_range(1..100);
+            let num_ticks = rng().random_range(1..100);
             info!("create {num_ticks} ticks:");
             let mut entries = create_random_ticks(num_ticks, 100, Hash::default());
             time.stop();
 
             let mut modified = false;
-            if thread_rng().gen_ratio(1, 2) {
+            if rng().random_ratio(1, 2) {
                 modified = true;
-                let modify_idx = thread_rng().gen_range(0..num_ticks) as usize;
+                let modify_idx = rng().random_range(0..num_ticks) as usize;
                 entries[modify_idx].hash = hash(&[1, 2, 3]);
             }
 
             info!("done.. {time}");
             let mut time = Measure::start("poh");
-            let res = entries.verify(&Hash::default(), &thread_pool_for_tests());
+            let res = entries
+                .verify(&Hash::default(), &thread_pool_for_tests())
+                .status();
             assert_eq!(res, !modified);
             time.stop();
             info!("{time} {res}");

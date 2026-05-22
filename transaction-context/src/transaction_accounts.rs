@@ -2,8 +2,9 @@
 use qualifier_attr::qualifiers;
 use {
     crate::{
-        vm_slice::VmSlice, IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION,
-        MAX_ACCOUNT_DATA_LEN,
+        IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION, MAX_ACCOUNT_DATA_LEN,
+        vm_addresses::{GUEST_ACCOUNT_PAYLOAD_BASE_ADDRESS, GUEST_REGION_SIZE},
+        vm_slice::VmSlice,
     },
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_instruction::error::InstructionError,
@@ -15,9 +16,6 @@ use {
         sync::Arc,
     },
 };
-
-const GUEST_REGION_SIZE: u64 = 1 << 32;
-const GUEST_ACCOUNT_PAYLOAD_BASE_ADDRESS: u64 = 9 * GUEST_REGION_SIZE;
 
 /// This struct is shared with programs. Do not alter its fields.
 #[repr(C)]
@@ -32,12 +30,14 @@ struct AccountSharedFields {
 }
 
 #[derive(Debug, PartialEq)]
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 struct AccountPrivateFields {
     rent_epoch: u64,
     executable: bool,
     payload: Arc<Vec<u8>>,
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl AccountPrivateFields {
     fn payload_len(&self) -> usize {
         self.payload.len()
@@ -45,11 +45,13 @@ impl AccountPrivateFields {
 }
 
 #[derive(Debug, PartialEq)]
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 pub struct TransactionAccountView<'a> {
     abi_account: &'a AccountSharedFields,
     private_fields: &'a AccountPrivateFields,
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl ReadableAccount for TransactionAccountView<'_> {
     fn lamports(&self) -> u64 {
         self.abi_account.lamports
@@ -72,6 +74,7 @@ impl ReadableAccount for TransactionAccountView<'_> {
     }
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl PartialEq<AccountSharedData> for TransactionAccountView<'_> {
     fn eq(&self, other: &AccountSharedData) -> bool {
         other.lamports() == self.lamports()
@@ -83,11 +86,13 @@ impl PartialEq<AccountSharedData> for TransactionAccountView<'_> {
 }
 
 #[derive(Debug)]
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 pub struct TransactionAccountViewMut<'a> {
     abi_account: &'a mut AccountSharedFields,
     private_fields: &'a mut AccountPrivateFields,
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl TransactionAccountViewMut<'_> {
     fn data_mut(&mut self) -> &mut Vec<u8> {
         Arc::make_mut(&mut self.private_fields.payload)
@@ -174,6 +179,7 @@ impl TransactionAccountViewMut<'_> {
     }
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl ReadableAccount for TransactionAccountViewMut<'_> {
     fn lamports(&self) -> u64 {
         self.abi_account.lamports
@@ -196,6 +202,7 @@ impl ReadableAccount for TransactionAccountViewMut<'_> {
     }
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl WritableAccount for TransactionAccountViewMut<'_> {
     fn set_lamports(&mut self, lamports: u64) {
         self.abi_account.lamports = lamports;
@@ -233,11 +240,14 @@ impl WritableAccount for TransactionAccountViewMut<'_> {
 }
 
 /// An account key and the matching account
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 pub type KeyedAccountSharedData = (Pubkey, AccountSharedData);
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 pub(crate) type DeconstructedTransactionAccounts =
     (Vec<KeyedAccountSharedData>, Box<[Cell<bool>]>, Cell<i64>);
 
 #[derive(Debug)]
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 pub struct TransactionAccounts {
     shared_account_fields: Box<[UnsafeCell<AccountSharedFields>]>,
     private_account_fields: Box<[UnsafeCell<AccountPrivateFields>]>,
@@ -247,8 +257,8 @@ pub struct TransactionAccounts {
     lamports_delta: Cell<i128>,
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl TransactionAccounts {
-    #[cfg(not(target_os = "solana"))]
     pub(crate) fn new(accounts: Vec<KeyedAccountSharedData>) -> TransactionAccounts {
         let touched_flags = vec![Cell::new(false); accounts.len()].into_boxed_slice();
         let borrow_counters = vec![BorrowCounter::default(); accounts.len()].into_boxed_slice();
@@ -293,7 +303,6 @@ impl TransactionAccounts {
         self.shared_account_fields.len()
     }
 
-    #[cfg(not(target_os = "solana"))]
     pub fn touch(&self, index: IndexOfAccount) -> Result<(), InstructionError> {
         self.touched_flags
             .get(index as usize)
@@ -426,14 +435,14 @@ impl TransactionAccounts {
     }
 
     fn deconstruct_into_keyed_account_shared_data(&mut self) -> Vec<KeyedAccountSharedData> {
-        let mut shared_account_fields = std::mem::take(&mut self.shared_account_fields);
-        let mut private_account_fields = std::mem::take(&mut self.private_account_fields);
+        let shared_account_fields = std::mem::take(&mut self.shared_account_fields);
+        let private_account_fields = std::mem::take(&mut self.private_account_fields);
         shared_account_fields
-            .iter_mut()
-            .zip(private_account_fields.iter_mut())
+            .into_iter()
+            .zip(private_account_fields)
             .map(|(shared_fields_cell, private_fields_cell)| {
-                let shared_fields = shared_fields_cell.get_mut();
-                let private_fields = private_fields_cell.get_mut();
+                let shared_fields = shared_fields_cell.into_inner();
+                let private_fields = private_fields_cell.into_inner();
                 (
                     shared_fields.key,
                     AccountSharedData::create_from_existing_shared_data(
@@ -449,14 +458,14 @@ impl TransactionAccounts {
     }
 
     pub(crate) fn deconstruct_into_account_shared_data(&mut self) -> Vec<AccountSharedData> {
-        let mut shared_account_fields = std::mem::take(&mut self.shared_account_fields);
-        let mut private_account_fields = std::mem::take(&mut self.private_account_fields);
+        let shared_account_fields = std::mem::take(&mut self.shared_account_fields);
+        let private_account_fields = std::mem::take(&mut self.private_account_fields);
         shared_account_fields
-            .iter_mut()
-            .zip(private_account_fields.iter_mut())
+            .into_iter()
+            .zip(private_account_fields)
             .map(|(shared_fields_cell, private_fields_cell)| {
-                let shared_fields = shared_fields_cell.get_mut();
-                let private_fields = private_fields_cell.get_mut();
+                let shared_fields = shared_fields_cell.into_inner();
+                let private_fields = private_fields_cell.into_inner();
                 AccountSharedData::create_from_existing_shared_data(
                     shared_fields.lamports,
                     private_fields.payload.clone(),
@@ -497,10 +506,12 @@ impl TransactionAccounts {
 }
 
 #[derive(Default, Debug, Clone)]
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 struct BorrowCounter {
     counter: Cell<i8>,
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl BorrowCounter {
     #[inline]
     fn is_writing(&self) -> bool {
@@ -548,17 +559,20 @@ impl BorrowCounter {
     }
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 pub struct AccountRef<'a> {
     account: TransactionAccountView<'a>,
     borrow_counter: &'a BorrowCounter,
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl Drop for AccountRef<'_> {
     fn drop(&mut self) {
         self.borrow_counter.release_borrow();
     }
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl<'a> Deref for AccountRef<'a> {
     type Target = TransactionAccountView<'a>;
     fn deref(&self) -> &Self::Target {
@@ -567,11 +581,13 @@ impl<'a> Deref for AccountRef<'a> {
 }
 
 #[derive(Debug)]
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 pub struct AccountRefMut<'a> {
     account: TransactionAccountViewMut<'a>,
     borrow_counter: &'a BorrowCounter,
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl Drop for AccountRefMut<'_> {
     fn drop(&mut self) {
         // SAFETY: We are synchronizing the lengths.
@@ -585,6 +601,7 @@ impl Drop for AccountRefMut<'_> {
     }
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl<'a> Deref for AccountRefMut<'a> {
     type Target = TransactionAccountViewMut<'a>;
     fn deref(&self) -> &Self::Target {
@@ -592,13 +609,14 @@ impl<'a> Deref for AccountRefMut<'a> {
     }
 }
 
+#[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl DerefMut for AccountRefMut<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.account
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "sbf"), not(target_arch = "bpf")))]
 mod tests {
     use {
         crate::transaction_accounts::TransactionAccounts, solana_account::AccountSharedData,

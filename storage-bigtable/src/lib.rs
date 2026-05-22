@@ -1,12 +1,4 @@
-#![cfg_attr(
-    not(feature = "agave-unstable-api"),
-    deprecated(
-        since = "3.1.0",
-        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
-                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
-                acknowledge use of an interface that may break without warning."
-    )
-)]
+#![cfg(feature = "agave-unstable-api")]
 #![allow(clippy::arithmetic_side_effects)]
 
 use {
@@ -25,18 +17,19 @@ use {
     solana_transaction::versioned::VersionedTransaction,
     solana_transaction_error::TransactionError,
     solana_transaction_status::{
-        extract_and_fmt_memos, ConfirmedBlock, ConfirmedTransactionStatusWithSignature,
+        ConfirmedBlock, ConfirmedTransactionStatusWithSignature,
         ConfirmedTransactionWithStatusMeta, EntrySummary, Reward, TransactionByAddrInfo,
         TransactionConfirmationStatus, TransactionStatus, TransactionStatusMeta,
         TransactionWithStatusMeta, VersionedConfirmedBlock, VersionedConfirmedBlockWithEntries,
-        VersionedTransactionWithStatusMeta,
+        VersionedTransactionWithStatusMeta, extract_and_fmt_memos,
     },
     std::{
         collections::{HashMap, HashSet},
         convert::TryInto,
+        fmt::Debug,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     },
@@ -67,7 +60,7 @@ pub enum Error {
     BlockNotFound(Slot),
 
     #[error("Signature not found")]
-    SignatureNotFound,
+    SignatureNotFound(Signature),
 
     #[error("tokio error")]
     TokioJoinError(JoinError),
@@ -303,6 +296,7 @@ impl From<StoredConfirmedBlockReward> for Reward {
             post_balance: 0,
             reward_type: None,
             commission: None,
+            commission_bps: None,
         }
     }
 }
@@ -550,14 +544,14 @@ impl LedgerStorage {
     }
 
     // Fetches and gets a vector of confirmed blocks via a multirow fetch
-    pub async fn get_confirmed_blocks_with_data<'a>(
+    pub async fn get_confirmed_blocks_with_data(
         &self,
-        slots: &'a [Slot],
-    ) -> Result<impl Iterator<Item = (Slot, ConfirmedBlock)> + 'a> {
+        slots: impl IntoIterator<Item = Slot> + Debug,
+    ) -> Result<impl Iterator<Item = (Slot, ConfirmedBlock)>> {
         trace!("LedgerStorage::get_confirmed_blocks_with_data request received: {slots:?}");
         self.stats.increment_num_queries();
         let mut bigtable = self.connection.client();
-        let row_keys = slots.iter().copied().map(slot_to_blocks_key);
+        let row_keys = slots.into_iter().map(slot_to_blocks_key);
         let data = bigtable
             .get_protobuf_or_bincode_cells("blocks", row_keys)
             .await?
@@ -613,7 +607,10 @@ impl LedgerStorage {
     }
 
     /// Fetches a vector of block entries via a multirow fetch
-    pub async fn get_entries(&self, slot: Slot) -> Result<impl Iterator<Item = EntrySummary>> {
+    pub async fn get_entries(
+        &self,
+        slot: Slot,
+    ) -> Result<impl Iterator<Item = EntrySummary> + use<>> {
         trace!("LedgerStorage::get_block_entries request received: {slot:?}");
         self.stats.increment_num_queries();
         let mut bigtable = self.connection.client();
@@ -636,7 +633,7 @@ impl LedgerStorage {
             .get_bincode_cell::<TransactionInfo>("tx", signature.to_string())
             .await
             .map_err(|err| match err {
-                bigtable::Error::RowNotFound => Error::SignatureNotFound,
+                bigtable::Error::RowNotFound => Error::SignatureNotFound(*signature),
                 _ => err.into(),
             })?;
         Ok(transaction_info.into())
@@ -669,7 +666,7 @@ impl LedgerStorage {
 
         // Fetch blocks
         let blocks = self
-            .get_confirmed_blocks_with_data(&slots.into_iter().collect::<Vec<_>>())
+            .get_confirmed_blocks_with_data(slots)
             .await?
             .collect::<HashMap<_, _>>();
 
@@ -693,6 +690,7 @@ impl LedgerStorage {
                                     slot,
                                     tx_with_meta: tx_with_meta.clone(),
                                     block_time: block.block_time,
+                                    index,
                                 })
                             }
                         })
@@ -715,7 +713,7 @@ impl LedgerStorage {
             .get_bincode_cell("tx", signature.to_string())
             .await
             .map_err(|err| match err {
-                bigtable::Error::RowNotFound => Error::SignatureNotFound,
+                bigtable::Error::RowNotFound => Error::SignatureNotFound(*signature),
                 _ => err.into(),
             })?;
 
@@ -736,6 +734,7 @@ impl LedgerStorage {
                         slot,
                         tx_with_meta,
                         block_time: block.block_time,
+                        index,
                     }))
                 }
             }
@@ -773,7 +772,7 @@ impl LedgerStorage {
                     .get_bincode_cell("tx", before_signature.to_string())
                     .await
                     .map_err(|err| match err {
-                        bigtable::Error::RowNotFound => Error::SignatureNotFound,
+                        bigtable::Error::RowNotFound => Error::SignatureNotFound(*before_signature),
                         _ => err.into(),
                     })?;
 
@@ -789,7 +788,7 @@ impl LedgerStorage {
                     .get_bincode_cell("tx", until_signature.to_string())
                     .await
                     .map_err(|err| match err {
-                        bigtable::Error::RowNotFound => Error::SignatureNotFound,
+                        bigtable::Error::RowNotFound => Error::SignatureNotFound(*until_signature),
                         _ => err.into(),
                     })?;
 
@@ -876,6 +875,7 @@ impl LedgerStorage {
                         err: tx_by_addr_info.err,
                         memo: tx_by_addr_info.memo,
                         block_time: tx_by_addr_info.block_time,
+                        index: tx_by_addr_info.index,
                     },
                     tx_by_addr_info.index,
                 ));

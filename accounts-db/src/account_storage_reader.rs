@@ -1,8 +1,7 @@
 use {
     crate::{
-        account_info::Offset,
-        accounts_db::AccountStorageEntry,
-        accounts_file::{AccountsFile, InternalsForArchive},
+        account_info::Offset, account_storage_entry::AccountStorageEntry,
+        accounts_file::InternalsForArchive,
     },
     solana_clock::Slot,
     std::{
@@ -34,13 +33,6 @@ impl<'a> AccountStorageReader<'a> {
             .obsolete_accounts_read_lock()
             .filter_obsolete_accounts(snapshot_slot)
             .collect();
-        // Tiered storage is not compatible with obsolete accounts at this time
-        if matches!(storage.accounts, AccountsFile::TieredStorage(_)) {
-            assert!(
-                sorted_obsolete_accounts.is_empty(),
-                "Obsolete accounts should be empty for TieredStorage"
-            );
-        }
 
         // Convert the length to the size
         sorted_obsolete_accounts
@@ -135,12 +127,17 @@ mod tests {
     use {
         super::*,
         crate::{
-            accounts_db::{get_temp_accounts_paths, AccountStorageEntry},
-            accounts_file::{AccountsFile, AccountsFileProvider, StorageAccess},
             ObsoleteAccounts,
+            account_storage_entry::AccountStorageEntry,
+            accounts_db::get_temp_accounts_paths,
+            accounts_file::{AccountsFile, AccountsFileProvider, StorageAccess},
         },
         log::*,
-        rand::{rngs::StdRng, seq::SliceRandom, SeedableRng},
+        rand::{
+            SeedableRng,
+            rngs::StdRng,
+            seq::{IndexedMutRandom as _, IndexedRandom},
+        },
         solana_account::AccountSharedData,
         solana_pubkey::Pubkey,
         std::iter,
@@ -161,41 +158,8 @@ mod tests {
         )
     }
 
-    #[test_case(StorageAccess::Mmap)]
-    #[test_case(StorageAccess::File)]
-    #[should_panic(expected = "Obsolete accounts should be empty for TieredStorage")]
-    fn test_account_storage_reader_tiered_storage_one_obsolete_account_should_panic(
-        storage_access: StorageAccess,
-    ) {
-        let (storage, _temp_dirs) =
-            create_storage_for_storage_reader(0, AccountsFileProvider::HotStorage, storage_access);
-
-        let account = AccountSharedData::new(1, 10, &Pubkey::new_unique());
-        let account2 = AccountSharedData::new(1, 10, &Pubkey::new_unique());
-        let slot = 0;
-
-        let accounts = [
-            (&Pubkey::new_unique(), &account),
-            (&Pubkey::new_unique(), &account2),
-        ];
-
-        storage.accounts.write_accounts(&(slot, &accounts[..]), 0);
-
-        let offset = 0;
-        // Mark the obsolete accounts in storage
-        let mut size = storage.accounts.get_account_data_lens(&[0]);
-        storage
-            .obsolete_accounts()
-            .write()
-            .unwrap()
-            .mark_accounts_obsolete(vec![(offset, size.pop().unwrap())].into_iter(), 0);
-
-        _ = AccountStorageReader::new(&storage, None).unwrap();
-    }
-
-    #[test_case(AccountsFileProvider::AppendVec, StorageAccess::Mmap)]
+    #[test_case(AccountsFileProvider::AppendVec, #[allow(deprecated)] StorageAccess::Mmap)]
     #[test_case(AccountsFileProvider::AppendVec, StorageAccess::File)]
-    #[test_case(AccountsFileProvider::HotStorage, StorageAccess::File)]
     fn test_account_storage_reader_no_obsolete_accounts(
         provider: AccountsFileProvider,
         storage_access: StorageAccess,
@@ -223,12 +187,12 @@ mod tests {
     #[test_case(100, 0, StorageAccess::File)]
     #[test_case(100, 10, StorageAccess::File)]
     #[test_case(100, 100, StorageAccess::File)]
-    #[test_case(0, 0, StorageAccess::Mmap)]
-    #[test_case(1, 0, StorageAccess::Mmap)]
-    #[test_case(1, 1, StorageAccess::Mmap)]
-    #[test_case(100, 0, StorageAccess::Mmap)]
-    #[test_case(100, 10, StorageAccess::Mmap)]
-    #[test_case(100, 100, StorageAccess::Mmap)]
+    #[test_case(0, 0, #[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(1, 0, #[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(1, 1, #[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(100, 0, #[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(100, 10, #[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(100, 100, #[allow(deprecated)] StorageAccess::Mmap)]
     fn test_account_storage_reader_with_obsolete_accounts(
         total_accounts: usize,
         number_of_accounts_to_remove: usize,
@@ -294,6 +258,7 @@ mod tests {
                 storage.accounts.internals_for_archive(),
                 InternalsForArchive::FileIo(_)
             )),
+            #[allow(deprecated)]
             StorageAccess::Mmap => assert!(matches!(
                 storage.accounts.internals_for_archive(),
                 InternalsForArchive::Mmap(_)
@@ -342,7 +307,7 @@ mod tests {
         }
     }
 
-    #[test_case(StorageAccess::Mmap)]
+    #[test_case(#[allow(deprecated)] StorageAccess::Mmap)]
     #[test_case(StorageAccess::File)]
     fn test_account_storage_reader_filter_by_slot(storage_access: StorageAccess) {
         let (storage, _temp_dirs) =

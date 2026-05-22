@@ -24,9 +24,9 @@ use {
     },
     itertools::Itertools,
     solana_keypair::Keypair,
+    solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
     solana_signer::Signer,
-    solana_streamer::socket::SocketAddrSpace,
     solana_time_utils::timestamp,
     std::{
         collections::{HashMap, HashSet},
@@ -34,8 +34,8 @@ use {
         net::SocketAddr,
         ops::{DerefMut, RangeBounds},
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Mutex, RwLock,
+            atomic::{AtomicUsize, Ordering},
         },
     },
 };
@@ -114,7 +114,7 @@ impl CrdsGossipPush {
             .into_group_map()
     }
 
-    fn wallclock_window(&self, now: u64) -> impl RangeBounds<u64> {
+    fn wallclock_window(&self, now: u64) -> impl RangeBounds<u64> + use<> {
         now.saturating_sub(self.msg_timeout)..=now.saturating_add(self.msg_timeout)
     }
 
@@ -246,7 +246,7 @@ impl CrdsGossipPush {
         pings: &mut Vec<(SocketAddr, Ping)>,
         socket_addr_space: &SocketAddrSpace,
     ) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // Active and valid gossip nodes with matching shred-version.
         let nodes = crds_gossip::get_gossip_nodes(
             &mut rng,
@@ -296,7 +296,7 @@ mod tests {
 
     fn new_ping_cache() -> PingCache {
         PingCache::new(
-            &mut rand::thread_rng(),
+            &mut rand::rng(),
             Instant::now(),
             Duration::from_secs(20 * 60),      // ttl
             Duration::from_secs(20 * 60) / 64, // rate_limit_delay
@@ -348,9 +348,10 @@ mod tests {
         assert_eq!(crds.read().unwrap().get::<&CrdsValue>(&label), Some(&value));
 
         // push it again
-        assert!(push
-            .process_push_message(&crds, vec![(Pubkey::default(), vec![value])], 0)
-            .is_empty());
+        assert!(
+            push.process_push_message(&crds, vec![(Pubkey::default(), vec![value])], 0)
+                .is_empty()
+        );
     }
     #[test]
     fn test_process_push_old_version() {
@@ -369,9 +370,10 @@ mod tests {
         // push an old version
         ci.set_wallclock(0);
         let value = CrdsValue::new_unsigned(CrdsData::from(ci));
-        assert!(push
-            .process_push_message(&crds, vec![(Pubkey::default(), vec![value])], 0)
-            .is_empty());
+        assert!(
+            push.process_push_message(&crds, vec![(Pubkey::default(), vec![value])], 0)
+                .is_empty()
+        );
     }
     #[test]
     fn test_process_push_timeout() {
@@ -383,16 +385,18 @@ mod tests {
         // push a version to far in the future
         ci.set_wallclock(timeout + 1);
         let value = CrdsValue::new_unsigned(CrdsData::from(&ci));
-        assert!(push
-            .process_push_message(&crds, vec![(Pubkey::default(), vec![value])], 0)
-            .is_empty());
+        assert!(
+            push.process_push_message(&crds, vec![(Pubkey::default(), vec![value])], 0)
+                .is_empty()
+        );
 
         // push a version to far in the past
         ci.set_wallclock(0);
         let value = CrdsValue::new_unsigned(CrdsData::from(ci));
-        assert!(push
-            .process_push_message(&crds, vec![(Pubkey::default(), vec![value])], timeout + 1)
-            .is_empty());
+        assert!(
+            push.process_push_message(&crds, vec![(Pubkey::default(), vec![value])], timeout + 1)
+                .is_empty()
+        );
     }
     #[test]
     fn test_process_push_update() {
@@ -468,7 +472,7 @@ mod tests {
     #[test]
     fn test_personalized_push_messages() {
         let now = timestamp();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut crds = Crds::default();
         let push = CrdsGossipPush::default();
         let mut ping_cache = new_ping_cache();
@@ -641,13 +645,15 @@ mod tests {
         );
 
         // push it again
-        assert!(push
-            .process_push_message(&crds, vec![(Pubkey::default(), vec![value.clone()])], 0)
-            .is_empty());
+        assert!(
+            push.process_push_message(&crds, vec![(Pubkey::default(), vec![value.clone()])], 0)
+                .is_empty()
+        );
 
         // push it again
-        assert!(push
-            .process_push_message(&crds, vec![(Pubkey::default(), vec![value])], 0)
-            .is_empty());
+        assert!(
+            push.process_push_message(&crds, vec![(Pubkey::default(), vec![value])], 0)
+                .is_empty()
+        );
     }
 }

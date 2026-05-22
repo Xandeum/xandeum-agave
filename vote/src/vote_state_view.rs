@@ -14,7 +14,7 @@ use {
     frame_v4::VoteStateFrameV4,
     solana_clock::{Epoch, Slot},
     solana_pubkey::Pubkey,
-    solana_vote_interface::state::{BlockTimestamp, Lockout, BLS_PUBLIC_KEY_COMPRESSED_SIZE},
+    solana_vote_interface::state::{BLS_PUBLIC_KEY_COMPRESSED_SIZE, BlockTimestamp, Lockout},
     std::sync::Arc,
 };
 #[cfg(feature = "dev-context-only-utils")]
@@ -357,8 +357,8 @@ mod tests {
         solana_vote_interface::{
             authorized_voters::AuthorizedVoters,
             state::{
-                LandedVote, VoteInit, VoteState1_14_11, VoteStateV3, VoteStateV4,
-                VoteStateVersions, MAX_EPOCH_CREDITS_HISTORY, MAX_LOCKOUT_HISTORY,
+                LandedVote, MAX_EPOCH_CREDITS_HISTORY, MAX_LOCKOUT_HISTORY, VoteInit,
+                VoteState1_14_11, VoteStateV3, VoteStateV4, VoteStateVersions,
             },
         },
         std::collections::VecDeque,
@@ -411,14 +411,10 @@ mod tests {
             &Clock::default(),
         );
 
+        // Add another authorized voter for epoch 1
         target_vote_state
-            .set_new_authorized_voter(
-                &Pubkey::new_unique(), // authorized_pubkey
-                0,                     // current_epoch
-                1,                     // target_epoch
-                |_| Ok(()),
-            )
-            .unwrap();
+            .authorized_voters
+            .insert(1, Pubkey::new_unique());
 
         target_vote_state.root_slot = Some(42);
         target_vote_state.epoch_credits.push((42, 42, 42));
@@ -513,7 +509,7 @@ mod tests {
             target_vote_state
                 .epoch_credits
                 .truncate(MAX_EPOCH_CREDITS_HISTORY);
-            if target_vote_state.authorized_voters().len() >= u8::MAX as usize {
+            if target_vote_state.authorized_voters.len() >= u8::MAX as usize {
                 continue;
             }
 
@@ -659,21 +655,21 @@ mod tests {
         assert_eq!(view_votes, state_votes);
         assert_eq!(
             vote_state_view.last_lockout(),
-            vote_state.last_lockout().copied()
+            vote_state.votes.back().map(|v| v.lockout)
         );
         assert_eq!(
             vote_state_view.last_voted_slot(),
-            vote_state.last_voted_slot(),
+            vote_state.votes.back().map(|v| v.lockout.slot()),
         );
         assert_eq!(vote_state_view.root_slot(), vote_state.root_slot);
 
-        if let Some((first_voter_epoch, first_voter)) = vote_state.authorized_voters().first() {
+        if let Some((first_voter_epoch, first_voter)) = vote_state.authorized_voters.first() {
             assert_eq!(
                 vote_state_view.get_authorized_voter(*first_voter_epoch),
                 Some(first_voter)
             );
 
-            let (last_voter_epoch, last_voter) = vote_state.authorized_voters().last().unwrap();
+            let (last_voter_epoch, last_voter) = vote_state.authorized_voters.last().unwrap();
             assert_eq!(
                 vote_state_view.get_authorized_voter(*last_voter_epoch),
                 Some(last_voter)

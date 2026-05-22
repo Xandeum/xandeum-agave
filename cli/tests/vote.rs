@@ -3,17 +3,18 @@ use {
     solana_account::ReadableAccount,
     solana_cli::{
         check_balance,
-        cli::{process_command, request_and_confirm_airdrop, CliCommand, CliConfig},
+        cli::{CliCommand, CliConfig, process_command, request_and_confirm_airdrop},
         spend_utils::SpendAmount,
     },
-    solana_cli_output::{parse_sign_only_reply_string, OutputFormat},
+    solana_cli_output::{OutputFormat, parse_sign_only_reply_string},
+    solana_client::nonblocking::blockhash_query::Source,
     solana_commitment_config::CommitmentConfig,
     solana_faucet::faucet::run_local_faucet_with_unique_port_for_tests,
     solana_keypair::Keypair,
-    solana_rpc_client::rpc_client::RpcClient,
-    solana_rpc_client_nonce_utils::blockhash_query::{self, BlockhashQuery},
-    solana_signer::{null_signer::NullSigner, Signer},
-    solana_streamer::socket::SocketAddrSpace,
+    solana_net_utils::SocketAddrSpace,
+    solana_rpc_client::nonblocking::rpc_client::RpcClient,
+    solana_rpc_client_nonce_utils::nonblocking::blockhash_query::BlockhashQuery,
+    solana_signer::{Signer, null_signer::NullSigner},
     solana_test_validator::TestValidator,
     solana_vote_program::vote_state::{VoteAuthorize, VoteStateV4},
     test_case::test_case,
@@ -21,12 +22,16 @@ use {
 
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
-fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     let mint_keypair = Keypair::new();
-    let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair.insecure_clone());
+    let test_validator = TestValidator::async_with_no_fees(
+        &mint_keypair,
+        Some(faucet_addr),
+        SocketAddrSpace::Unspecified,
+    )
+    .await;
 
     let rpc_client =
         RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
@@ -37,6 +42,7 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     config.signers = vec![&default_signer];
 
     request_and_confirm_airdrop(&rpc_client, &config, &config.signers[0].pubkey(), 100_000)
+        .await
         .unwrap();
 
     // Create vote account
@@ -49,19 +55,26 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         identity_account: 0,
         authorized_voter: None,
         authorized_withdrawer: config.signers[0].pubkey(),
-        commission: 0,
+        commission: Some(0),
+        use_v2_instruction: false,
+
+        inflation_rewards_commission_bps: None,
+        inflation_rewards_collector: None,
+        block_revenue_commission_bps: None,
+        block_revenue_collector: None,
         sign_only: false,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::All(blockhash_query::Source::Cluster),
+        blockhash_query: BlockhashQuery::Rpc(Source::Cluster),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
         fee_payer: 0,
         compute_unit_price,
     };
-    process_command(&config).unwrap();
+    process_command(&config).await.unwrap();
     let vote_account = rpc_client
         .get_account(&vote_account_keypair.pubkey())
+        .await
         .unwrap();
     let vote_state =
         VoteStateV4::deserialize(vote_account.data(), &vote_account_keypair.pubkey()).unwrap();
@@ -69,6 +82,7 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     assert_eq!(authorized_withdrawer, config.signers[0].pubkey());
     let expected_balance = rpc_client
         .get_minimum_balance_for_rent_exemption(VoteStateV4::size_of())
+        .await
         .unwrap()
         .max(1);
     check_balance!(expected_balance, &rpc_client, &vote_account_pubkey);
@@ -83,7 +97,7 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         dump_transaction_message: false,
         allow_unfunded_recipient: true,
         no_wait: false,
-        blockhash_query: BlockhashQuery::All(blockhash_query::Source::Cluster),
+        blockhash_query: BlockhashQuery::Rpc(Source::Cluster),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
@@ -92,7 +106,7 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         derived_address_program_id: None,
         compute_unit_price,
     };
-    process_command(&config).unwrap();
+    process_command(&config).await.unwrap();
     let expected_balance = expected_balance + 10_000;
     check_balance!(expected_balance, &rpc_client, &vote_account_pubkey);
 
@@ -103,9 +117,10 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         vote_account_pubkey,
         new_authorized_pubkey: first_withdraw_authority.pubkey(),
         vote_authorize: VoteAuthorize::Withdrawer,
+        use_v2_instruction: false,
         sign_only: false,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::All(blockhash_query::Source::Cluster),
+        blockhash_query: BlockhashQuery::Rpc(Source::Cluster),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
@@ -114,9 +129,10 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         new_authorized: None,
         compute_unit_price,
     };
-    process_command(&config).unwrap();
+    process_command(&config).await.unwrap();
     let vote_account = rpc_client
         .get_account(&vote_account_keypair.pubkey())
+        .await
         .unwrap();
     let vote_state =
         VoteStateV4::deserialize(vote_account.data(), &vote_account_keypair.pubkey()).unwrap();
@@ -130,9 +146,10 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         vote_account_pubkey,
         new_authorized_pubkey: withdraw_authority.pubkey(),
         vote_authorize: VoteAuthorize::Withdrawer,
+        use_v2_instruction: false,
         sign_only: false,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::All(blockhash_query::Source::Cluster),
+        blockhash_query: BlockhashQuery::Rpc(Source::Cluster),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
@@ -141,7 +158,7 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         new_authorized: Some(1),
         compute_unit_price,
     };
-    process_command(&config).unwrap_err(); // unsigned by new authority should fail
+    process_command(&config).await.unwrap_err(); // unsigned by new authority should fail
     config.signers = vec![
         &default_signer,
         &first_withdraw_authority,
@@ -151,9 +168,10 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         vote_account_pubkey,
         new_authorized_pubkey: withdraw_authority.pubkey(),
         vote_authorize: VoteAuthorize::Withdrawer,
+        use_v2_instruction: false,
         sign_only: false,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::All(blockhash_query::Source::Cluster),
+        blockhash_query: BlockhashQuery::Rpc(Source::Cluster),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
@@ -162,9 +180,10 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         new_authorized: Some(2),
         compute_unit_price,
     };
-    process_command(&config).unwrap();
+    process_command(&config).await.unwrap();
     let vote_account = rpc_client
         .get_account(&vote_account_keypair.pubkey())
+        .await
         .unwrap();
     let vote_state =
         VoteStateV4::deserialize(vote_account.data(), &vote_account_keypair.pubkey()).unwrap();
@@ -181,14 +200,14 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         destination_account_pubkey: destination_account,
         sign_only: false,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::All(blockhash_query::Source::Cluster),
+        blockhash_query: BlockhashQuery::Rpc(Source::Cluster),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
         fee_payer: 0,
         compute_unit_price,
     };
-    process_command(&config).unwrap();
+    process_command(&config).await.unwrap();
     let expected_balance = expected_balance - 1_000;
     check_balance!(expected_balance, &rpc_client, &vote_account_pubkey);
     check_balance!(1_000, &rpc_client, &destination_account);
@@ -202,14 +221,14 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         withdraw_authority: 1,
         sign_only: false,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::All(blockhash_query::Source::Cluster),
+        blockhash_query: BlockhashQuery::Rpc(Source::Cluster),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
         fee_payer: 0,
         compute_unit_price,
     };
-    process_command(&config).unwrap();
+    process_command(&config).await.unwrap();
 
     // Close vote account
     let destination_account = solana_pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
@@ -222,19 +241,23 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         fee_payer: 0,
         compute_unit_price,
     };
-    process_command(&config).unwrap();
+    process_command(&config).await.unwrap();
     check_balance!(0, &rpc_client, &vote_account_pubkey);
     check_balance!(expected_balance, &rpc_client, &destination_account);
 }
 
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
-fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     let mint_keypair = Keypair::new();
-    let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair.insecure_clone());
+    let test_validator = TestValidator::async_with_no_fees(
+        &mint_keypair,
+        Some(faucet_addr),
+        SocketAddrSpace::Unspecified,
+    )
+    .await;
 
     let rpc_client =
         RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
@@ -250,7 +273,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     let offline_keypair = Keypair::new();
     config_offline.signers = vec![&offline_keypair];
     // Verify that we cannot reach the cluster
-    process_command(&config_offline).unwrap_err();
+    process_command(&config_offline).await.unwrap_err();
 
     request_and_confirm_airdrop(
         &rpc_client,
@@ -258,6 +281,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         &config_payer.signers[0].pubkey(),
         100_000,
     )
+    .await
     .unwrap();
     check_balance!(100_000, &rpc_client, &config_payer.signers[0].pubkey());
 
@@ -267,6 +291,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         &config_offline.signers[0].pubkey(),
         100_000,
     )
+    .await
     .unwrap();
     check_balance!(100_000, &rpc_client, &config_offline.signers[0].pubkey());
 
@@ -280,19 +305,26 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         identity_account: 0,
         authorized_voter: None,
         authorized_withdrawer: offline_keypair.pubkey(),
-        commission: 0,
+        commission: Some(0),
+        use_v2_instruction: false,
+
+        inflation_rewards_commission_bps: None,
+        inflation_rewards_collector: None,
+        block_revenue_commission_bps: None,
+        block_revenue_collector: None,
         sign_only: false,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::All(blockhash_query::Source::Cluster),
+        blockhash_query: BlockhashQuery::Rpc(Source::Cluster),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
         fee_payer: 0,
         compute_unit_price,
     };
-    process_command(&config_payer).unwrap();
+    process_command(&config_payer).await.unwrap();
     let vote_account = rpc_client
         .get_account(&vote_account_keypair.pubkey())
+        .await
         .unwrap();
     let vote_state =
         VoteStateV4::deserialize(vote_account.data(), &vote_account_keypair.pubkey()).unwrap();
@@ -300,6 +332,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     assert_eq!(authorized_withdrawer, offline_keypair.pubkey());
     let expected_balance = rpc_client
         .get_minimum_balance_for_rent_exemption(VoteStateV4::size_of())
+        .await
         .unwrap()
         .max(1);
     check_balance!(expected_balance, &rpc_client, &vote_account_pubkey);
@@ -314,7 +347,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         dump_transaction_message: false,
         allow_unfunded_recipient: true,
         no_wait: false,
-        blockhash_query: BlockhashQuery::All(blockhash_query::Source::Cluster),
+        blockhash_query: BlockhashQuery::Rpc(Source::Cluster),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
@@ -323,20 +356,21 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         derived_address_program_id: None,
         compute_unit_price,
     };
-    process_command(&config_payer).unwrap();
+    process_command(&config_payer).await.unwrap();
     let expected_balance = expected_balance + 10_000;
     check_balance!(expected_balance, &rpc_client, &vote_account_pubkey);
 
     // Authorize vote account withdrawal to another signer, offline
     let withdraw_authority = Keypair::new();
-    let blockhash = rpc_client.get_latest_blockhash().unwrap();
+    let blockhash = rpc_client.get_latest_blockhash().await.unwrap();
     config_offline.command = CliCommand::VoteAuthorize {
         vote_account_pubkey,
         new_authorized_pubkey: withdraw_authority.pubkey(),
         vote_authorize: VoteAuthorize::Withdrawer,
+        use_v2_instruction: false,
         sign_only: true,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::None(blockhash),
+        blockhash_query: BlockhashQuery::Static(blockhash),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
@@ -346,7 +380,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         compute_unit_price,
     };
     config_offline.output_format = OutputFormat::JsonCompact;
-    let sig_response = process_command(&config_offline).unwrap();
+    let sig_response = process_command(&config_offline).await.unwrap();
     let sign_only = parse_sign_only_reply_string(&sig_response);
     assert!(sign_only.has_all_signers());
     let offline_presigner = sign_only
@@ -357,9 +391,10 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         vote_account_pubkey,
         new_authorized_pubkey: withdraw_authority.pubkey(),
         vote_authorize: VoteAuthorize::Withdrawer,
+        use_v2_instruction: false,
         sign_only: false,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::FeeCalculator(blockhash_query::Source::Cluster, blockhash),
+        blockhash_query: BlockhashQuery::Validated(Source::Cluster, blockhash),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
@@ -368,9 +403,10 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         new_authorized: None,
         compute_unit_price,
     };
-    process_command(&config_payer).unwrap();
+    process_command(&config_payer).await.unwrap();
     let vote_account = rpc_client
         .get_account(&vote_account_keypair.pubkey())
+        .await
         .unwrap();
     let vote_state =
         VoteStateV4::deserialize(vote_account.data(), &vote_account_keypair.pubkey()).unwrap();
@@ -379,7 +415,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
 
     // Withdraw from vote account offline
     let destination_account = solana_pubkey::new_rand(); // Send withdrawal to new account to make balance check easy
-    let blockhash = rpc_client.get_latest_blockhash().unwrap();
+    let blockhash = rpc_client.get_latest_blockhash().await.unwrap();
     let fee_payer_null_signer = NullSigner::new(&default_signer.pubkey());
     config_offline.signers = vec![&fee_payer_null_signer, &withdraw_authority];
     config_offline.command = CliCommand::WithdrawFromVoteAccount {
@@ -389,7 +425,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         destination_account_pubkey: destination_account,
         sign_only: true,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::None(blockhash),
+        blockhash_query: BlockhashQuery::Static(blockhash),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
@@ -397,7 +433,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         compute_unit_price,
     };
     config_offline.output_format = OutputFormat::JsonCompact;
-    let sig_response = process_command(&config_offline).unwrap();
+    let sig_response = process_command(&config_offline).await.unwrap();
     let sign_only = parse_sign_only_reply_string(&sig_response);
     let offline_presigner = sign_only
         .presigner_of(&config_offline.signers[1].pubkey())
@@ -410,20 +446,20 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         destination_account_pubkey: destination_account,
         sign_only: false,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::FeeCalculator(blockhash_query::Source::Cluster, blockhash),
+        blockhash_query: BlockhashQuery::Validated(Source::Cluster, blockhash),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
         fee_payer: 0,
         compute_unit_price,
     };
-    process_command(&config_payer).unwrap();
+    process_command(&config_payer).await.unwrap();
     let expected_balance = expected_balance - 1_000;
     check_balance!(expected_balance, &rpc_client, &vote_account_pubkey);
     check_balance!(1_000, &rpc_client, &destination_account);
 
     // Re-assign validator identity offline
-    let blockhash = rpc_client.get_latest_blockhash().unwrap();
+    let blockhash = rpc_client.get_latest_blockhash().await.unwrap();
     let new_identity_keypair = Keypair::new();
     let new_identity_null_signer = NullSigner::new(&new_identity_keypair.pubkey());
     config_offline.signers = vec![
@@ -437,16 +473,16 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         withdraw_authority: 1,
         sign_only: true,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::None(blockhash),
+        blockhash_query: BlockhashQuery::Static(blockhash),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
         fee_payer: 0,
         compute_unit_price,
     };
-    process_command(&config_offline).unwrap();
+    process_command(&config_offline).await.unwrap();
     config_offline.output_format = OutputFormat::JsonCompact;
-    let sig_response = process_command(&config_offline).unwrap();
+    let sig_response = process_command(&config_offline).await.unwrap();
     let sign_only = parse_sign_only_reply_string(&sig_response);
     let offline_presigner = sign_only
         .presigner_of(&config_offline.signers[1].pubkey())
@@ -458,14 +494,14 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         withdraw_authority: 1,
         sign_only: false,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::FeeCalculator(blockhash_query::Source::Cluster, blockhash),
+        blockhash_query: BlockhashQuery::Validated(Source::Cluster, blockhash),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
         fee_payer: 0,
         compute_unit_price,
     };
-    process_command(&config_payer).unwrap();
+    process_command(&config_payer).await.unwrap();
 
     // Close vote account offline. Must use WithdrawFromVoteAccount and specify amount, since
     // CloseVoteAccount requires RpcClient
@@ -478,16 +514,16 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         destination_account_pubkey: destination_account,
         sign_only: true,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::None(blockhash),
+        blockhash_query: BlockhashQuery::Static(blockhash),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
         fee_payer: 0,
         compute_unit_price,
     };
-    process_command(&config_offline).unwrap();
+    process_command(&config_offline).await.unwrap();
     config_offline.output_format = OutputFormat::JsonCompact;
-    let sig_response = process_command(&config_offline).unwrap();
+    let sig_response = process_command(&config_offline).await.unwrap();
     let sign_only = parse_sign_only_reply_string(&sig_response);
     let offline_presigner = sign_only
         .presigner_of(&config_offline.signers[1].pubkey())
@@ -500,14 +536,14 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
         destination_account_pubkey: destination_account,
         sign_only: false,
         dump_transaction_message: false,
-        blockhash_query: BlockhashQuery::FeeCalculator(blockhash_query::Source::Cluster, blockhash),
+        blockhash_query: BlockhashQuery::Validated(Source::Cluster, blockhash),
         nonce_account: None,
         nonce_authority: 0,
         memo: None,
         fee_payer: 0,
         compute_unit_price,
     };
-    process_command(&config_payer).unwrap();
+    process_command(&config_payer).await.unwrap();
     check_balance!(0, &rpc_client, &vote_account_pubkey);
     check_balance!(expected_balance, &rpc_client, &destination_account);
 }

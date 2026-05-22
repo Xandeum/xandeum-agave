@@ -11,18 +11,22 @@ use {
             duplicate_repair_status::get_ancestor_hash_repair_sample_size,
             quic_endpoint::RemoteRequest,
             repair_handler::RepairHandler,
-            repair_service::{OutstandingShredRepairs, RepairStats, REPAIR_MS},
+            repair_service::{OutstandingShredRepairs, REPAIR_MS, RepairStats},
             request_response::RequestResponse,
             result::{Error, RepairVerifyError, Result},
         },
     },
-    bincode::{serialize, Options},
+    agave_votor_messages::migration::MigrationStatus,
+    bincode::{Options, serialize},
     bytes::Bytes,
     crossbeam_channel::{Receiver, RecvTimeoutError},
     lru::LruCache,
     rand::{
-        distributions::{Distribution, WeightedError, WeightedIndex},
         Rng,
+        distr::{
+            Distribution,
+            weighted::{Error as WeightedError, WeightedIndex},
+        },
     },
     serde::{Deserialize, Serialize},
     solana_clock::Slot,
@@ -33,21 +37,22 @@ use {
         ping_pong::{self, Pong},
         weighted_shuffle::WeightedShuffle,
     },
-    solana_hash::{Hash, HASH_BYTES},
-    solana_keypair::{signable::Signable, Keypair},
-    solana_ledger::shred::{self, Nonce, ShredFetchStats, SIZE_OF_NONCE},
+    solana_hash::{HASH_BYTES, Hash},
+    solana_keypair::{Keypair, signable::Signable},
+    solana_ledger::shred::{self, Nonce, SIZE_OF_NONCE, ShredFetchStats},
+    solana_net_utils::SocketAddrSpace,
     solana_packet::PACKET_DATA_SIZE,
     solana_perf::{
         data_budget::DataBudget,
-        packet::{Packet, PacketBatch, PacketBatchRecycler, PinnedPacketBatch},
+        packet::{Packet, PacketBatch, PacketBatchRecycler, RecycledPacketBatch},
     },
-    solana_pubkey::{Pubkey, PUBKEY_BYTES},
+    solana_poh::poh_recorder::SharedLeaderState,
+    solana_pubkey::{PUBKEY_BYTES, Pubkey},
     solana_runtime::bank_forks::SharableBanks,
-    solana_signature::{Signature, SIGNATURE_BYTES},
+    solana_signature::{SIGNATURE_BYTES, Signature},
     solana_signer::Signer,
     solana_streamer::{
-        sendmmsg::{batch_send, SendPktsError},
-        socket::SocketAddrSpace,
+        sendmmsg::{SendPktsError, batch_send},
         streamer::PacketBatchSender,
     },
     solana_time_utils::timestamp,
@@ -56,8 +61,8 @@ use {
         collections::{HashMap, HashSet},
         net::{SocketAddr, UdpSocket},
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
         thread::{Builder, JoinHandle},
         time::{Duration, Instant},
@@ -174,6 +179,7 @@ struct ServeRepairStats {
     total_requests: usize,
     dropped_requests_outbound_bandwidth: usize,
     dropped_requests_load_shed: usize,
+    dropped_requests_load_shed_sigverify: usize,
     dropped_requests_low_stake: usize,
     whitelisted_requests: usize,
     total_dropped_response_packets: usize,
@@ -230,7 +236,7 @@ type PingCache = ping_pong::PingCache<REPAIR_PING_TOKEN_SIZE>;
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiEnumVisitor, AbiExample),
-    frozen_abi(digest = "fFcqrZWZX4WcorTUxfMCVWeh2QcwamXKdLTzsDj58Kn")
+    frozen_abi(digest = "HbUQDATKfpN8pjyyarSGa8uN4SuLNTvMf7T5b66ajnNZ")
 )]
 #[derive(Debug, Deserialize, Serialize)]
 pub enum RepairProtocol {
@@ -342,6 +348,8 @@ pub struct ServeRepair {
     sharable_banks: SharableBanks,
     repair_whitelist: Arc<RwLock<HashSet<Pubkey>>>,
     repair_handler: Box<dyn RepairHandler + Send + Sync>,
+    leader_state: Option<SharedLeaderState>,
+    migration_status: Arc<MigrationStatus>,
 }
 
 // Cache entry for repair peers for a slot.
@@ -405,12 +413,33 @@ impl ServeRepair {
         sharable_banks: SharableBanks,
         repair_whitelist: Arc<RwLock<HashSet<Pubkey>>>,
         repair_handler: Box<dyn RepairHandler + Send + Sync>,
+        migration_status: Arc<MigrationStatus>,
     ) -> Self {
         Self {
             cluster_info,
             sharable_banks,
             repair_whitelist,
             repair_handler,
+            leader_state: None,
+            migration_status,
+        }
+    }
+
+    pub fn new_with_leader_state(
+        cluster_info: Arc<ClusterInfo>,
+        sharable_banks: SharableBanks,
+        repair_whitelist: Arc<RwLock<HashSet<Pubkey>>>,
+        repair_handler: Box<dyn RepairHandler + Send + Sync>,
+        leader_state: SharedLeaderState,
+        migration_status: Arc<MigrationStatus>,
+    ) -> Self {
+        Self {
+            cluster_info,
+            sharable_banks,
+            repair_whitelist,
+            repair_handler,
+            leader_state: Some(leader_state),
+            migration_status,
         }
     }
 
@@ -423,11 +452,13 @@ impl ServeRepair {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
         let repair_handler = Box::new(StandardRepairHandler::new(blockstore));
+        let bank_forks_r = bank_forks.read().unwrap();
         Self::new(
             cluster_info,
-            bank_forks.read().unwrap().sharable_banks(),
+            bank_forks_r.sharable_banks(),
             repair_whitelist,
             repair_handler,
+            bank_forks_r.migration_status(),
         )
     }
 
@@ -503,11 +534,18 @@ impl ServeRepair {
                     slot,
                 } => {
                     stats.ancestor_hashes += 1;
-                    (
-                        self.repair_handler
-                            .run_ancestor_hashes(recycler, from_addr, *slot, *nonce),
-                        "AncestorHashes",
-                    )
+                    if self
+                        .migration_status
+                        .should_respond_to_ancestor_hashes_requests(*slot)
+                    {
+                        (
+                            self.repair_handler
+                                .run_ancestor_hashes(recycler, from_addr, *slot, *nonce),
+                            "AncestorHashes",
+                        )
+                    } else {
+                        (None, "AncestorHashes")
+                    }
                 }
                 RepairProtocol::Pong(pong) => {
                     stats.pong += 1;
@@ -620,9 +658,15 @@ impl ServeRepair {
         whitelist: &HashSet<Pubkey>,
         my_id: &Pubkey,
         socket_addr_space: &SocketAddrSpace,
+        mut remaining_budget_estimate: usize,
         stats: &mut ServeRepairStats,
     ) -> Vec<RepairRequestWithMeta> {
+        const MIN_RESPONSE_SIZE: usize = PACKET_DATA_SIZE + SIZE_OF_NONCE;
         let decode_request = |request| {
+            if remaining_budget_estimate < MIN_RESPONSE_SIZE {
+                stats.dropped_requests_load_shed_sigverify += 1;
+                return None;
+            }
             let result = Self::decode_request(
                 request,
                 epoch_staked_nodes,
@@ -637,6 +681,9 @@ impl ServeRepair {
                     } else {
                         stats.handle_requests_staked += 1;
                     }
+                    // assuming we will reply to the request, we need to update the budget estimate
+                    // some responses may be larger, but we have to be conservative here
+                    remaining_budget_estimate -= MIN_RESPONSE_SIZE;
                 }
                 Err(e) => {
                     Self::record_request_decode_error(e, stats);
@@ -658,6 +705,8 @@ impl ServeRepair {
         stats: &mut ServeRepairStats,
         data_budget: &DataBudget,
     ) -> std::result::Result<(), RecvTimeoutError> {
+        /// How much more expensive it is to serve bytes if we are a leader
+        const LEADER_BYTE_COST_MULTIPLIER: usize = 10;
         const TIMEOUT: Duration = Duration::from_secs(1);
         let mut requests = vec![requests_receiver.recv_timeout(TIMEOUT)?];
         const MAX_REQUESTS_PER_ITERATION: usize = 1024;
@@ -700,8 +749,27 @@ impl ServeRepair {
         stats.dropped_requests_load_shed += dropped_requests;
         stats.total_requests += total_requests;
 
+        // Check if we are currently a leader, so we can limit the service rate
+        // If information is not available, assume we are not a leader.
+        let is_leader = self
+            .leader_state
+            .as_ref()
+            .map(|ls| ls.load().working_bank().is_some())
+            .unwrap_or(false);
+        // assign extra cost to served bytes if we are a leader
+        let byte_cost_multiplier = if is_leader {
+            LEADER_BYTE_COST_MULTIPLIER
+        } else {
+            1
+        };
+
         let decode_start = Instant::now();
         let mut decoded_requests = {
+            // Estimate how much data budget we have left, 2x margin to prioritize staked,
+            // apply byte cost multiplier here so we can operate in bytes inside decode_requests
+            let effective_data_budget_estimate =
+                data_budget.get().saturating_mul(2) / byte_cost_multiplier;
+            // staked requests (as those get filtered after sigverify)
             let whitelist = self.repair_whitelist.read().unwrap();
             Self::decode_requests(
                 requests,
@@ -709,6 +777,7 @@ impl ServeRepair {
                 &whitelist,
                 &my_id,
                 &socket_addr_space,
+                effective_data_budget_estimate,
                 stats,
             )
         };
@@ -731,6 +800,7 @@ impl ServeRepair {
             repair_response_quic_sender,
             stats,
             data_budget,
+            byte_cost_multiplier,
         );
         stats.handle_requests_time_us += handle_requests_start.elapsed().as_micros() as u64;
 
@@ -757,6 +827,11 @@ impl ServeRepair {
             (
                 "dropped_requests_load_shed",
                 stats.dropped_requests_load_shed,
+                i64
+            ),
+            (
+                "dropped_requests_load_shed_sigverify",
+                stats.dropped_requests_load_shed_sigverify,
                 i64
             ),
             (
@@ -840,7 +915,7 @@ impl ServeRepair {
         assert!(REPAIR_PING_CACHE_RATE_LIMIT_DELAY > Duration::from_millis(REPAIR_MS));
 
         let mut ping_cache = PingCache::new(
-            &mut rand::thread_rng(),
+            &mut rand::rng(),
             Instant::now(),
             REPAIR_PING_CACHE_TTL,
             REPAIR_PING_CACHE_RATE_LIMIT_DELAY,
@@ -853,7 +928,7 @@ impl ServeRepair {
             .spawn(move || {
                 let mut last_print = Instant::now();
                 let mut stats = ServeRepairStats::default();
-                let data_budget = DataBudget::default();
+                let data_budget = DataBudget::new(MAX_BYTES_PER_INTERVAL);
                 while !exit.load(Ordering::Relaxed) {
                     let result = self.run_listen(
                         &mut ping_cache,
@@ -871,7 +946,9 @@ impl ServeRepair {
                             return;
                         }
                     };
-                    if last_print.elapsed().as_secs() > 2 {
+
+                    const REPORT_INTERVAL: Duration = Duration::from_secs(2);
+                    if last_print.elapsed() > REPORT_INTERVAL {
                         self.report_reset_stats(&mut stats);
                         last_print = Instant::now();
                     }
@@ -940,7 +1017,7 @@ impl ServeRepair {
         from_addr: &SocketAddr,
         identity_keypair: &Keypair,
     ) -> (bool, Option<Packet>) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let (check, ping) = request
             .sender()
             .map(|&sender| {
@@ -996,6 +1073,7 @@ impl ServeRepair {
         repair_response_quic_sender: &AsyncSender<(SocketAddr, Bytes)>,
         stats: &mut ServeRepairStats,
         data_budget: &DataBudget,
+        byte_cost_multiplier: usize,
     ) {
         let identity_keypair = self.cluster_info.keypair();
         let mut pending_pings = Vec::default();
@@ -1008,7 +1086,10 @@ impl ServeRepair {
             whitelisted: _,
         } in requests.into_iter()
         {
-            if !data_budget.check(request.max_response_bytes()) {
+            // we deliberately consume early assuming that request succeeds,
+            // if it does we will refund the unused tokens
+            let max_response_cost = request.max_response_bytes() * byte_cost_multiplier;
+            if !data_budget.take(max_response_cost) {
                 stats.dropped_requests_outbound_bandwidth += 1;
                 continue;
             }
@@ -1030,15 +1111,16 @@ impl ServeRepair {
                 continue;
             };
             let num_response_packets = rsp.len();
-            let num_response_bytes = rsp.iter().map(|p| p.meta().size).sum();
-            if data_budget.take(num_response_bytes)
-                && send_response(
-                    rsp,
-                    protocol,
-                    packet_batch_sender,
-                    repair_response_quic_sender,
-                )
-            {
+            let num_response_bytes: usize = rsp.iter().map(|p| p.meta().size).sum();
+            // refund unused bytes if we can only serve the request partially
+            data_budget
+                .put(max_response_cost.saturating_sub(num_response_bytes * byte_cost_multiplier));
+            if send_response(
+                rsp,
+                protocol,
+                packet_batch_sender,
+                repair_response_quic_sender,
+            ) {
                 stats.total_response_packets += num_response_packets;
                 match stake > 0 {
                     true => stats.total_response_bytes_staked += num_response_bytes,
@@ -1052,7 +1134,7 @@ impl ServeRepair {
 
         if !pending_pings.is_empty() {
             stats.pings_sent += pending_pings.len();
-            let batch = PinnedPacketBatch::new(pending_pings);
+            let batch = RecycledPacketBatch::new(pending_pings);
             let _ = packet_batch_sender.send(batch.into());
         }
     }
@@ -1106,7 +1188,7 @@ impl ServeRepair {
                 peers_cache.get(&slot).unwrap()
             }
         };
-        let peer = repair_peers.sample(&mut rand::thread_rng());
+        let peer = repair_peers.sample(&mut rand::rng());
         let nonce = outstanding_requests.add_request(repair_request, timestamp());
         let out = self.map_repair_request(
             &repair_request,
@@ -1146,7 +1228,7 @@ impl ServeRepair {
         }
         let (weights, index) = cluster_slots.compute_weights_exclude_nonfrozen(slot, &repair_peers);
         let peers = WeightedShuffle::new("repair_request_ancestor_hashes", weights)
-            .shuffle(&mut rand::thread_rng())
+            .shuffle(&mut rand::rng())
             .map(|i| index[i])
             .filter_map(|i| {
                 let addr = repair_peers[i].serve_repair(repair_protocol)?;
@@ -1170,9 +1252,7 @@ impl ServeRepair {
             return None;
         }
         let (weights, index) = cluster_slots.compute_weights_exclude_nonfrozen(slot, &repair_peers);
-        let k = WeightedIndex::new(weights)
-            .ok()?
-            .sample(&mut rand::thread_rng());
+        let k = WeightedIndex::new(weights).ok()?.sample(&mut rand::rng());
         let n = index[k];
         Some((
             *repair_peers[n].pubkey(),
@@ -1354,27 +1434,27 @@ mod tests {
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_ledger::{
-            blockstore::{make_many_slot_entries, Blockstore},
+            blockstore::{Blockstore, make_many_slot_entries},
             blockstore_processor::fill_blockstore_slot_with_ticks,
-            genesis_utils::{create_genesis_config, GenesisConfigInfo},
+            genesis_utils::{GenesisConfigInfo, create_genesis_config},
             get_tmp_ledger_path_auto_delete,
             shred::{
-                max_ticks_per_n_shreds, ProcessShredsStats, ReedSolomonCache, Shred, Shredder,
+                ProcessShredsStats, ReedSolomonCache, Shred, Shredder, max_ticks_per_n_shreds,
             },
         },
-        solana_perf::packet::{deserialize_from_with_limit, Packet, PacketFlags, PacketRef},
+        solana_net_utils::SocketAddrSpace,
+        solana_perf::packet::{Packet, PacketFlags, PacketRef, deserialize_from_with_limit},
         solana_pubkey::Pubkey,
         solana_runtime::bank::Bank,
-        solana_streamer::socket::SocketAddrSpace,
         solana_time_utils::timestamp,
         std::{io::Cursor, net::Ipv4Addr},
     };
 
     #[test]
     fn test_serialized_ping_size() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let keypair = Keypair::new();
-        let ping = Ping::new(rng.gen(), &keypair);
+        let ping = Ping::new(rng.random(), &keypair);
         let ping = RepairResponse::Ping(ping);
         let pkt = Packet::from_data(None, ping).unwrap();
         assert_eq!(pkt.meta().size, REPAIR_RESPONSE_SERIALIZED_PING_BYTES);
@@ -1415,9 +1495,9 @@ mod tests {
 
     #[test]
     fn test_check_well_formed_repair_request() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let keypair = Keypair::new();
-        let ping = Ping::new(rng.gen(), &keypair);
+        let ping = Ping::new(rng.random(), &keypair);
         let pong = Pong::new(&ping, &keypair);
         let request = RepairProtocol::Pong(pong);
         let mut pkt = Packet::from_data(None, request).unwrap();
@@ -1517,9 +1597,11 @@ mod tests {
             assert_eq!(&header.sender, &serve_repair.my_id());
             assert_eq!(&header.recipient, &repair_peer_id);
             let signed_data = [&rsp[..4], &rsp[4 + SIGNATURE_BYTES..]].concat();
-            assert!(header
-                .signature
-                .verify(keypair.pubkey().as_ref(), &signed_data));
+            assert!(
+                header
+                    .signature
+                    .verify(keypair.pubkey().as_ref(), &signed_data)
+            );
         } else {
             panic!("unexpected request type {:?}", &deserialized_request);
         }
@@ -1560,9 +1642,11 @@ mod tests {
             assert_eq!(&header.sender, &serve_repair.my_id());
             assert_eq!(&header.recipient, &repair_peer_id);
             let signed_data = [&request_bytes[..4], &request_bytes[4 + SIGNATURE_BYTES..]].concat();
-            assert!(header
-                .signature
-                .verify(keypair.pubkey().as_ref(), &signed_data));
+            assert!(
+                header
+                    .signature
+                    .verify(keypair.pubkey().as_ref(), &signed_data)
+            );
         } else {
             panic!("unexpected request type {:?}", &deserialized_request);
         }
@@ -1613,9 +1697,11 @@ mod tests {
             assert_eq!(&header.sender, &serve_repair.my_id());
             assert_eq!(&header.recipient, &repair_peer_id);
             let signed_data = [&request_bytes[..4], &request_bytes[4 + SIGNATURE_BYTES..]].concat();
-            assert!(header
-                .signature
-                .verify(keypair.pubkey().as_ref(), &signed_data));
+            assert!(
+                header
+                    .signature
+                    .verify(keypair.pubkey().as_ref(), &signed_data)
+            );
         } else {
             panic!("unexpected request type {:?}", &deserialized_request);
         }
@@ -1647,9 +1733,11 @@ mod tests {
             assert_eq!(&header.sender, &serve_repair.my_id());
             assert_eq!(&header.recipient, &repair_peer_id);
             let signed_data = [&request_bytes[..4], &request_bytes[4 + SIGNATURE_BYTES..]].concat();
-            assert!(header
-                .signature
-                .verify(keypair.pubkey().as_ref(), &signed_data));
+            assert!(
+                header
+                    .signature
+                    .verify(keypair.pubkey().as_ref(), &signed_data)
+            );
         } else {
             panic!("unexpected request type {:?}", &deserialized_request);
         }
@@ -1918,10 +2006,6 @@ mod tests {
         );
         nxt.set_gossip((Ipv4Addr::LOCALHOST, 1234)).unwrap();
         nxt.set_tvu(UDP, (Ipv4Addr::LOCALHOST, 1235)).unwrap();
-        nxt.set_tvu(QUIC, (Ipv4Addr::LOCALHOST, 1236)).unwrap();
-        nxt.set_tpu((Ipv4Addr::LOCALHOST, 1238)).unwrap();
-        nxt.set_tpu_forwards((Ipv4Addr::LOCALHOST, 1239)).unwrap();
-        nxt.set_tpu_vote(UDP, (Ipv4Addr::LOCALHOST, 1240)).unwrap();
         nxt.set_rpc((Ipv4Addr::LOCALHOST, 1241)).unwrap();
         nxt.set_rpc_pubsub((Ipv4Addr::LOCALHOST, 1242)).unwrap();
         nxt.set_serve_repair(UDP, serve_repair_addr).unwrap();
@@ -1954,9 +2038,6 @@ mod tests {
         nxt.set_gossip((Ipv4Addr::LOCALHOST, 1234)).unwrap();
         nxt.set_tvu(UDP, (Ipv4Addr::LOCALHOST, 1235)).unwrap();
         nxt.set_tvu(QUIC, (Ipv4Addr::LOCALHOST, 1236)).unwrap();
-        nxt.set_tpu((Ipv4Addr::LOCALHOST, 1238)).unwrap();
-        nxt.set_tpu_forwards((Ipv4Addr::LOCALHOST, 1239)).unwrap();
-        nxt.set_tpu_vote(UDP, (Ipv4Addr::LOCALHOST, 1240)).unwrap();
         nxt.set_rpc((Ipv4Addr::LOCALHOST, 1241)).unwrap();
         nxt.set_rpc_pubsub((Ipv4Addr::LOCALHOST, 1242)).unwrap();
         nxt.set_serve_repair(UDP, serve_repair_addr2).unwrap();
@@ -2045,7 +2126,7 @@ mod tests {
                 )
             })
             .collect();
-        let expected = PacketBatch::Pinned(PinnedPacketBatch::new(expected));
+        let expected = PacketBatch::Pinned(RecycledPacketBatch::new(expected));
         assert_eq!(rv, expected);
     }
 
@@ -2069,14 +2150,10 @@ mod tests {
             .expect("Expect successful ledger write");
         let nonce = 42;
         // Make sure repair response is corrupted
-        assert!(repair_response::repair_response_packet(
-            &blockstore,
-            1,
-            0,
-            &socketaddr_any!(),
-            nonce,
-        )
-        .is_none());
+        assert!(
+            repair_response::repair_response_packet(&blockstore, 1, 0, &socketaddr_any!(), nonce,)
+                .is_none()
+        );
 
         // Orphan request for slot 2 should only return slot 1 since
         // calling `repair_response_packet` on slot 1's shred will
@@ -2087,14 +2164,16 @@ mod tests {
             .expect("run_orphan packets");
 
         // Verify responses
-        let expected = PinnedPacketBatch::new(vec![repair_response::repair_response_packet(
-            &blockstore,
-            2,
-            31, // shred_index
-            &socketaddr_any!(),
-            nonce,
-        )
-        .unwrap()])
+        let expected = RecycledPacketBatch::new(vec![
+            repair_response::repair_response_packet(
+                &blockstore,
+                2,
+                31, // shred_index
+                &socketaddr_any!(),
+                nonce,
+            )
+            .unwrap(),
+        ])
         .into();
         assert_eq!(rv, expected);
     }
@@ -2210,9 +2289,11 @@ mod tests {
         // then no repairs should be generated
         for pubkey in &[solana_pubkey::new_rand(), *me.pubkey()] {
             let known_validators = Some(vec![*pubkey].into_iter().collect());
-            assert!(serve_repair
-                .repair_peers(&known_validators, 1, &identity_keypair.pubkey())
-                .is_empty());
+            assert!(
+                serve_repair
+                    .repair_peers(&known_validators, 1, &identity_keypair.pubkey())
+                    .is_empty()
+            );
             assert_matches!(
                 serve_repair.repair_request(
                     &cluster_slots,

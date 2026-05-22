@@ -5,7 +5,7 @@ use {
     agave_transaction_view::transaction_view::SanitizedTransactionView,
     ahash::HashMap,
     itertools::Itertools,
-    rand::{thread_rng, Rng},
+    rand::{Rng, rng},
     solana_account::from_account,
     solana_clock::Epoch,
     solana_pubkey::Pubkey,
@@ -195,9 +195,7 @@ impl VoteStorage {
             self.cached_epoch_authorized_voters = bank
                 .epoch_stakes(bank.epoch())
                 .map(|stakes| stakes.epoch_authorized_voters().clone())
-                // Should be fine to expect as the current epoch must exist in epoch_stakes,
-                // will cleanup in a follow up
-                .unwrap_or_else(|| current_epoch_stakes.epoch_authorized_voters().clone());
+                .expect("Epoch stakes for the current bank must be available");
             self.cached_epoch_stakes = current_epoch_stakes;
             self.current_epoch = bank.epoch();
             self.deprecate_legacy_vote_ixs = bank
@@ -323,7 +321,7 @@ impl VoteStorage {
         should_replenish_taken_votes && latest_vote.is_vote_taken()
     }
 
-    fn weighted_random_order_by_stake(&self) -> impl Iterator<Item = Pubkey> {
+    fn weighted_random_order_by_stake(&self) -> impl Iterator<Item = Pubkey> + use<> {
         // Efraimidis and Spirakis algo for weighted random sample without replacement
         let mut pubkey_with_weight: Vec<(f64, Pubkey)> = self
             .latest_vote_per_vote_pubkey
@@ -333,7 +331,7 @@ impl VoteStorage {
                 if stake == 0 {
                     None // Ignore votes from unstaked validators
                 } else {
-                    Some((thread_rng().gen::<f64>().powf(1.0 / (stake as f64)), pubkey))
+                    Some((rng().random::<f64>().powf(1.0 / (stake as f64)), pubkey))
                 }
             })
             .collect::<Vec<_>>();
@@ -376,6 +374,7 @@ pub(crate) mod tests {
         solana_epoch_schedule::MINIMUM_SLOTS_PER_EPOCH,
         solana_genesis_config::GenesisConfig,
         solana_hash::Hash,
+        solana_keypair::Keypair,
         solana_perf::packet::{BytesPacket, PacketFlags},
         solana_runtime::genesis_utils::{self, ValidatorVoteKeypairs},
         solana_signer::Signer,
@@ -408,7 +407,7 @@ pub(crate) mod tests {
             leader_schedule_epoch: epoch,
             unix_timestamp: 0,
         };
-        let vote_state = VoteStateV4::new(vote_pubkey, &vote_init, &clock);
+        let vote_state = VoteStateV4::new_with_defaults(vote_pubkey, &vote_init, &clock);
         let account = AccountSharedData::new_data(
             1_000_000,
             &VoteStateVersions::new_v4(vote_state),
@@ -480,7 +479,7 @@ pub(crate) mod tests {
     }
 
     fn to_sanitized_view(packet: BytesPacket) -> SanitizedTransactionView<SharedBytes> {
-        SanitizedTransactionView::try_new_sanitized(Arc::new(packet.buffer().to_vec()), false)
+        SanitizedTransactionView::try_new_sanitized(Arc::new(packet.buffer().to_vec()), false, true)
             .unwrap()
     }
 
@@ -522,12 +521,16 @@ pub(crate) mod tests {
             None,
         );
 
-        assert!(vote_storage
-            .update_latest_vote(vote_a, false /* should replenish */)
-            .is_none());
-        assert!(vote_storage
-            .update_latest_vote(vote_b, false /* should replenish */)
-            .is_none());
+        assert!(
+            vote_storage
+                .update_latest_vote(vote_a, false /* should replenish */)
+                .is_none()
+        );
+        assert!(
+            vote_storage
+                .update_latest_vote(vote_b, false /* should replenish */)
+                .is_none()
+        );
         assert_eq!(2, vote_storage.len());
 
         assert_eq!(
@@ -970,7 +973,7 @@ pub(crate) mod tests {
             genesis_utils::create_genesis_config_with_vote_accounts(100, &[&keypair_c], vec![200])
                 .genesis_config;
         let bank_0 = Bank::new_for_tests(&config);
-        let bank = Bank::new_from_parent(
+        let bank = Bank::warp_from_parent(
             Arc::new(bank_0),
             &Pubkey::new_unique(),
             3 * MINIMUM_SLOTS_PER_EPOCH,

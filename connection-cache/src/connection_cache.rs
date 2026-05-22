@@ -1,19 +1,19 @@
 use {
     crate::{
         client_connection::ClientConnection as BlockingClientConnection,
-        connection_cache_stats::{ConnectionCacheStats, CONNECTION_STAT_SUBMISSION_INTERVAL},
+        connection_cache_stats::{CONNECTION_STAT_SUBMISSION_INTERVAL, ConnectionCacheStats},
         nonblocking::client_connection::ClientConnection as NonblockingClientConnection,
     },
     crossbeam_channel::{Receiver, RecvError, Sender},
     indexmap::map::IndexMap,
     log::*,
-    rand::{thread_rng, Rng},
+    rand::{Rng, rng},
     solana_keypair::Keypair,
     solana_measure::measure::Measure,
     solana_time_utils::AtomicInterval,
     std::{
         net::SocketAddr,
-        sync::{atomic::Ordering, Arc, RwLock},
+        sync::{Arc, RwLock, atomic::Ordering},
         thread::{Builder, JoinHandle},
     },
     thiserror::Error,
@@ -115,22 +115,24 @@ where
     ) -> JoinHandle<()> {
         Builder::new()
             .name("solQAsynCon".to_string())
-            .spawn(move || loop {
-                let recv_result = receiver.recv();
-                match recv_result {
-                    Err(RecvError) => {
-                        break;
-                    }
-                    Ok((idx, addr)) => {
-                        let map = map.read().unwrap();
-                        let pool = map.get(&addr);
-                        if let Some(pool) = pool {
-                            let conn = pool.get(idx);
-                            if let Ok(conn) = conn {
-                                drop(map);
-                                let conn = conn.new_blocking_connection(addr, stats.clone());
-                                let result = conn.send_data(&[]);
-                                debug!("Create async connection result {result:?} for {addr}");
+            .spawn(move || {
+                loop {
+                    let recv_result = receiver.recv();
+                    match recv_result {
+                        Err(RecvError) => {
+                            break;
+                        }
+                        Ok((idx, addr)) => {
+                            let map = map.read().unwrap();
+                            let pool = map.get(&addr);
+                            if let Some(pool) = pool {
+                                let conn = pool.get(idx);
+                                if let Ok(conn) = conn {
+                                    drop(map);
+                                    let conn = conn.new_blocking_connection(addr, stats.clone());
+                                    let result = conn.send_data(&[]);
+                                    debug!("Create async connection result {result:?} for {addr}");
+                                }
                             }
                         }
                     }
@@ -217,8 +219,8 @@ where
             Measure::start("get_connection_cache_eviction_measure");
         let existing_index = map.get_index_of(addr);
         while map.len() >= MAX_CONNECTIONS {
-            let mut rng = thread_rng();
-            let n = rng.gen_range(0..MAX_CONNECTIONS);
+            let mut rng = rng();
+            let n = rng.random_range(0..MAX_CONNECTIONS);
             if let Some(index) = existing_index {
                 if n == index {
                     continue;
@@ -443,8 +445,8 @@ pub trait ConnectionPool: Send + Sync + 'static {
     /// Get a connection from the pool. It must have at least one connection in the pool.
     /// This randomly picks a connection in the pool.
     fn borrow_connection(&self) -> Arc<Self::BaseClientConnection> {
-        let mut rng = thread_rng();
-        let n = rng.gen_range(0..self.num_connections());
+        let mut rng = rng();
+        let n = rng.random_range(0..self.num_connections());
         self.get(n).expect("index is within num_connections")
     }
 
@@ -675,10 +677,10 @@ mod tests {
     }
 
     fn get_addr(rng: &mut ChaChaRng) -> SocketAddr {
-        let a = rng.gen_range(1..255);
-        let b = rng.gen_range(1..255);
-        let c = rng.gen_range(1..255);
-        let d = rng.gen_range(1..255);
+        let a = rng.random_range(1..255);
+        let b = rng.random_range(1..255);
+        let c = rng.random_range(1..255);
+        let d = rng.random_range(1..255);
 
         let addr_str = format!("{a}.{b}.{c}.{d}:80");
 

@@ -1,12 +1,12 @@
 use {
     crate::{
-        cluster_nodes::{self, check_feature_activation, ClusterNodesCache},
+        cluster_nodes::{ClusterNodesCache, DATA_PLANE_FANOUT, check_feature_activation},
         retransmit_stage::RetransmitStage,
     },
     agave_feature_set as feature_set,
     crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender},
     itertools::{Either, Itertools},
-    rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
+    rayon::{ThreadPool, ThreadPoolBuilder, prelude::*},
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
@@ -17,13 +17,12 @@ use {
             layout::{get_shred, resign_packet},
             wire::is_retransmitter_signed_variant,
         },
-        sigverify_shreds::{verify_shreds_gpu, LruCache, SlotPubkeys},
+        sigverify_shreds::{LruCache, SlotPubkeys, verify_shreds},
     },
     solana_perf::{
         self,
         deduper::Deduper,
         packet::{PacketBatch, PacketRefMut},
-        recycler_cache::RecyclerCache,
     },
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
@@ -32,8 +31,8 @@ use {
     std::{
         num::NonZeroUsize,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc, RwLock,
+            atomic::{AtomicUsize, Ordering},
         },
         thread::{Builder, JoinHandle},
         time::{Duration, Instant},
@@ -83,7 +82,6 @@ pub fn spawn_shred_sigverify(
     verified_sender: Sender<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
     num_sigverify_threads: NonZeroUsize,
 ) -> JoinHandle<()> {
-    let recycler_cache = RecyclerCache::warmed();
     let mut stats = ShredSigVerifyStats::new(Instant::now());
     let cache = RwLock::new(LruCache::new(SIGVERIFY_LRU_CACHE_CAPACITY));
     let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
@@ -96,7 +94,7 @@ pub fn spawn_shred_sigverify(
         .build()
         .expect("new rayon threadpool");
     let run_shred_sigverify = move || {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut deduper = Deduper::<2, [u8]>::new(&mut rng, DEDUPER_NUM_BITS);
         let mut shred_buffer = Vec::with_capacity(SIGVERIFY_SHRED_BATCH_SIZE);
         loop {
@@ -112,7 +110,6 @@ pub fn spawn_shred_sigverify(
                 &cluster_info,
                 &bank_forks,
                 &leader_schedule_cache,
-                &recycler_cache,
                 &deduper,
                 &shred_fetch_receiver,
                 &retransmit_sender,
@@ -143,7 +140,6 @@ fn run_shred_sigverify<const K: usize>(
     cluster_info: &ClusterInfo,
     bank_forks: &RwLock<BankForks>,
     leader_schedule_cache: &LeaderScheduleCache,
-    recycler_cache: &RecyclerCache,
     deduper: &Deduper<K, [u8]>,
     shred_fetch_receiver: &Receiver<PacketBatch>,
     retransmit_sender: &EvictingSender<Vec<shred::Payload>>,
@@ -205,7 +201,6 @@ fn run_shred_sigverify<const K: usize>(
         &keypair.pubkey(),
         &working_bank,
         leader_schedule_cache,
-        recycler_cache,
         shred_buffer,
         cache,
     );
@@ -363,8 +358,7 @@ fn verify_retransmitter_signature(
     };
     let cluster_nodes =
         cluster_nodes_cache.get(shred.slot(), root_bank, working_bank, cluster_info);
-    let data_plane_fanout = cluster_nodes::get_data_plane_fanout(shred.slot(), root_bank);
-    let parent = match cluster_nodes.get_retransmit_parent(&leader, &shred, data_plane_fanout) {
+    let parent = match cluster_nodes.get_retransmit_parent(&leader.id, &shred, DATA_PLANE_FANOUT) {
         Ok(Some(parent)) => parent,
         Ok(None) => {
             stats
@@ -395,7 +389,6 @@ fn verify_packets(
     self_pubkey: &Pubkey,
     working_bank: &Bank,
     leader_schedule_cache: &LeaderScheduleCache,
-    recycler_cache: &RecyclerCache,
     packets: &mut [PacketBatch],
     cache: &RwLock<LruCache>,
 ) {
@@ -404,7 +397,7 @@ fn verify_packets(
             .filter_map(|(slot, pubkey)| Some((slot, pubkey?)))
             .chain(std::iter::once((Slot::MAX, Pubkey::default())))
             .collect();
-    let out = verify_shreds_gpu(thread_pool, packets, &leader_slots, recycler_cache, cache);
+    let out = verify_shreds(thread_pool, packets, &leader_slots, cache);
     solana_perf::sigverify::mark_disabled(packets, &out);
 }
 
@@ -428,6 +421,7 @@ fn get_slot_leaders<'a>(
             let slot = shred.and_then(shred::layout::get_slot)?;
             let leader = leader_schedule_cache
                 .slot_leader_at(slot, Some(bank))
+                .map(|leader| leader.id)
                 .filter(|leader| leader != self_pubkey);
             if leader.is_none() {
                 packet.meta_mut().set_discard(true);
@@ -562,7 +556,7 @@ mod tests {
     use {
         super::*,
         rand::Rng,
-        solana_entry::entry::{create_ticks, Entry},
+        solana_entry::entry::{Entry, create_ticks},
         solana_gossip::contact_info::ContactInfo,
         solana_hash::Hash,
         solana_keypair::Keypair,
@@ -570,10 +564,10 @@ mod tests {
             genesis_utils::create_genesis_config_with_leader,
             shred::{Nonce, ProcessShredsStats, ReedSolomonCache, Shredder},
         },
-        solana_perf::packet::{Packet, PacketFlags, PinnedPacketBatch},
+        solana_net_utils::SocketAddrSpace,
+        solana_perf::packet::{Packet, PacketFlags, RecycledPacketBatch},
         solana_runtime::bank::Bank,
         solana_signer::Signer,
-        solana_streamer::socket::SocketAddrSpace,
         solana_time_utils::timestamp,
         test_case::test_matrix,
     };
@@ -589,7 +583,7 @@ mod tests {
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
         let bank_forks = BankForks::new_rw_arc(bank);
         let batch_size = 2;
-        let mut batch = PinnedPacketBatch::with_capacity(batch_size);
+        let mut batch = RecycledPacketBatch::with_capacity(batch_size);
         batch.resize(batch_size, Packet::default());
         let mut batches = vec![batch];
 
@@ -636,7 +630,6 @@ mod tests {
             &Pubkey::new_unique(), // self_pubkey
             &working_bank,
             &leader_schedule_cache,
-            &RecyclerCache::warmed(),
             &mut batches,
             &cache,
         );
@@ -649,7 +642,7 @@ mod tests {
         [true, false]
     )]
     fn test_maybe_verify_and_resign_packet(repaired: bool, is_last_in_slot: bool) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         let leader_keypair = Arc::new(Keypair::new());
         let leader_pubkey = leader_keypair.pubkey();
@@ -662,7 +655,7 @@ mod tests {
             let bank_forks = bank_forks.read().unwrap();
             (bank_forks.working_bank(), bank_forks.root_bank())
         };
-        let chained_merkle_root = Hash::new_from_array(rng.gen());
+        let chained_merkle_root = Hash::new_from_array(rng.random());
 
         let shredder = Shredder::new(root_bank.slot(), root_bank.parent_slot(), 0, 0).unwrap();
         let entries = vec![Entry::new(&Hash::default(), 0, vec![])];
@@ -693,7 +686,7 @@ mod tests {
 
         for shred in shreds.iter_mut() {
             let keypair = Keypair::new();
-            let nonce = repaired.then(|| rng.gen::<Nonce>());
+            let nonce = repaired.then(|| rng.random::<Nonce>());
             if is_last_in_slot {
                 let packet = &mut shred.payload().to_packet(nonce);
                 let buf_before = packet.buffer_mut().to_vec();

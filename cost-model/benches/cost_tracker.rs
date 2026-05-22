@@ -33,7 +33,7 @@ fn setup(num_transactions: usize, contentious_transactions: bool) -> BenchSetup 
                 };
                 writable_accounts.push(writable_account_key)
             });
-            WritableKeysTransaction(writable_accounts)
+            WritableKeysTransaction::new(writable_accounts)
         })
         .collect_vec();
 
@@ -45,7 +45,7 @@ fn setup(num_transactions: usize, contentious_transactions: bool) -> BenchSetup 
 
 fn get_costs(
     transactions: &[WritableKeysTransaction],
-) -> Vec<TransactionCost<WritableKeysTransaction>> {
+) -> Vec<TransactionCost<'_, WritableKeysTransaction>> {
     transactions
         .iter()
         .map(|transaction| {

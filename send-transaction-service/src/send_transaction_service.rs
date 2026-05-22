@@ -21,10 +21,10 @@ use {
         net::SocketAddr,
         num::Saturating,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, Mutex, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
-        thread::{self, sleep, Builder, JoinHandle},
+        thread::{self, Builder, JoinHandle, sleep},
         time::{Duration, Instant},
     },
 };
@@ -157,7 +157,7 @@ impl Default for Config {
 pub const MAX_RETRY_SLEEP_MS: u64 = 1000;
 
 impl SendTransactionService {
-    pub fn new_with_client<Client: TransactionClient + Clone + std::marker::Send + 'static>(
+    pub fn new<Client: TransactionClient + Clone + std::marker::Send + 'static>(
         bank_forks: &Arc<RwLock<BankForks>>,
         receiver: Receiver<TransactionInfo>,
         client: Client,
@@ -214,92 +214,95 @@ impl SendTransactionService {
         debug!("Starting send-transaction-service::receive_txn_thread");
         Builder::new()
             .name("solStxReceive".to_string())
-            .spawn(move || loop {
-                let stats = &stats_report.stats;
-                let recv_result = receiver.recv_timeout(Duration::from_millis(batch_send_rate_ms));
-                if exit.load(Ordering::Relaxed) {
-                    break;
-                }
-                match recv_result {
-                    Err(RecvTimeoutError::Disconnected) => {
-                        info!("Terminating send-transaction-service.");
-                        exit.store(true, Ordering::Relaxed);
+            .spawn(move || {
+                loop {
+                    let stats = &stats_report.stats;
+                    let recv_result =
+                        receiver.recv_timeout(Duration::from_millis(batch_send_rate_ms));
+                    if exit.load(Ordering::Relaxed) {
                         break;
                     }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Ok(transaction_info) => {
-                        stats.received_transactions.fetch_add(1, Ordering::Relaxed);
-                        let entry = transactions.entry(transaction_info.signature);
-                        let mut new_transaction = false;
-                        if let Entry::Vacant(_) = entry {
-                            if !retry_transactions
-                                .lock()
-                                .unwrap()
-                                .contains_key(&transaction_info.signature)
-                            {
-                                entry.or_insert(transaction_info);
-                                new_transaction = true;
-                            }
+                    match recv_result {
+                        Err(RecvTimeoutError::Disconnected) => {
+                            info!("Terminating send-transaction-service.");
+                            exit.store(true, Ordering::Relaxed);
+                            break;
                         }
-                        if !new_transaction {
-                            stats
-                                .received_duplicate_transactions
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-
-                if (!transactions.is_empty()
-                    && last_batch_sent.elapsed().as_millis() as u64 >= batch_send_rate_ms)
-                    || transactions.len() >= batch_size
-                {
-                    stats
-                        .sent_transactions
-                        .fetch_add(transactions.len() as u64, Ordering::Relaxed);
-                    let wire_transactions = transactions
-                        .values()
-                        .map(|transaction_info| transaction_info.wire_transaction.clone())
-                        .collect::<Vec<Vec<u8>>>();
-                    client.send_transactions_in_batch(wire_transactions, stats);
-                    let last_sent_time = Instant::now();
-                    {
-                        // take a lock of retry_transactions and move the batch to the retry set.
-                        let mut retry_transactions = retry_transactions.lock().unwrap();
-                        let mut transactions_to_retry: usize = 0;
-                        let mut transactions_added_to_retry = Saturating::<usize>(0);
-                        for (signature, mut transaction_info) in transactions.drain() {
-                            // drop transactions with 0 max retries
-                            let max_retries = transaction_info
-                                .get_max_retries(default_max_retries, service_max_retries);
-                            if max_retries == Some(0) {
-                                continue;
-                            }
-                            transactions_to_retry += 1;
-
-                            let retry_len = retry_transactions.len();
-                            let entry = retry_transactions.entry(signature);
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Ok(transaction_info) => {
+                            stats.received_transactions.fetch_add(1, Ordering::Relaxed);
+                            let entry = transactions.entry(transaction_info.signature);
+                            let mut new_transaction = false;
                             if let Entry::Vacant(_) = entry {
-                                if retry_len >= retry_pool_max_size {
-                                    break;
-                                } else {
-                                    transaction_info.last_sent_time = Some(last_sent_time);
-                                    transactions_added_to_retry += 1;
+                                if !retry_transactions
+                                    .lock()
+                                    .unwrap()
+                                    .contains_key(&transaction_info.signature)
+                                {
                                     entry.or_insert(transaction_info);
+                                    new_transaction = true;
                                 }
                             }
+                            if !new_transaction {
+                                stats
+                                    .received_duplicate_transactions
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                         }
-                        let Saturating(retry_queue_overflow) =
-                            Saturating(transactions_to_retry) - transactions_added_to_retry;
-                        stats
-                            .retry_queue_overflow
-                            .fetch_add(retry_queue_overflow as u64, Ordering::Relaxed);
-                        stats
-                            .retry_queue_size
-                            .store(retry_transactions.len() as u64, Ordering::Relaxed);
                     }
-                    last_batch_sent = Instant::now();
+
+                    if (!transactions.is_empty()
+                        && last_batch_sent.elapsed().as_millis() as u64 >= batch_send_rate_ms)
+                        || transactions.len() >= batch_size
+                    {
+                        stats
+                            .sent_transactions
+                            .fetch_add(transactions.len() as u64, Ordering::Relaxed);
+                        let wire_transactions = transactions
+                            .values()
+                            .map(|transaction_info| transaction_info.wire_transaction.clone())
+                            .collect::<Vec<Vec<u8>>>();
+                        client.send_transactions_in_batch(wire_transactions, stats);
+                        let last_sent_time = Instant::now();
+                        {
+                            // take a lock of retry_transactions and move the batch to the retry set.
+                            let mut retry_transactions = retry_transactions.lock().unwrap();
+                            let mut transactions_to_retry: usize = 0;
+                            let mut transactions_added_to_retry = Saturating::<usize>(0);
+                            for (signature, mut transaction_info) in transactions.drain() {
+                                // drop transactions with 0 max retries
+                                let max_retries = transaction_info
+                                    .get_max_retries(default_max_retries, service_max_retries);
+                                if max_retries == Some(0) {
+                                    continue;
+                                }
+                                transactions_to_retry += 1;
+
+                                let retry_len = retry_transactions.len();
+                                let entry = retry_transactions.entry(signature);
+                                if let Entry::Vacant(_) = entry {
+                                    if retry_len >= retry_pool_max_size {
+                                        break;
+                                    } else {
+                                        transaction_info.last_sent_time = Some(last_sent_time);
+                                        transactions_added_to_retry += 1;
+                                        entry.or_insert(transaction_info);
+                                    }
+                                }
+                            }
+                            let Saturating(retry_queue_overflow) =
+                                Saturating(transactions_to_retry) - transactions_added_to_retry;
+                            stats
+                                .retry_queue_overflow
+                                .fetch_add(retry_queue_overflow as u64, Ordering::Relaxed);
+                            stats
+                                .retry_queue_size
+                                .store(retry_transactions.len() as u64, Ordering::Relaxed);
+                        }
+                        last_batch_sent = Instant::now();
+                    }
+                    stats_report.report();
                 }
-                stats_report.report();
             })
             .unwrap()
     }
@@ -319,44 +322,46 @@ impl SendTransactionService {
         let mut retry_interval_ms = retry_interval_ms_default;
         Builder::new()
             .name("solStxRetry".to_string())
-            .spawn(move || loop {
-                sleep(Duration::from_millis(retry_interval_ms));
-                if exit.load(Ordering::Relaxed) {
-                    break;
-                }
-                let mut transactions = retry_transactions.lock().unwrap();
-                if transactions.is_empty() {
-                    retry_interval_ms = retry_interval_ms_default;
-                } else {
-                    let stats = &stats_report.stats;
-                    stats
-                        .retry_queue_size
-                        .store(transactions.len() as u64, Ordering::Relaxed);
+            .spawn(move || {
+                loop {
+                    sleep(Duration::from_millis(retry_interval_ms));
+                    if exit.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let mut transactions = retry_transactions.lock().unwrap();
+                    if transactions.is_empty() {
+                        retry_interval_ms = retry_interval_ms_default;
+                    } else {
+                        let stats = &stats_report.stats;
+                        stats
+                            .retry_queue_size
+                            .store(transactions.len() as u64, Ordering::Relaxed);
 
-                    let BankPair {
-                        root_bank,
-                        working_bank,
-                    } = sharable_banks.load();
-                    let result = Self::process_transactions(
-                        &working_bank,
-                        &root_bank,
-                        &mut transactions,
-                        &client,
-                        &config,
-                        stats,
-                    );
-                    stats_report.report();
+                        let BankPair {
+                            root_bank,
+                            working_bank,
+                        } = sharable_banks.load();
+                        let result = Self::process_transactions(
+                            &working_bank,
+                            &root_bank,
+                            &mut transactions,
+                            &client,
+                            &config,
+                            stats,
+                        );
+                        stats_report.report();
 
-                    // Adjust retry interval taking into account the time since the last send.
-                    retry_interval_ms = retry_interval_ms_default
-                        .checked_sub(
-                            result
-                                .last_sent_time
-                                .and_then(|last| Instant::now().checked_duration_since(last))
-                                .and_then(|interval| interval.as_millis().try_into().ok())
-                                .unwrap_or(0),
-                        )
-                        .unwrap_or(retry_interval_ms_default);
+                        // Adjust retry interval taking into account the time since the last send.
+                        retry_interval_ms = retry_interval_ms_default
+                            .checked_sub(
+                                result
+                                    .last_sent_time
+                                    .and_then(|last| Instant::now().checked_duration_since(last))
+                                    .and_then(|interval| interval.as_millis().try_into().ok())
+                                    .unwrap_or(0),
+                            )
+                            .unwrap_or(retry_interval_ms_default);
+                    }
                 }
             })
             .unwrap()
@@ -531,11 +536,7 @@ impl SendTransactionService {
 mod test {
     use {
         super::*,
-        crate::{
-            test_utils::ClientWithCreator,
-            tpu_info::NullTpuInfo,
-            transaction_client::{ConnectionCacheClient, TpuClientNextClient},
-        },
+        crate::test_utils::create_client_for_tests,
         crossbeam_channel::{bounded, unbounded},
         solana_account::AccountSharedData,
         solana_genesis_config::create_genesis_config,
@@ -548,14 +549,18 @@ mod test {
         tokio::runtime::Handle,
     };
 
-    fn service_exit<C: ClientWithCreator>(maybe_runtime: Option<Handle>) {
+    const GENESIS_LAMPORTS: u64 = 10_000_000_000;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn service_exit() {
         let bank = Bank::default_for_tests();
         let bank_forks = BankForks::new_rw_arc(bank);
         let (sender, receiver) = unbounded();
 
-        let client = C::create_client(maybe_runtime, "127.0.0.1:0".parse().unwrap(), None, 1);
+        let client =
+            create_client_for_tests(Handle::current(), "127.0.0.1:0".parse().unwrap(), None, 1);
 
-        let send_transaction_service = SendTransactionService::new_with_client(
+        let send_transaction_service = SendTransactionService::new(
             &bank_forks,
             receiver,
             client.clone(),
@@ -568,20 +573,11 @@ mod test {
 
         drop(sender);
         send_transaction_service.join().unwrap();
-        client.stop();
-    }
-
-    #[test]
-    fn service_exit_with_connection_cache() {
-        service_exit::<ConnectionCacheClient<NullTpuInfo>>(None);
+        client.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn service_exit_with_tpu_client_next() {
-        service_exit::<TpuClientNextClient>(Some(Handle::current()));
-    }
-
-    fn validator_exit<C: ClientWithCreator>(maybe_runtime: Option<Handle>) {
+    async fn validator_exit() {
         let bank = Bank::default_for_tests();
         let bank_forks = BankForks::new_rw_arc(bank);
         let (sender, receiver) = bounded(0);
@@ -599,8 +595,9 @@ mod test {
         };
 
         let exit = Arc::new(AtomicBool::new(false));
-        let client = C::create_client(maybe_runtime, "127.0.0.1:0".parse().unwrap(), None, 1);
-        let _send_transaction_service = SendTransactionService::new_with_client(
+        let client =
+            create_client_for_tests(Handle::current(), "127.0.0.1:0".parse().unwrap(), None, 1);
+        let _send_transaction_service = SendTransactionService::new(
             &bank_forks,
             receiver,
             client.clone(),
@@ -615,7 +612,7 @@ mod test {
 
         thread::spawn(move || {
             exit.store(true, Ordering::Relaxed);
-            client.stop();
+            client.cancel();
         });
 
         let mut option = Ok(());
@@ -624,20 +621,11 @@ mod test {
         }
     }
 
-    #[test]
-    fn validator_exit_with_connection_cache() {
-        validator_exit::<ConnectionCacheClient<NullTpuInfo>>(None);
-    }
-
     #[tokio::test(flavor = "multi_thread")]
-    async fn validator_exit_with_tpu_client_next() {
-        validator_exit::<TpuClientNextClient>(Some(Handle::current()));
-    }
-
-    fn process_transactions<C: ClientWithCreator>(maybe_runtime: Option<Handle>) {
+    async fn process_transactions() {
         agave_logger::setup();
 
-        let (mut genesis_config, mint_keypair) = create_genesis_config(4);
+        let (mut genesis_config, mint_keypair) = create_genesis_config(GENESIS_LAMPORTS);
         genesis_config.fee_rate_governor = solana_fee_calculator::FeeRateGovernor::new(0, 0);
         let (_, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
 
@@ -719,8 +707,8 @@ mod test {
             ),
         );
 
-        let client = C::create_client(
-            maybe_runtime,
+        let client = create_client_for_tests(
+            Handle::current(),
             "127.0.0.1:0".parse().unwrap(),
             config.tpu_peers.clone(),
             leader_forward_count,
@@ -913,23 +901,14 @@ mod test {
                 ..ProcessTransactionsResult::default()
             }
         );
-        client.stop();
-    }
-
-    #[test]
-    fn process_transactions_with_connection_cache() {
-        process_transactions::<ConnectionCacheClient<NullTpuInfo>>(None);
+        client.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn process_transactions_with_tpu_client_next() {
-        process_transactions::<TpuClientNextClient>(Some(Handle::current()));
-    }
-
-    fn retry_durable_nonce_transactions<C: ClientWithCreator>(maybe_runtime: Option<Handle>) {
+    async fn retry_durable_nonce_transactions() {
         agave_logger::setup();
 
-        let (mut genesis_config, mint_keypair) = create_genesis_config(4);
+        let (mut genesis_config, mint_keypair) = create_genesis_config(GENESIS_LAMPORTS);
         genesis_config.fee_rate_governor = solana_fee_calculator::FeeRateGovernor::new(0, 0);
         let (_, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         let leader_forward_count = 1;
@@ -1017,8 +996,8 @@ mod test {
             ),
         );
         let stats = SendTransactionServiceStats::default();
-        let client = C::create_client(
-            maybe_runtime,
+        let client = create_client_for_tests(
+            Handle::current(),
             "127.0.0.1:0".parse().unwrap(),
             config.tpu_peers.clone(),
             leader_forward_count,
@@ -1254,16 +1233,6 @@ mod test {
                 ..ProcessTransactionsResult::default()
             }
         );
-        client.stop();
-    }
-
-    #[test]
-    fn retry_durable_nonce_transactions_with_connection_cache() {
-        retry_durable_nonce_transactions::<ConnectionCacheClient<NullTpuInfo>>(None);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn retry_durable_nonce_transactions_with_tpu_client_next() {
-        retry_durable_nonce_transactions::<TpuClientNextClient>(Some(Handle::current()));
+        client.cancel();
     }
 }

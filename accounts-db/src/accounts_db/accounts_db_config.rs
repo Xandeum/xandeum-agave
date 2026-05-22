@@ -1,16 +1,15 @@
 use {
     super::{
-        AccountShrinkThreshold, MarkObsoleteAccounts, DEFAULT_ACCOUNTS_SHRINK_THRESHOLD_OPTION,
-        MEMLOCK_BUDGET_SIZE_FOR_TESTS,
+        AccountShrinkThreshold, DEFAULT_ACCOUNTS_SHRINK_THRESHOLD_OPTION, MarkObsoleteAccounts,
     },
     crate::{
         accounts_file::StorageAccess,
         accounts_index::{
-            AccountSecondaryIndexes, AccountsIndexConfig, ScanFilter,
             ACCOUNTS_INDEX_CONFIG_FOR_BENCHMARKS, ACCOUNTS_INDEX_CONFIG_FOR_TESTING,
+            AccountSecondaryIndexes, AccountsIndexConfig, ScanFilter,
         },
         partitioned_rewards::{
-            PartitionedEpochRewardsConfig, DEFAULT_PARTITIONED_EPOCH_REWARDS_CONFIG,
+            DEFAULT_PARTITIONED_EPOCH_REWARDS_CONFIG, PartitionedEpochRewardsConfig,
         },
     },
     std::{num::NonZeroUsize, path::PathBuf},
@@ -20,8 +19,7 @@ use {
 pub struct AccountsDbConfig {
     pub index: Option<AccountsIndexConfig>,
     pub account_indexes: Option<AccountSecondaryIndexes>,
-    /// Base directory for various necessary files
-    pub base_working_path: Option<PathBuf>,
+    pub bank_hash_details_dir: PathBuf,
     pub shrink_paths: Option<Vec<PathBuf>>,
     pub shrink_ratio: AccountShrinkThreshold,
     /// The low and high watermark sizes for the read cache, in bytes.
@@ -46,16 +44,18 @@ pub struct AccountsDbConfig {
     pub num_background_threads: Option<NonZeroUsize>,
     /// Number of threads for foreground operations (`thread_pool_foreground`)
     pub num_foreground_threads: Option<NonZeroUsize>,
-    /// Amount of memory (in bytes) that is allowed to be locked during db operations.
-    /// On linux it's verified on start-up with the kernel limits, such that during runtime
-    /// parts of it can be utilized without panicking.
-    pub memlock_budget_size: usize,
+    /// Whether to register buffers as *fixed* in io_uring
+    ///
+    /// Requires memlock ulimit higher than sum of buffer sizes registered at the same time.
+    pub use_registered_io_uring_buffers: bool,
+    /// Enables direct I/O for operations on snapshots, their archives and contents being unpacked
+    pub snapshots_use_direct_io: bool,
 }
 
 pub const ACCOUNTS_DB_CONFIG_FOR_TESTING: AccountsDbConfig = AccountsDbConfig {
     index: Some(ACCOUNTS_INDEX_CONFIG_FOR_TESTING),
     account_indexes: None,
-    base_working_path: None,
+    bank_hash_details_dir: PathBuf::new(), // tests don't use bank hash details
     shrink_paths: None,
     shrink_ratio: DEFAULT_ACCOUNTS_SHRINK_THRESHOLD_OPTION,
     read_cache_limit_bytes: None,
@@ -69,16 +69,17 @@ pub const ACCOUNTS_DB_CONFIG_FOR_TESTING: AccountsDbConfig = AccountsDbConfig {
     partitioned_epoch_rewards_config: DEFAULT_PARTITIONED_EPOCH_REWARDS_CONFIG,
     storage_access: StorageAccess::File,
     scan_filter_for_shrinking: ScanFilter::OnlyAbnormalTest,
-    mark_obsolete_accounts: MarkObsoleteAccounts::Disabled,
+    mark_obsolete_accounts: MarkObsoleteAccounts::Enabled,
     num_background_threads: None,
     num_foreground_threads: None,
-    memlock_budget_size: MEMLOCK_BUDGET_SIZE_FOR_TESTS,
+    use_registered_io_uring_buffers: true,
+    snapshots_use_direct_io: true,
 };
 
 pub const ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS: AccountsDbConfig = AccountsDbConfig {
     index: Some(ACCOUNTS_INDEX_CONFIG_FOR_BENCHMARKS),
     account_indexes: None,
-    base_working_path: None,
+    bank_hash_details_dir: PathBuf::new(), // benches don't use bank hash details
     shrink_paths: None,
     shrink_ratio: DEFAULT_ACCOUNTS_SHRINK_THRESHOLD_OPTION,
     read_cache_limit_bytes: None,
@@ -92,8 +93,9 @@ pub const ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS: AccountsDbConfig = AccountsDbConfig
     partitioned_epoch_rewards_config: DEFAULT_PARTITIONED_EPOCH_REWARDS_CONFIG,
     storage_access: StorageAccess::File,
     scan_filter_for_shrinking: ScanFilter::OnlyAbnormal,
-    mark_obsolete_accounts: MarkObsoleteAccounts::Disabled,
+    mark_obsolete_accounts: MarkObsoleteAccounts::Enabled,
     num_background_threads: None,
     num_foreground_threads: None,
-    memlock_budget_size: MEMLOCK_BUDGET_SIZE_FOR_TESTS,
+    use_registered_io_uring_buffers: true,
+    snapshots_use_direct_io: true,
 };

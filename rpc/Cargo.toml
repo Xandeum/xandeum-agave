@@ -70,7 +70,6 @@ solana-poh = { workspace = true }
 solana-poh-config = { workspace = true }
 solana-program-pack = { workspace = true }
 solana-pubkey = { workspace = true }
-solana-quic-definitions = { workspace = true }
 solana-rayon-threadlimit = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-runtime = { workspace = true }
@@ -80,12 +79,12 @@ solana-signature = { workspace = true }
 solana-signer = { workspace = true }
 solana-slot-history = { workspace = true }
 solana-storage-bigtable = { workspace = true }
-solana-streamer = { workspace = true }
 solana-svm = { workspace = true }
 solana-system-interface = { workspace = true }
 solana-system-transaction = { workspace = true }
 solana-sysvar = { workspace = true }
 solana-time-utils = { workspace = true }
+solana-tls-utils = { workspace = true }
 solana-tpu-client = { workspace = true }
 solana-transaction = { workspace = true }
 solana-transaction-context = { workspace = true }

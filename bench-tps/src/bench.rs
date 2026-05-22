@@ -2,14 +2,14 @@ use {
     crate::{
         cli::{ComputeUnitPrice, Config, InstructionPaddingConfig},
         log_transaction_service::{
-            create_log_transactions_service_and_sender, SignatureBatchSender, TransactionInfoBatch,
+            SignatureBatchSender, TransactionInfoBatch, create_log_transactions_service_and_sender,
         },
-        perf_utils::{sample_txs, SampleStats},
+        perf_utils::{SampleStats, sample_txs},
         send_batch::*,
     },
     chrono::Utc,
     log::*,
-    rand::distributions::{Distribution, Uniform},
+    rand::distr::{Distribution, Uniform},
     rayon::prelude::*,
     solana_account::Account,
     solana_client::nonce_utils,
@@ -33,10 +33,10 @@ use {
         collections::{HashSet, VecDeque},
         process::exit,
         sync::{
-            atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
             Arc, RwLock,
+            atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
         },
-        thread::{sleep, Builder, JoinHandle},
+        thread::{Builder, JoinHandle, sleep},
         time::{Duration, Instant},
     },
 };
@@ -583,8 +583,9 @@ fn generate_system_txs(
     if let Some(compute_unit_price) = compute_unit_price {
         let compute_unit_prices = match compute_unit_price {
             ComputeUnitPrice::Random => {
-                let mut rng = rand::thread_rng();
-                let range = Uniform::from(0..MAX_RANDOM_COMPUTE_UNIT_PRICE);
+                let mut rng = rand::rng();
+                let range = Uniform::try_from(0..MAX_RANDOM_COMPUTE_UNIT_PRICE)
+                    .expect("ok for non-empty range");
                 (0..pairs.len())
                     .map(|_| {
                         range
@@ -1225,7 +1226,7 @@ mod tests {
         agave_feature_set::FeatureSet,
         solana_commitment_config::CommitmentConfig,
         solana_fee_calculator::FeeRateGovernor,
-        solana_genesis_config::{create_genesis_config, GenesisConfig},
+        solana_genesis_config::{GenesisConfig, create_genesis_config},
         solana_native_token::LAMPORTS_PER_SOL,
         solana_nonce::state::State,
         solana_runtime::{bank::Bank, bank_client::BankClient, bank_forks::BankForks},

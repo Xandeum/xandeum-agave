@@ -1,12 +1,4 @@
-#![cfg_attr(
-    not(feature = "agave-unstable-api"),
-    deprecated(
-        since = "3.1.0",
-        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
-                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
-                acknowledge use of an interface that may break without warning."
-    )
-)]
+#![cfg(feature = "agave-unstable-api")]
 use {
     log::*,
     rand::Rng,
@@ -18,7 +10,7 @@ use {
 // The mask is 12 bits long (1<<12 = 4096), it means the probability of matching
 // the transaction is 1/4096 assuming the portion being matched is random.
 static TXN_MASK: std::sync::LazyLock<u16> =
-    std::sync::LazyLock::new(|| rand::thread_rng().gen_range(0..4096));
+    std::sync::LazyLock::new(|| rand::rng().random_range(0..4096));
 
 /// Check if a transaction given its signature matches the randomly selected mask.
 /// The signature should be from the reference of Signature
@@ -69,7 +61,7 @@ mod tests {
         super::*,
         solana_hash::Hash,
         solana_keypair::Keypair,
-        solana_perf::packet::{bytes::Bytes, Meta},
+        solana_perf::packet::{Meta, bytes::Bytes},
         solana_signature::Signature,
         solana_system_transaction as system_transaction,
     };
@@ -112,8 +104,8 @@ mod tests {
         // The lower four bits are ignored as only 12 highest bits from
         // signature's 61 and 62 u8 are used for matching.
         // We generate a random one
-        let mut rng = rand::thread_rng();
-        let random_number: u8 = rng.gen_range(0..=15);
+        let mut rng = rand::rng();
+        let random_number: u8 = rng.random_range(0..=15);
         sig[61] = ((*TXN_MASK & 0xf_u16) << 4) as u8 | random_number;
         sig[62] = (*TXN_MASK >> 4) as u8;
 

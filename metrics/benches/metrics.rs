@@ -1,11 +1,11 @@
 use {
-    bencher::{benchmark_group, benchmark_main, Bencher},
+    bencher::{Bencher, benchmark_group, benchmark_main},
     log::*,
-    rand::distributions::{Distribution, Uniform},
+    rand::distr::{Distribution, Uniform},
     solana_metrics::{
         counter::CounterPoint,
         datapoint::DataPoint,
-        metrics::{serialize_points, test_mocks::MockMetricsWriter, MetricsAgent},
+        metrics::{MetricsAgent, serialize_points, test_mocks::MockMetricsWriter},
     },
     std::{hint::black_box, sync::Arc, time::Duration},
 };
@@ -60,8 +60,8 @@ fn bench_counter_submission(b: &mut Bencher) {
 fn bench_random_submission(b: &mut Bencher) {
     let writer = Arc::new(MockMetricsWriter::new());
     let agent = MetricsAgent::new(writer, Duration::from_secs(10), 1000);
-    let mut rng = rand::thread_rng();
-    let die = Uniform::<i32>::from(1..7);
+    let mut rng = rand::rng();
+    let die = Uniform::<i32>::try_from(1..7).expect("ok for non-empty range");
 
     b.iter(|| {
         for i in 0..1000 {

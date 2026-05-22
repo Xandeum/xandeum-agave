@@ -60,13 +60,7 @@ Operate a configured testnet
                                       - Number of seconds to wait after validators have finished starting before starting client programs
                                         (default: $clientDelayStart)
    -n NUM_VALIDATORS                  - Number of validators to apply command to.
-   --gpu-mode GPU_MODE                - Specify GPU mode to launch validators with (default: $gpuMode).
-                                        MODE must be one of
-                                          on - GPU *required*, any vendor *
-                                          off - No GPU, CPU-only
-                                          auto - Use GPU if available, any vendor *
-                                          cuda - GPU *required*, Nvidia CUDA only
-                                          *  Currently, Nvidia CUDA is the only supported GPU vendor
+   --gpu-mode GPU_MODE                - Deprecated, this argument is ignored
    --hashes-per-tick NUM_HASHES|sleep|auto
                                       - Override the default --hashes-per-tick for the cluster
    --no-airdrop
@@ -142,9 +136,6 @@ Operate a configured testnet
  startnode/stopnode-specific options:
    -i [ip address]                    - IP Address of the node to start or stop
 
- startnode specific option:
-   --wen-restart [coordinator_pubkey]      - Use given coordinator pubkey and apply wen_restat
-
  startclients-specific options:
    $CLIENT_OPTIONS
 
@@ -211,7 +202,7 @@ build() {
 
     $MAYBE_DOCKER bash -c "
       set -ex
-      $profilerFlags scripts/cargo-install-all.sh farf $buildVariant --validator-only --no-spl-token
+      $profilerFlags scripts/cargo-install-all.sh farf $buildVariant --no-build-dev-bins --no-build-deprecated-bins --no-build-platform-tools --no-spl-token
     "
   )
 
@@ -341,7 +332,6 @@ startBootstrapLeader() {
          ${#clientIpList[@]} \"$benchTpsExtraArgs\" \
          \"$genesisOptions\" \
          \"$maybeNoSnapshot $maybeSkipLedgerVerify $maybeLimitLedgerSize $maybeWaitForSupermajority $maybeAccountsDbSkipShrink $maybeSkipRequireTower\" \
-         \"$gpuMode\" \
          \"$maybeWarpSlot\" \
          \"$maybeFullRpc\" \
          \"$waitForNodeInit\" \
@@ -349,7 +339,6 @@ startBootstrapLeader() {
          \"$TMPFS_ACCOUNTS\" \
          \"$disableQuic\" \
          \"$enableUdp\" \
-         \"$maybeWenRestart\" \
       "
 
   ) >> "$logFile" 2>&1 || {
@@ -416,7 +405,6 @@ startNode() {
          ${#clientIpList[@]} \"$benchTpsExtraArgs\" \
          \"$genesisOptions\" \
          \"$maybeNoSnapshot $maybeSkipLedgerVerify $maybeLimitLedgerSize $maybeWaitForSupermajority $maybeAccountsDbSkipShrink $maybeSkipRequireTower\" \
-         \"$gpuMode\" \
          \"$maybeWarpSlot\" \
          \"$maybeFullRpc\" \
          \"$waitForNodeInit\" \
@@ -424,7 +412,6 @@ startNode() {
          \"$TMPFS_ACCOUNTS\" \
          \"$disableQuic\" \
          \"$enableUdp\" \
-         \"$maybeWenRestart\" \
       "
   ) >> "$logFile" 2>&1 &
   declare pid=$!
@@ -831,7 +818,6 @@ maybeSkipRequireTower=""
 debugBuild=false
 profileBuild=false
 doBuild=true
-gpuMode=auto
 clientDelayStart=0
 netLogDir=
 maybeWarpSlot=
@@ -842,7 +828,6 @@ disableQuic=false
 enableUdp=false
 clientType=tpu-client
 maybeUseUnstakedConnection=""
-maybeWenRestart=""
 
 command=$1
 [[ -n $command ]] || usage
@@ -925,15 +910,7 @@ while [[ -n $1 ]]; do
       profileBuild=true
       shift 1
     elif [[ $1 = --gpu-mode ]]; then
-      gpuMode=$2
-      case "$gpuMode" in
-        on|off|auto|cuda)
-          ;;
-        *)
-          echo "Unexpected GPU mode: \"$gpuMode\""
-          exit 1
-          ;;
-      esac
+      echo "'--gpu-mode' is deprecated, GPU support was removed from agave"
       shift 2
     elif [[ $1 == --client-delay-start ]]; then
       clientDelayStart=$2
@@ -982,12 +959,6 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --use-unstaked-connection ]]; then
       maybeUseUnstakedConnection="$1"
       shift 1
-    elif [[ $1 = --wen-restart ]]; then
-      # wen_restart needs tower storage to be there, so set skipSetup to true
-      # to avoid erasing the tower storage on disk.
-      skipSetup=true
-      maybeWenRestart="$2"
-      shift 2
     else
       usage "Unknown long option: $1"
     fi

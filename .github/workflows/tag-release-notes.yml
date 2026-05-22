@@ -1,0 +1,35 @@
+# When you push a version tag (e.g. v3.1.13x), create or update a GitHub Release
+# with auto-generated notes from merged PRs and commits since the previous tag.
+#
+# Narrow `if` below to your GitHub repo if you do not want this on every fork.
+name: Tag release notes
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    # Skip upstream repo (they use release.yml + Buildkite). Remove this line
+    # to run everywhere, or replace with: github.repository == 'YOUR_ORG/YOUR_REPO'
+    if: github.repository != 'anza-xyz/agave'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Create or update release (auto-generated notes)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          # Start as draft so you can edit the description before publishing
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

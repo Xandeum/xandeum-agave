@@ -5,9 +5,9 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::shred::{
-        self, max_entries_per_n_shred, max_entries_per_n_shred_last_or_not, recover,
-        verify_test_data_shred, ProcessShredsStats, ReedSolomonCache, Shred, ShredData, Shredder,
-        DATA_SHREDS_PER_FEC_BLOCK,
+        self, DATA_SHREDS_PER_FEC_BLOCK, ProcessShredsStats, ReedSolomonCache, Shred, ShredData,
+        Shredder, max_entries_per_n_shred, max_entries_per_n_shred_last_or_not, recover,
+        verify_test_data_shred,
     },
     solana_signer::Signer,
     solana_system_transaction as system_transaction,
@@ -47,7 +47,7 @@ fn test_multi_fec_block_coding(is_last_in_slot: bool) {
         .collect();
 
     let reed_solomon_cache = ReedSolomonCache::default();
-    let serialized_entries = bincode::serialize(&entries).unwrap();
+    let serialized_entries = wincode::serialize(&entries).unwrap();
 
     let (data_shreds, coding_shreds) = shredder.entries_to_merkle_shreds_for_tests(
         &keypair,

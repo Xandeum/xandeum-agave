@@ -12,7 +12,7 @@ use {
         bank_utils,
         prioritization_fee_cache::PrioritizationFeeCache,
         transaction_batch::TransactionBatch,
-        vote_sender_types::ReplayVoteSender,
+        vote_sender_types::{ReplayVoteSendType, ReplayVoteSender},
     },
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_svm::{
@@ -39,14 +39,14 @@ pub enum CommitTransactionDetails {
 pub struct Committer {
     transaction_status_sender: Option<TransactionStatusSender>,
     replay_vote_sender: ReplayVoteSender,
-    prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+    prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
 }
 
 impl Committer {
     pub fn new(
         transaction_status_sender: Option<TransactionStatusSender>,
         replay_vote_sender: ReplayVoteSender,
-        prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+        prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
     ) -> Self {
         Self {
             transaction_status_sender,
@@ -100,14 +100,16 @@ impl Committer {
                 batch.sanitized_transactions(),
                 &commit_results,
                 Some(&self.replay_vote_sender),
+                ReplayVoteSendType::VerifiedExecuted,
             );
 
-            let committed_transactions = commit_results
-                .iter()
-                .zip(batch.sanitized_transactions())
-                .filter_map(|(commit_result, tx)| commit_result.was_committed().then_some(tx));
-            self.prioritization_fee_cache
-                .update(bank, committed_transactions);
+            if let Some(prioritization_fee_cache) = self.prioritization_fee_cache.as_ref() {
+                let committed_transactions = commit_results
+                    .iter()
+                    .zip(batch.sanitized_transactions())
+                    .filter_map(|(commit_result, tx)| commit_result.was_committed().then_some(tx));
+                prioritization_fee_cache.update(bank, committed_transactions);
+            }
 
             self.collect_balances_and_send_status_batch(
                 commit_results,

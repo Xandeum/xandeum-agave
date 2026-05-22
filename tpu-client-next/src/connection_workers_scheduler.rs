@@ -4,14 +4,14 @@
 use {
     super::leader_updater::LeaderUpdater,
     crate::{
+        SendTransactionStats,
         connection_worker::DEFAULT_MAX_CONNECTION_HANDSHAKE_TIMEOUT,
         logging::debug,
         quic_networking::{
-            create_client_config, create_client_endpoint, QuicClientCertificate, QuicError,
+            QuicClientCertificate, QuicError, create_client_config, create_client_endpoint,
         },
         transaction_batch::TransactionBatch,
-        workers_cache::{shutdown_worker, WorkersCache, WorkersCacheError},
-        SendTransactionStats,
+        workers_cache::{WorkersCache, WorkersCacheError, shutdown_worker},
     },
     async_trait::async_trait,
     quinn::{ClientConfig, Endpoint},
@@ -100,6 +100,10 @@ pub struct ConnectionWorkersSchedulerConfig {
 
     /// Configures the number of leaders to connect to and send transactions to.
     pub leaders_fanout: Fanout,
+
+    /// Override the initial congestion window size in bytes. If `None`, uses
+    /// INITIAL_CONGESTION_WINDOW as the default.
+    pub override_initial_congestion_window: Option<u64>,
 }
 
 /// The [`BindTarget`] enum defines how the UDP socket should be bound:
@@ -139,7 +143,7 @@ impl From<StakeIdentity> for QuicClientCertificate {
 /// [`ConnectionWorkersScheduler`] to distribute transactions to workers
 /// accordingly.
 #[async_trait]
-pub trait WorkersBroadcaster {
+pub trait WorkersBroadcaster: Send + Sync {
     /// Sends a `transaction_batch` to workers associated with the given
     /// `leaders` addresses.
     ///
@@ -147,6 +151,7 @@ pub trait WorkersBroadcaster {
     /// encounters an unrecoverable error. In this case, it will trigger
     /// stopping the scheduler and cleaning all the data.
     async fn send_to_workers(
+        &self,
         workers: &mut WorkersCache,
         leaders: &[SocketAddr],
         transaction_batch: TransactionBatch,
@@ -190,20 +195,20 @@ impl ConnectionWorkersScheduler {
         self,
         config: ConnectionWorkersSchedulerConfig,
     ) -> Result<Arc<SendTransactionStats>, ConnectionWorkersSchedulerError> {
-        self.run_with_broadcaster::<NonblockingBroadcaster>(config)
+        self.run_with_broadcaster(config, Box::new(NonblockingBroadcaster))
             .await
     }
 
-    /// Starts the scheduler, which manages the distribution of transactions to
-    /// the network's upcoming leaders. `Broadcaster` allows to customize the
-    /// way transactions are send to the leaders, see [`WorkersBroadcaster`].
+    /// Starts the scheduler, which manages the distribution of transactions to the network's
+    /// upcoming leaders. `broadcaster` allows to customize the way transactions are send to the
+    /// leaders, see [`WorkersBroadcaster`].
     ///
-    /// Runs the main loop that handles worker scheduling and management for
-    /// connections. Returns [`SendTransactionStats`] or an error.
+    /// Runs the main loop that handles worker scheduling and management for connections. Returns
+    /// [`SendTransactionStats`] or an error.
     ///
-    /// Importantly, if some transactions were not delivered due to network
-    /// problems, they will not be retried when the problem is resolved.
-    pub async fn run_with_broadcaster<Broadcaster: WorkersBroadcaster>(
+    /// Importantly, if some transactions were not delivered due to network problems, they will not
+    /// be retried when the problem is resolved.
+    pub async fn run_with_broadcaster(
         self,
         ConnectionWorkersSchedulerConfig {
             bind,
@@ -213,7 +218,9 @@ impl ConnectionWorkersScheduler {
             worker_channel_size,
             max_reconnect_attempts,
             leaders_fanout,
+            override_initial_congestion_window: initial_congestion_window,
         }: ConnectionWorkersSchedulerConfig,
+        broadcaster: Box<dyn WorkersBroadcaster>,
     ) -> Result<Arc<SendTransactionStats>, ConnectionWorkersSchedulerError> {
         let ConnectionWorkersScheduler {
             mut leader_updater,
@@ -222,7 +229,7 @@ impl ConnectionWorkersScheduler {
             cancel,
             stats,
         } = self;
-        let mut endpoint = setup_endpoint(bind, stake_identity)?;
+        let mut endpoint = setup_endpoint(bind, stake_identity, initial_congestion_window)?;
 
         debug!("Client endpoint bind address: {:?}", endpoint.local_addr());
         let mut workers = WorkersCache::new(num_connections, cancel.clone());
@@ -250,7 +257,7 @@ impl ConnectionWorkersScheduler {
                         continue;
                     };
 
-                    let client_config = build_client_config(update_identity_receiver.borrow_and_update().as_ref());
+                    let client_config = build_client_config(update_identity_receiver.borrow_and_update().as_ref(), initial_congestion_window);
                     endpoint.set_default_client_config(client_config);
                     // Flush workers since they are handling connections created
                     // with outdated certificate.
@@ -283,8 +290,9 @@ impl ConnectionWorkersScheduler {
                 }
             }
 
-            if let Err(error) =
-                Broadcaster::send_to_workers(&mut workers, &send_leaders, transaction_batch).await
+            if let Err(error) = broadcaster
+                .send_to_workers(&mut workers, &send_leaders, transaction_batch)
+                .await
             {
                 last_error = Some(error);
                 break;
@@ -306,28 +314,33 @@ impl ConnectionWorkersScheduler {
 pub fn setup_endpoint(
     bind: BindTarget,
     stake_identity: Option<StakeIdentity>,
+    initial_congestion_window: Option<u64>,
 ) -> Result<Endpoint, ConnectionWorkersSchedulerError> {
-    let client_config = build_client_config(stake_identity.as_ref());
+    let client_config = build_client_config(stake_identity.as_ref(), initial_congestion_window);
     let endpoint = create_client_endpoint(bind, client_config)?;
     Ok(endpoint)
 }
 
-fn build_client_config(stake_identity: Option<&StakeIdentity>) -> ClientConfig {
+fn build_client_config(
+    stake_identity: Option<&StakeIdentity>,
+    initial_congestion_window: Option<u64>,
+) -> ClientConfig {
     let client_certificate = match stake_identity {
         Some(identity) => identity.as_certificate(),
         None => &QuicClientCertificate::new(None),
     };
-    create_client_config(client_certificate)
+    create_client_config(client_certificate, initial_congestion_window)
 }
 
 /// [`NonblockingBroadcaster`] attempts to immediately send transactions to all
 /// the workers. If worker cannot accept transactions because it's channel is
 /// full, the transactions will not be sent to this worker.
-struct NonblockingBroadcaster;
+pub struct NonblockingBroadcaster;
 
 #[async_trait]
 impl WorkersBroadcaster for NonblockingBroadcaster {
     async fn send_to_workers(
+        &self,
         workers: &mut WorkersCache,
         leaders: &[SocketAddr],
         transaction_batch: TransactionBatch,

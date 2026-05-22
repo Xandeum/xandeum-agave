@@ -1,15 +1,16 @@
 use {
     crate::{commands, commands::run::args::pub_sub_config},
     agave_snapshots::{
+        DEFAULT_ARCHIVE_COMPRESSION, SnapshotVersion,
         snapshot_config::{
             DEFAULT_FULL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
             DEFAULT_INCREMENTAL_SNAPSHOT_ARCHIVE_INTERVAL_SLOTS,
             DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
             DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
         },
-        SnapshotVersion, DEFAULT_ARCHIVE_COMPRESSION,
     },
-    clap::{crate_description, crate_name, App, AppSettings, Arg, ArgMatches, SubCommand},
+    clap::{App, AppSettings, Arg, ArgMatches, SubCommand, crate_description, crate_name},
+    log::warn,
     solana_accounts_db::accounts_db::{
         DEFAULT_ACCOUNTS_SHRINK_OPTIMIZE_TOTAL_SPACE, DEFAULT_ACCOUNTS_SHRINK_RATIO,
     },
@@ -20,28 +21,26 @@ use {
         },
     },
     solana_clock::Slot,
-    solana_core::{
-        banking_trace::BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT, validator::TransactionStructure,
-    },
+    solana_core::banking_trace::BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT,
     solana_epoch_schedule::MINIMUM_SLOTS_PER_EPOCH,
     solana_faucet::faucet::{self, FAUCET_PORT},
     solana_hash::Hash,
     solana_net_utils::{MINIMUM_VALIDATOR_PORT_RANGE_WIDTH, VALIDATOR_PORT_RANGE},
-    solana_quic_definitions::QUIC_PORT_OFFSET,
     solana_send_transaction_service::send_transaction_service::{self},
     solana_streamer::quic::{
-        DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE, DEFAULT_MAX_QUIC_CONNECTIONS_PER_PEER,
-        DEFAULT_MAX_STAKED_CONNECTIONS, DEFAULT_MAX_STREAMS_PER_MS,
-        DEFAULT_MAX_UNSTAKED_CONNECTIONS, DEFAULT_QUIC_ENDPOINTS,
+        DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
+        DEFAULT_MAX_QUIC_CONNECTIONS_PER_STAKED_PEER,
+        DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER, DEFAULT_MAX_STAKED_CONNECTIONS,
+        DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_MAX_UNSTAKED_CONNECTIONS, DEFAULT_QUIC_ENDPOINTS,
     },
-    solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
+    solana_tpu_client::tpu_client::DEFAULT_VOTE_USE_QUIC,
     std::{cmp::Ordering, path::PathBuf, str::FromStr},
 };
 
 pub mod thread_args;
 use {
     solana_core::banking_stage::BankingStage,
-    thread_args::{thread_args, DefaultThreadArgs},
+    thread_args::{DefaultThreadArgs, thread_args},
 };
 
 // The default minimal snapshot download speed (bytes/second)
@@ -76,7 +75,8 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
         .subcommand(commands::staked_nodes_overrides::command())
         .subcommand(commands::wait_for_restart_window::command())
         .subcommand(commands::set_public_address::command())
-        .subcommand(commands::manage_block_production::command(default_args));
+        .subcommand(commands::manage_block_production::command(default_args))
+        .subcommand(commands::blockstore::command());
 
     commands::run::add_args(app, default_args)
         .args(&thread_args(&default_args.thread_args))
@@ -129,126 +129,21 @@ fn deprecated_arguments() -> Vec<DeprecatedArg> {
     }
 
     add_arg!(
-        // deprecated in v3.0.0
-        Arg::with_name("accounts_db_clean_threads")
-            .long("accounts-db-clean-threads")
+        // deprecated in v4.0.0
+        Arg::with_name("enable_accounts_disk_index")
+            .long("enable-accounts-disk-index")
+            .help("Enables the disk-based accounts index")
+            .conflicts_with("accounts_index_limit"),
+        replaced_by: "accounts-index-limit",
+    );
+    add_arg!(
+        // deprecated in v4.0.0
+        Arg::with_name("tpu_connection_pool_size")
+            .long("tpu-connection-pool-size")
             .takes_value(true)
-            .value_name("NUMBER")
-            .conflicts_with("accounts_db_background_threads"),
-        replaced_by: "accounts-db-background-threads",
-    );
-    add_arg!(
-        // deprecated in v3.1.0
-        Arg::with_name("accounts_db_hash_threads")
-            .long("accounts-db-hash-threads")
-            .takes_value(true)
-            .value_name("NUMBER"),
-        usage_warning: "There is no more startup background accounts hash calculation",
-    );
-    add_arg!(
-        // deprecated in v3.0.0
-        Arg::with_name("accounts_db_read_cache_limit_mb")
-            .long("accounts-db-read-cache-limit-mb")
-            .value_name("MAX | LOW,HIGH")
-            .takes_value(true)
-            .min_values(1)
-            .max_values(2)
-            .multiple(false)
-            .require_delimiter(true)
-            .help("How large the read cache for account data can become, in mebibytes")
-            .long_help(
-                "How large the read cache for account data can become, in mebibytes. \
-                 If given a single value, it will be the maximum size for the cache. \
-                 If given a pair of values, they will be the low and high watermarks \
-                 for the cache. When the cache exceeds the high watermark, entries will \
-                 be evicted until the size reaches the low watermark."
-            )
-            .hidden(hidden_unless_forced())
-            .conflicts_with("accounts_db_read_cache_limit"),
-            replaced_by: "accounts-db-read-cache-limit",
-    );
-    add_arg!(
-        // deprecated in v3.0.0
-        Arg::with_name("accounts_hash_cache_path")
-            .long("accounts-hash-cache-path")
-            .value_name("PATH")
-            .takes_value(true)
-            .help(
-                "Use PATH as accounts hash cache location \
-                 [default: <LEDGER>/accounts_hash_cache]",
-            ),
-            usage_warning: "The accounts hash cache is obsolete",
-    );
-    add_arg!(
-        // deprecated in v3.1.1
-        Arg::with_name("cuda")
-            .long("cuda")
-            .takes_value(false)
-            .help("Use CUDA"),
-        usage_warning: "CUDA support will be dropped"
-    );
-    add_arg!(
-        // deprecated in v3.1.3
-        Arg::with_name("dev_halt_at_slot")
-            .long("dev-halt-at-slot")
-            .value_name("SLOT")
-            .validator(is_slot)
-            .takes_value(true)
-            .help("Halt the validator when it reaches the given slot"),
-        usage_warning: "--dev-halt-at-slot will be removed in the future"
-    );
-    add_arg!(Arg::with_name("disable_accounts_disk_index")
-        // (actually) deprecated in v3.1.0
-        .long("disable-accounts-disk-index")
-        .help("Disable the disk-based accounts index if it is enabled by default.")
-        .conflicts_with("enable_accounts_disk_index"),
-        usage_warning: "The disk-based accounts index is disabled by default",
-    );
-    add_arg!(
-        // deprecated in v3.0.0
-        Arg::with_name("gossip_host")
-            .long("gossip-host")
-            .value_name("HOST")
-            .takes_value(true)
-            .validator(solana_net_utils::is_host),
-            replaced_by : "bind-address",
-            usage_warning:"Use --bind-address instead",
-    );
-    add_arg!(
-        // deprecated in v3.1.0
-        Arg::with_name("tpu_coalesce_ms")
-            .long("tpu-coalesce-ms")
-            .value_name("MILLISECS")
-            .takes_value(true)
-            .validator(is_parsable::<u64>)
-            .help("Milliseconds to wait in the TPU receiver for packet coalescing."),
-            usage_warning:"tpu_coalesce will be dropped (currently ignored)",
-    );
-    add_arg!(
-        // deprecated in v3.0.0
-        Arg::with_name("tpu_disable_quic")
-            .long("tpu-disable-quic")
-            .takes_value(false)
-            .help("Do not use QUIC to send transactions."),
-        usage_warning: "UDP support will be dropped"
-    );
-    add_arg!(
-        // deprecated in v3.0.0
-        Arg::with_name("tpu_enable_udp")
-            .long("tpu-enable-udp")
-            .takes_value(false)
-            .help("Enable UDP for receiving/sending transactions."),
-        usage_warning: "UDP support will be dropped"
-    );
-    add_arg!(
-        // deprecated in v3.1.0
-        Arg::with_name("transaction_struct")
-            .long("transaction-structure")
-            .value_name("STRUCT")
-            .takes_value(true)
-            .possible_values(TransactionStructure::cli_names())
-            .help(TransactionStructure::cli_message()),
-        usage_warning: "Transaction structure is no longer configurable"
+            .validator(is_parsable::<usize>)
+            .help("Controls the TPU connection pool size per remote address"),
+         usage_warning:"This parameter is misleading, avoid setting it",
     );
     res
 }
@@ -285,8 +180,7 @@ pub fn warn_for_deprecated_arguments(matches: &ArgMatches) {
                     msg.push('.');
                 }
             }
-            // this can not rely on logger since it is not initialized at the time of call
-            eprintln!("{msg}");
+            warn!("{msg}");
         }
     }
 }
@@ -314,15 +208,11 @@ pub struct DefaultArgs {
     pub snapshot_archive_format: String,
     pub snapshot_zstd_compression_level: String,
 
-    pub rocksdb_shred_compaction: String,
-    pub rocksdb_ledger_compression: String,
-    pub rocksdb_perf_sample_interval: String,
-
     pub accounts_shrink_optimize_total_space: String,
     pub accounts_shrink_ratio: String,
-    pub tpu_connection_pool_size: String,
 
-    pub tpu_max_connections_per_peer: String,
+    pub tpu_max_connections_per_unstaked_peer: String,
+    pub tpu_max_connections_per_staked_peer: String,
     pub tpu_max_connections_per_ipaddr_per_minute: String,
     pub tpu_max_staked_connections: String,
     pub tpu_max_unstaked_connections: String,
@@ -335,8 +225,6 @@ pub struct DefaultArgs {
 
     pub banking_trace_dir_byte_limit: String,
     pub block_production_pacing_fill_time_millis: String,
-
-    pub wen_restart_path: String,
 
     pub thread_args: DefaultThreadArgs,
 }
@@ -368,17 +256,16 @@ impl DefaultArgs {
             snapshot_zstd_compression_level: "1".to_string(), // level 1 is optimized for speed
             contact_debug_interval: "120000".to_string(),
             snapshot_version: SnapshotVersion::default(),
-            rocksdb_shred_compaction: "level".to_string(),
-            rocksdb_ledger_compression: "none".to_string(),
-            rocksdb_perf_sample_interval: "0".to_string(),
             accounts_shrink_optimize_total_space: DEFAULT_ACCOUNTS_SHRINK_OPTIMIZE_TOTAL_SPACE
                 .to_string(),
             accounts_shrink_ratio: DEFAULT_ACCOUNTS_SHRINK_RATIO.to_string(),
-            tpu_connection_pool_size: DEFAULT_TPU_CONNECTION_POOL_SIZE.to_string(),
             tpu_max_connections_per_ipaddr_per_minute:
                 DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE.to_string(),
             vote_use_quic: DEFAULT_VOTE_USE_QUIC.to_string(),
-            tpu_max_connections_per_peer: DEFAULT_MAX_QUIC_CONNECTIONS_PER_PEER.to_string(),
+            tpu_max_connections_per_unstaked_peer: DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER
+                .to_string(),
+            tpu_max_connections_per_staked_peer: DEFAULT_MAX_QUIC_CONNECTIONS_PER_STAKED_PEER
+                .to_string(),
             tpu_max_staked_connections: DEFAULT_MAX_STAKED_CONNECTIONS.to_string(),
             tpu_max_unstaked_connections: DEFAULT_MAX_UNSTAKED_CONNECTIONS.to_string(),
             tpu_max_fwd_staked_connections: DEFAULT_MAX_STAKED_CONNECTIONS
@@ -390,7 +277,6 @@ impl DefaultArgs {
             banking_trace_dir_byte_limit: BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT.to_string(),
             block_production_pacing_fill_time_millis: BankingStage::default_fill_time_millis()
                 .to_string(),
-            wen_restart_path: "wen_restart_progress.proto".to_string(),
             thread_args: DefaultThreadArgs::default(),
         }
     }
@@ -416,8 +302,6 @@ pub fn port_range_validator(port_range: String) -> Result<(), String> {
                 start,
                 start + MINIMUM_VALIDATOR_PORT_RANGE_WIDTH
             ))
-        } else if end.checked_add(QUIC_PORT_OFFSET).is_none() {
-            Err("Invalid dynamic_port_range.".to_string())
         } else {
             Ok(())
         }
@@ -746,7 +630,7 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 .help(
                     "Use when running a validator behind a NAT. DNS name or IP address for this \
                      validator to advertise in gossip. This address will be used as the target \
-                     desination address for peers trying to contact this node. [default: the \
+                     destination address for peers trying to contact this node. [default: the \
                      first --bind-address, or ask --entrypoint when --bind-address is not \
                      provided, or 127.0.0.1 when --entrypoint is not provided]. Note: this \
                      argument cannot be used in a multihoming context (when multiple \
@@ -878,6 +762,12 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 .takes_value(true)
                 .multiple(true)
                 .help("Specify the configuration file for the Geyser plugin."),
+        )
+        .arg(
+            Arg::with_name("enable_scheduler_bindings")
+                .long("enable-scheduler-bindings")
+                .takes_value(false)
+                .help("Enables external processes to connect and manage block production"),
         )
         .arg(
             Arg::with_name("deactivate_feature")

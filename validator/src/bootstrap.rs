@@ -1,17 +1,17 @@
 use {
     agave_snapshots::{
-        paths as snapshot_paths, snapshot_archive_info::SnapshotArchiveInfoGetter as _,
-        SnapshotKind,
+        SnapshotArchiveKind, paths as snapshot_paths,
+        snapshot_archive_info::SnapshotArchiveInfoGetter as _,
     },
     itertools::Itertools,
     log::*,
-    rand::{seq::SliceRandom, thread_rng, Rng},
+    rand::{Rng, rng, seq::SliceRandom},
     rayon::prelude::*,
     solana_account::ReadableAccount,
     solana_clock::Slot,
     solana_commitment_config::CommitmentConfig,
     solana_core::validator::{ValidatorConfig, ValidatorStartProgress},
-    solana_download_utils::{download_snapshot_archive, DownloadProgressRecord},
+    solana_download_utils::{DownloadProgressRecord, download_snapshot_archive},
     solana_genesis_utils::download_then_check_genesis_hash,
     solana_gossip::{
         cluster_info::ClusterInfo,
@@ -23,19 +23,19 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_metrics::datapoint_info,
+    solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
     solana_signer::Signer,
-    solana_streamer::socket::SocketAddrSpace,
     solana_vote_program::vote_state::VoteStateV4,
     std::{
-        collections::{hash_map::RandomState, HashMap, HashSet},
+        collections::{HashMap, HashSet, hash_map::RandomState},
         net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
         path::Path,
         process::exit,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
         time::{Duration, Instant},
     },
@@ -86,14 +86,6 @@ fn verify_reachable_ports(
 
     if verify_address(&node.info.serve_repair(Protocol::UDP)) {
         udp_sockets.push(&node.sockets.serve_repair);
-    }
-    if verify_address(&node.info.tpu(Protocol::UDP)) {
-        udp_sockets.extend(node.sockets.tpu.iter());
-        udp_sockets.extend(&node.sockets.tpu_quic);
-    }
-    if verify_address(&node.info.tpu_forwards(Protocol::UDP)) {
-        udp_sockets.extend(node.sockets.tpu_forwards.iter());
-        udp_sockets.extend(&node.sockets.tpu_forwards_quic);
     }
     if verify_address(&node.info.tpu_vote(Protocol::UDP)) {
         udp_sockets.extend(node.sockets.tpu_vote.iter());
@@ -347,7 +339,7 @@ pub fn fail_rpc_node(
     blacklisted_rpc_nodes: &mut HashSet<Pubkey, RandomState>,
 ) {
     warn!("{err}");
-    if let Some(ref known_validators) = known_validators {
+    if let Some(known_validators) = known_validators {
         if known_validators.contains(rpc_id) {
             return;
         }
@@ -576,7 +568,7 @@ pub fn rpc_bootstrap(
 ) {
     if do_port_check {
         let mut order: Vec<_> = (0..cluster_entrypoints.len()).collect();
-        order.shuffle(&mut thread_rng());
+        order.shuffle(&mut rng());
         if order.into_iter().all(|i| {
             !verify_reachable_ports(
                 node,
@@ -726,7 +718,7 @@ fn get_rpc_nodes(
         blacklist_timeout = Instant::now();
         get_rpc_peers_timout = Instant::now();
         if bootstrap_config.no_snapshot_fetch {
-            let random_peer = &rpc_peers[thread_rng().gen_range(0..rpc_peers.len())];
+            let random_peer = &rpc_peers[rng().random_range(0..rpc_peers.len())];
             return Ok(vec![GetRpcNodeResult {
                 rpc_contact_info: random_peer.clone(),
                 snapshot_hash: None,
@@ -870,7 +862,7 @@ type KnownSnapshotHashes = HashMap<(Slot, Hash), HashSet<(Slot, Hash)>>;
 /// queried for their individual snapshot hashes, their results will be checked against this
 /// map to verify correctness.
 ///
-/// NOTE: Only a single snashot hash is allowed per slot.  If somehow two known validators have
+/// NOTE: Only a single snapshot hash is allowed per slot.  If somehow two known validators have
 /// a snapshot hash with the same slot and _different_ hashes, the second will be skipped.
 /// This applies to both full and incremental snapshot hashes.
 fn get_snapshot_hashes_from_known_validators(
@@ -1042,13 +1034,12 @@ fn retain_peer_snapshot_hashes_that_match_known_snapshot_hashes(
         known_snapshot_hashes
             .get(&peer_snapshot_hash.snapshot_hash.full)
             .map(|known_incremental_hashes| {
-                if peer_snapshot_hash.snapshot_hash.incr.is_none() {
+                if let Some(incr) = peer_snapshot_hash.snapshot_hash.incr.as_ref() {
+                    known_incremental_hashes.contains(incr)
+                } else {
                     // If the peer's full snapshot hashes match, but doesn't have any
                     // incremental snapshots, that's fine; keep 'em!
                     true
-                } else {
-                    known_incremental_hashes
-                        .contains(peer_snapshot_hash.snapshot_hash.incr.as_ref().unwrap())
                 }
             })
             .unwrap_or(false)
@@ -1161,7 +1152,7 @@ fn download_snapshots(
             download_abort_count,
             rpc_contact_info,
             full_snapshot_hash,
-            SnapshotKind::FullSnapshot,
+            SnapshotArchiveKind::Full,
         )?;
     }
 
@@ -1192,7 +1183,7 @@ fn download_snapshots(
                     download_abort_count,
                     rpc_contact_info,
                     incremental_snapshot_hash,
-                    SnapshotKind::IncrementalSnapshot(full_snapshot_hash.0),
+                    SnapshotArchiveKind::Incremental(full_snapshot_hash.0),
                 )?;
             }
         }
@@ -1213,7 +1204,7 @@ fn download_snapshot(
     download_abort_count: &mut u64,
     rpc_contact_info: &ContactInfo,
     desired_snapshot_hash: (Slot, Hash),
-    snapshot_kind: SnapshotKind,
+    snapshot_kind: SnapshotArchiveKind,
 ) -> Result<(), String> {
     let maximum_full_snapshot_archives_to_retain = validator_config
         .snapshot_config

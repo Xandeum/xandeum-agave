@@ -1,27 +1,29 @@
 //! Controls the queueing and firing of skip timer events for use
 //! in the event loop.
-// TODO: Make this mockable in event_handler for tests
+
 mod stats;
 mod timers;
+
 use {
     crate::{
         common::{DELTA_BLOCK, DELTA_TIMEOUT},
-        consensus_metrics::ConsensusMetrics,
         event::VotorEvent,
     },
+    agave_votor_messages::migration::MigrationStatus,
     crossbeam_channel::Sender,
     parking_lot::RwLock as PlRwLock,
     solana_clock::Slot,
     std::{
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         },
         thread::{self, JoinHandle},
         time::{Duration, Instant},
     },
     timers::Timers,
 };
+
 /// A manager of timer states.  Uses a background thread to trigger next ready
 /// timers and send events.
 pub(crate) struct TimerManager {
@@ -33,17 +35,17 @@ impl TimerManager {
     pub(crate) fn new(
         event_sender: Sender<VotorEvent>,
         exit: Arc<AtomicBool>,
-        consensus_metrics: Arc<PlRwLock<ConsensusMetrics>>,
+        migration_status: Arc<MigrationStatus>,
     ) -> Self {
         let timers = Arc::new(PlRwLock::new(Timers::new(
             DELTA_TIMEOUT,
             DELTA_BLOCK,
             event_sender,
-            consensus_metrics,
         )));
         let handle = {
             let timers = Arc::clone(&timers);
             thread::spawn(move || {
+                let _ = migration_status.wait_for_migration_or_exit(exit.as_ref());
                 while !exit.load(Ordering::Relaxed) {
                     let duration = match timers.write().progress(Instant::now()) {
                         None => {
@@ -58,11 +60,14 @@ impl TimerManager {
                 }
             })
         };
+
         Self { timers, handle }
     }
+
     pub(crate) fn set_timeouts(&self, slot: Slot) {
         self.timers.write().set_timeouts(slot, Instant::now());
     }
+
     pub(crate) fn join(self) {
         self.handle.join().unwrap();
     }
@@ -76,12 +81,16 @@ impl TimerManager {
 #[cfg(test)]
 mod tests {
     use {super::*, crate::event::VotorEvent, crossbeam_channel::unbounded, std::time::Duration};
+
     #[test]
     fn test_timer_manager() {
         let (event_sender, event_receiver) = unbounded();
         let exit = Arc::new(AtomicBool::new(false));
-        let consensus_metrics = Arc::new(PlRwLock::new(ConsensusMetrics::new(0)));
-        let timer_manager = TimerManager::new(event_sender, exit.clone(), consensus_metrics);
+        let timer_manager = TimerManager::new(
+            event_sender,
+            exit.clone(),
+            Arc::new(MigrationStatus::post_migration_status()),
+        );
         let slot = 52;
         let start = Instant::now();
         timer_manager.set_timeouts(slot);
@@ -89,7 +98,8 @@ mod tests {
         let mut timeouts_received = 0;
         while timeouts_received < 2 && Instant::now().duration_since(start) < Duration::from_secs(2)
         {
-            if let Ok(event) = event_receiver.recv_timeout(Duration::from_millis(200)) {
+            let recv = event_receiver.recv_timeout(Duration::from_millis(200));
+            if let Ok(event) = recv {
                 match event {
                     VotorEvent::Timeout(s) => {
                         assert_eq!(s, slot);

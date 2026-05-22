@@ -7,8 +7,8 @@ use {
     solana_runtime::bank::Bank,
     solana_unified_scheduler_pool::{BankingStageMonitor, BankingStageStatus},
     std::sync::{
-        atomic::{AtomicBool, Ordering::Relaxed},
         Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
     },
 };
 
@@ -79,13 +79,19 @@ impl From<&PohRecorder> for DecisionMaker {
 
 #[derive(Debug)]
 pub(crate) struct DecisionMakerWrapper {
+    is_enabled: Arc<AtomicBool>,
     is_exited: Arc<AtomicBool>,
     decision_maker: DecisionMaker,
 }
 
 impl DecisionMakerWrapper {
-    pub(crate) fn new(is_exited: Arc<AtomicBool>, decision_maker: DecisionMaker) -> Self {
+    pub(crate) fn new(
+        is_enabled: Arc<AtomicBool>,
+        is_exited: Arc<AtomicBool>,
+        decision_maker: DecisionMaker,
+    ) -> Self {
         Self {
+            is_enabled,
             is_exited,
             decision_maker,
         }
@@ -96,6 +102,8 @@ impl BankingStageMonitor for DecisionMakerWrapper {
     fn status(&mut self) -> BankingStageStatus {
         if self.is_exited.load(Relaxed) {
             BankingStageStatus::Exited
+        } else if !self.is_enabled.load(Relaxed) {
+            BankingStageStatus::Disabled
         } else if matches!(
             self.decision_maker.make_consume_or_forward_decision(),
             BufferedPacketsDecision::Forward,
@@ -104,6 +112,10 @@ impl BankingStageMonitor for DecisionMakerWrapper {
         } else {
             BankingStageStatus::Active
         }
+    }
+
+    fn toggle_banking_packet_receiver(&mut self, enable: bool) {
+        self.is_enabled.store(enable, Relaxed);
     }
 }
 
@@ -126,7 +138,7 @@ mod tests {
     #[test]
     fn test_make_consume_or_forward_decision() {
         let genesis_config = create_genesis_config(2).genesis_config;
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
 
         let mut shared_leader_state = SharedLeaderState::new(0, None, None);
 

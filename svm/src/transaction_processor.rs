@@ -1,14 +1,14 @@
 use {
     crate::{
         account_loader::{
-            load_transaction, update_rent_exempt_status_for_account, validate_fee_payer,
             AccountLoader, CheckedTransactionDetails, LoadedTransaction, TransactionCheckResult,
-            TransactionLoadResult, ValidatedTransactionDetails,
+            TransactionLoadResult, ValidatedTransactionDetails, load_transaction,
+            update_rent_exempt_status_for_account, validate_fee_payer,
         },
         account_overrides::AccountOverrides,
         message_processor::process_message,
         nonce_info::NonceInfo,
-        program_loader::{get_program_modification_slot, load_program_with_pubkey},
+        program_loader::{get_program_deployment_slot, load_program_with_pubkey},
         rollback_accounts::RollbackAccounts,
         transaction_account_state_info::TransactionAccountStateInfo,
         transaction_balances::{BalanceCollectionRoutines, BalanceCollector},
@@ -18,7 +18,7 @@ use {
     },
     log::debug,
     percentage::Percentage,
-    solana_account::{state_traits::StateMut, AccountSharedData, ReadableAccount, PROGRAM_OWNERS},
+    solana_account::{AccountSharedData, PROGRAM_OWNERS, ReadableAccount, state_traits::StateMut},
     solana_clock::{Epoch, Slot},
     solana_hash::Hash,
     solana_instruction::TRANSACTION_LEVEL_STACK_HEIGHT,
@@ -27,9 +27,9 @@ use {
         inner_instruction::{InnerInstruction, InnerInstructionsList},
     },
     solana_nonce::{
+        NONCED_TX_MARKER_IX_INDEX,
         state::{DurableNonce, State as NonceState},
         versions::Versions as NonceVersions,
-        NONCED_TX_MARKER_IX_INDEX,
     },
     solana_nonce_account::verify_nonce_account,
     solana_program_runtime::{
@@ -51,11 +51,11 @@ use {
     solana_svm_measure::{measure::Measure, measure_us},
     solana_svm_timings::{ExecuteTimingType, ExecuteTimings},
     solana_svm_transaction::{svm_message::SVMMessage, svm_transaction::SVMTransaction},
-    solana_svm_type_overrides::sync::{atomic::Ordering, Arc, RwLock, RwLockReadGuard},
-    solana_transaction_context::{ExecutionRecord, TransactionContext},
+    solana_svm_type_overrides::sync::{Arc, RwLock, RwLockReadGuard, atomic::Ordering},
+    solana_transaction_context::transaction::{ExecutionRecord, TransactionContext},
     solana_transaction_error::{TransactionError, TransactionResult},
     std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         fmt::{Debug, Formatter},
         rc::Rc,
     },
@@ -115,9 +115,9 @@ pub struct TransactionProcessingConfig<'a> {
     /// Encapsulates overridden accounts, typically used for transaction
     /// simulation.
     pub account_overrides: Option<&'a AccountOverrides>,
-    /// Whether or not to check a program's modification slot when replenishing
+    /// Whether or not to check a program's deployment slot when replenishing
     /// a program cache instance.
-    pub check_program_modification_slot: bool,
+    pub check_program_deployment_slot: bool,
     /// The maximum number of bytes that log messages can consume.
     pub log_messages_bytes_limit: Option<usize>,
     /// Whether to limit the number of programs loaded for the transaction
@@ -125,6 +125,18 @@ pub struct TransactionProcessingConfig<'a> {
     pub limit_to_load_programs: bool,
     /// Recording capabilities for transaction execution.
     pub recording_config: ExecutionRecordingConfig,
+    /// Should failing transactions within the batch be dropped (no fee charged
+    /// & not committed).
+    pub drop_on_failure: bool,
+    /// If any transaction in the batch is not committed then the entire batch
+    /// should not be committed.
+    ///
+    /// # Note
+    ///
+    /// Without `drop_on_failure` this flag will still allow processed but
+    /// failing transactions to be committed. If both flags are set then any
+    /// failing transaction will cause all transactions to be aborted.
+    pub all_or_nothing: bool,
 }
 
 /// Runtime environment for transaction batch processing.
@@ -393,7 +405,13 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
         // Create the batch-local program cache.
         let mut program_cache_for_tx_batch = ProgramCacheForTxBatch::new(self.slot);
-        let builtins = self.builtin_program_ids.read().unwrap().clone();
+        let builtins = self
+            .builtin_program_ids
+            .read()
+            .unwrap()
+            .iter()
+            .map(|key| (*key, 0))
+            .collect::<HashMap<Pubkey, Slot>>();
         let ((), program_cache_us) = measure_us!({
             self.replenish_program_cache(
                 &account_loader,
@@ -401,7 +419,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 &environment.program_runtime_environments_for_execution,
                 &mut program_cache_for_tx_batch,
                 &mut execute_timings,
-                config.check_program_modification_slot,
+                config.check_program_deployment_slot,
                 config.limit_to_load_programs,
                 false, // increment_usage_counter
             );
@@ -460,15 +478,21 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
             let (processing_result, single_execution_us) = measure_us!(match load_result {
                 TransactionLoadResult::NotLoaded(err) => Err(err),
-                TransactionLoadResult::FeesOnly(fees_only_tx) => {
-                    // Update loaded accounts cache with nonce and fee-payer
-                    account_loader.update_accounts_for_failed_tx(&fees_only_tx.rollback_accounts);
+                TransactionLoadResult::FeesOnly(fees_only_tx) => match config.drop_on_failure {
+                    true => Err(fees_only_tx.load_error),
+                    false => {
+                        // Update loaded accounts cache with nonce and fee-payer
+                        account_loader.update_accounts_for_failed_tx(
+                            &fees_only_tx.rollback_accounts,
+                            self.slot,
+                        );
 
-                    Ok(ProcessedTransaction::FeesOnly(Box::new(fees_only_tx)))
-                }
+                        Ok(ProcessedTransaction::FeesOnly(Box::new(fees_only_tx)))
+                    }
+                },
                 TransactionLoadResult::Loaded(loaded_transaction) => {
-                    let (program_accounts_set, filter_executable_us) = measure_us!(self
-                        .filter_executable_program_accounts(
+                    let (program_accounts_set, filter_executable_us) =
+                        measure_us!(self.filter_executable_program_accounts(
                             &account_loader,
                             &mut program_cache_for_tx_batch,
                             tx,
@@ -485,7 +509,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                             &environment.program_runtime_environments_for_execution,
                             &mut program_cache_for_tx_batch,
                             &mut execute_timings,
-                            config.check_program_modification_slot,
+                            config.check_program_deployment_slot,
                             config.limit_to_load_programs,
                             true, // increment_usage_counter
                         );
@@ -519,16 +543,38 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                         config,
                     );
 
-                    // Update loaded accounts cache with account states which might have changed.
-                    // Also update local program cache with modifications made by the transaction,
-                    // if it executed successfully.
-                    account_loader.update_accounts_for_executed_tx(tx, &executed_tx);
+                    match (
+                        &executed_tx.execution_details.status,
+                        config.drop_on_failure,
+                    ) {
+                        // Successful transactions need to update the account loader cache as future
+                        // transactions in the batch may depend on them.
+                        (Ok(_), _) => {
+                            account_loader.update_accounts_for_successful_tx(
+                                tx,
+                                &executed_tx.loaded_transaction.accounts,
+                                self.slot,
+                            );
+                            // Also update local program cache with modifications made by the
+                            // transaction, if it executed successfully.
+                            program_cache_for_tx_batch.merge(&executed_tx.programs_modified_by_tx);
 
-                    if executed_tx.was_successful() {
-                        program_cache_for_tx_batch.merge(&executed_tx.programs_modified_by_tx);
+                            Ok(ProcessedTransaction::Executed(Box::new(executed_tx)))
+                        }
+                        // If the transaction failed & drop on failure is set then we don't want to
+                        // update the accounts as this transaction will be dropped from the batch.
+                        (Err(err), true) => Err(err.clone()),
+                        // Unsuccessful transactions will still update rollback accounts (fee payer,
+                        // nonce, etc).
+                        (Err(_), false) => {
+                            account_loader.update_accounts_for_failed_tx(
+                                &executed_tx.loaded_transaction.rollback_accounts,
+                                self.slot,
+                            );
+
+                            Ok(ProcessedTransaction::Executed(Box::new(executed_tx)))
+                        }
                     }
-
-                    Ok(ProcessedTransaction::Executed(Box::new(executed_tx)))
                 }
             });
             execution_us = execution_us.saturating_add(single_execution_us);
@@ -537,6 +583,33 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 measure_us!(balance_collector.collect_post_balances(&mut account_loader, tx));
             execute_timings
                 .saturating_add_in_place(ExecuteTimingType::CollectBalancesUs, collect_balances_us);
+
+            // If this is an all or nothing batch and we failed to process this transaction then we
+            // must abort all prior/remaining transactions.
+            if config.all_or_nothing && processing_result.is_err() {
+                // Abort prior transactions.
+                for res in processing_results.iter_mut() {
+                    *res = Err(TransactionError::CommitCancelled);
+                }
+
+                // Preserve the failure that triggered the batch to abort.
+                processing_results.push(processing_result);
+
+                // Abort remaining transactions.
+                processing_results.extend(
+                    (0..sanitized_txs.len() - processing_results.len())
+                        .map(|_| Err(TransactionError::CommitCancelled)),
+                );
+
+                return LoadAndExecuteSanitizedTransactionsOutput {
+                    error_metrics,
+                    execute_timings,
+                    processing_results,
+                    // If we abort the batch and balance recording is enabled, no balances should be
+                    // collected. If this is a leader thread, no batch will be committed.
+                    balance_collector: None,
+                };
+            }
 
             processing_results.push(processing_result);
         }
@@ -735,17 +808,16 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         account_loader: &AccountLoader<CB>,
         program_cache_for_tx_batch: &mut ProgramCacheForTxBatch,
         tx: &impl SVMMessage,
-    ) -> HashSet<Pubkey> {
-        let mut program_accounts_set = HashSet::default();
+    ) -> HashMap<Pubkey, Slot> {
+        let mut program_accounts_set = HashMap::default();
         for account_key in tx.account_keys().iter() {
             if let Some(cache_entry) = program_cache_for_tx_batch.find(account_key) {
                 cache_entry.tx_usage_counter.fetch_add(1, Ordering::Relaxed);
-            } else if account_loader
-                .get_account_shared_data(account_key)
-                .map(|(account, _slot)| PROGRAM_OWNERS.contains(account.owner()))
-                .unwrap_or(false)
+            } else if let Some((account, last_modification_slot)) =
+                account_loader.get_account_shared_data(account_key)
+                && PROGRAM_OWNERS.contains(account.owner())
             {
-                program_accounts_set.insert(*account_key);
+                program_accounts_set.insert(*account_key, last_modification_slot);
             }
         }
         program_accounts_set
@@ -755,64 +827,62 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
     fn replenish_program_cache<CB: TransactionProcessingCallback>(
         &self,
         account_loader: &AccountLoader<CB>,
-        program_accounts_set: &HashSet<Pubkey>,
+        program_accounts_set: &HashMap<Pubkey, Slot>,
         program_runtime_environments_for_execution: &ProgramRuntimeEnvironments,
         program_cache_for_tx_batch: &mut ProgramCacheForTxBatch,
         execute_timings: &mut ExecuteTimings,
-        check_program_modification_slot: bool,
+        check_program_deployment_slot: bool,
         limit_to_load_programs: bool,
         increment_usage_counter: bool,
     ) {
-        let mut missing_programs: Vec<(Pubkey, ProgramCacheMatchCriteria)> = program_accounts_set
-            .iter()
-            .map(|pubkey| {
-                let match_criteria = if check_program_modification_slot {
-                    get_program_modification_slot(account_loader, pubkey)
-                        .map_or(ProgramCacheMatchCriteria::Tombstone, |slot| {
-                            ProgramCacheMatchCriteria::DeployedOnOrAfterSlot(slot)
-                        })
-                } else {
-                    ProgramCacheMatchCriteria::NoCriteria
-                };
-                (*pubkey, match_criteria)
-            })
-            .collect();
+        let mut missing_programs: Vec<(Pubkey, ProgramCacheMatchCriteria, Slot)> =
+            program_accounts_set
+                .iter()
+                .map(|(pubkey, last_modification_slot)| {
+                    let match_criteria = if check_program_deployment_slot {
+                        get_program_deployment_slot(account_loader, pubkey)
+                            .map_or(ProgramCacheMatchCriteria::Tombstone, |slot| {
+                                ProgramCacheMatchCriteria::DeployedOnOrAfterSlot(slot)
+                            })
+                    } else {
+                        ProgramCacheMatchCriteria::NoCriteria
+                    };
+                    (*pubkey, match_criteria, *last_modification_slot)
+                })
+                .collect();
 
         let mut count_hits_and_misses = true;
         loop {
-            let (program_to_store, task_cookie, task_waiter) = {
-                // Lock the global cache.
-                let global_program_cache = self.global_program_cache.read().unwrap();
-                // Figure out which program needs to be loaded next.
-                let program_to_load = global_program_cache.extract(
-                    &mut missing_programs,
-                    program_cache_for_tx_batch,
+            // Lock the global cache.
+            let global_program_cache = self.global_program_cache.read().unwrap();
+            // Figure out which program needs to be loaded next.
+            let program_to_load = global_program_cache.extract(
+                &mut missing_programs,
+                program_cache_for_tx_batch,
+                program_runtime_environments_for_execution,
+                increment_usage_counter,
+                count_hits_and_misses,
+            );
+            count_hits_and_misses = false;
+            let task_waiter = Arc::clone(&global_program_cache.loading_task_waiter);
+            let task_cookie = task_waiter.cookie();
+            // Unlock the global cache again.
+            drop(global_program_cache);
+
+            let program_to_store = program_to_load.map(|key| {
+                // Load, verify and compile one program.
+                let (program, last_modification_slot) = load_program_with_pubkey(
+                    account_loader,
                     program_runtime_environments_for_execution,
-                    increment_usage_counter,
-                    count_hits_and_misses,
-                );
-                count_hits_and_misses = false;
+                    &key,
+                    self.slot,
+                    execute_timings,
+                )
+                .expect("called load_program_with_pubkey() with nonexistent account");
+                (key, program, last_modification_slot)
+            });
 
-                let program_to_store = program_to_load.map(|key| {
-                    // Load, verify and compile one program.
-                    let program = load_program_with_pubkey(
-                        account_loader,
-                        program_runtime_environments_for_execution,
-                        &key,
-                        self.slot,
-                        execute_timings,
-                        false,
-                    )
-                    .expect("called load_program_with_pubkey() with nonexistent account");
-                    (key, program)
-                });
-
-                let task_waiter = Arc::clone(&global_program_cache.loading_task_waiter);
-                (program_to_store, task_waiter.cookie(), task_waiter)
-                // Unlock the global cache again.
-            };
-
-            if let Some((key, program)) = program_to_store {
+            if let Some((key, program, last_modification_slot)) = program_to_store {
                 program_cache_for_tx_batch.loaded_missing = true;
                 let mut global_program_cache = self.global_program_cache.write().unwrap();
                 // Submit our last completed loading task.
@@ -820,6 +890,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     program_runtime_environments_for_execution,
                     self.slot,
                     key,
+                    last_modification_slot,
                     program,
                 ) && limit_to_load_programs
                 {
@@ -833,8 +904,11 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             } else if missing_programs.is_empty() {
                 break;
             } else {
-                // Sleep until the next finish_cooperative_loading_task() call.
-                // Once a task completes we'll wake up and try to load the
+                // Remember: there are multiple transaction processor threads running concurrently
+                // and those other threads may be loading this or other programs.
+                //
+                // So, sleep until some other thread submits a program with their
+                // `finish_cooperative_loading_task` call. We'll then wake up and try to load the
                 // missing programs inside the tx batch again.
                 let _new_cookie = task_waiter.wait(task_cookie);
             }
@@ -880,6 +954,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             environment.rent.clone(),
             compute_budget.max_instruction_stack_depth,
             compute_budget.max_instruction_trace_length,
+            tx.num_instructions(),
         );
 
         let pre_account_state_info =
@@ -1017,16 +1092,22 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         record_inner_instructions: bool,
     ) -> (ExecutionRecord, Option<InnerInstructionsList>) {
         let inner_ix = if record_inner_instructions {
-            debug_assert!(transaction_context
-                .get_instruction_context_at_index_in_trace(0)
-                .map(|instruction_context| instruction_context.get_stack_height()
-                    == TRANSACTION_LEVEL_STACK_HEIGHT)
-                .unwrap_or(true));
+            debug_assert!(
+                transaction_context
+                    .get_instruction_context_at_index_in_trace(0)
+                    .map(|instruction_context| instruction_context.get_stack_height()
+                        == TRANSACTION_LEVEL_STACK_HEIGHT)
+                    .unwrap_or(true)
+            );
 
-            let ix_trace = transaction_context.take_instruction_trace();
+            let (ix_trace, accounts, ix_data_trace) = transaction_context.take_instruction_trace();
             let mut outer_instructions = Vec::new();
-            for ix_in_trace in ix_trace.into_iter() {
-                let stack_height = ix_in_trace.nesting_level.saturating_add(1);
+            for ((ix_in_trace, ix_data), ix_accounts) in ix_trace
+                .into_iter()
+                .zip(ix_data_trace.into_iter())
+                .zip(accounts)
+            {
+                let stack_height = ix_in_trace.nesting_level.saturating_add(1) as usize;
                 if stack_height == TRANSACTION_LEVEL_STACK_HEIGHT {
                     outer_instructions.push(Vec::new());
                 } else if let Some(inner_instructions) = outer_instructions.last_mut() {
@@ -1034,9 +1115,8 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     inner_instructions.push(InnerInstruction {
                         instruction: CompiledInstruction::new_from_raw_parts(
                             ix_in_trace.program_account_index_in_tx as u8,
-                            ix_in_trace.instruction_data.into_owned(),
-                            ix_in_trace
-                                .instruction_accounts
+                            ix_data.into_owned(),
+                            ix_accounts
                                 .iter()
                                 .map(|acc| acc.index_in_transaction as u8)
                                 .collect(),
@@ -1085,6 +1165,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         self.global_program_cache.write().unwrap().assign_program(
             &self.environments,
             program_id,
+            0,
             Arc::new(builtin),
         );
     }
@@ -1104,14 +1185,14 @@ mod tests {
         super::*,
         crate::{
             account_loader::{
-                LoadedTransactionAccount, ValidatedTransactionDetails,
-                TRANSACTION_ACCOUNT_BASE_SIZE,
+                LoadedTransactionAccount, TRANSACTION_ACCOUNT_BASE_SIZE,
+                ValidatedTransactionDetails,
             },
             nonce_info::NonceInfo,
             rent_calculator::RENT_EXEMPT_RENT_EPOCH,
             rollback_accounts::RollbackAccounts,
         },
-        solana_account::{create_account_shared_data_for_test, WritableAccount},
+        solana_account::{WritableAccount, create_account_shared_data_for_test},
         solana_clock::Clock,
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_epoch_schedule::EpochSchedule,
@@ -1132,8 +1213,8 @@ mod tests {
         solana_signature::Signature,
         solana_svm_callback::{AccountState, InvokeContextCallback},
         solana_system_interface::instruction as system_instruction,
-        solana_transaction::{sanitized::SanitizedTransaction, Transaction},
-        solana_transaction_context::TransactionContext,
+        solana_transaction::{Transaction, sanitized::SanitizedTransaction},
+        solana_transaction_context::transaction::TransactionContext,
         solana_transaction_error::TransactionError,
         std::collections::HashMap,
         test_case::test_case,
@@ -1274,27 +1355,104 @@ mod tests {
 
     #[test]
     fn test_inner_instructions_list_from_instruction_trace() {
-        let instruction_trace = [1, 2, 1, 1, 2, 3, 2];
         let mut transaction_context = TransactionContext::new(
             vec![(
                 Pubkey::new_unique(),
                 AccountSharedData::new(1, 1, &bpf_loader::ID),
             )],
             Rent::default(),
-            3,
-            instruction_trace.len(),
+            4,
+            11,
+            4,
         );
-        for (index_in_trace, stack_height) in instruction_trace.into_iter().enumerate() {
-            while stack_height <= transaction_context.get_instruction_stack_height() {
-                transaction_context.pop().unwrap();
-            }
-            if stack_height > transaction_context.get_instruction_stack_height() {
-                transaction_context
-                    .configure_next_instruction_for_tests(0, vec![], vec![index_in_trace as u8])
-                    .unwrap();
-                transaction_context.push().unwrap();
-            }
-        }
+
+        // To be uncommented when we reorder the instruction trace
+        // Four top level instructions
+        // for i in 0..4 {
+        //     transaction_context
+        //         .configure_instruction_at_index(
+        //             i,
+        //             0,
+        //             vec![],
+        //             vec![u16::MAX; 256],
+        //             Cow::Owned(vec![i as u8]),
+        //             None,
+        //         )
+        //         .unwrap();
+        // }
+
+        // Execute ix #0
+        transaction_context
+            .configure_top_level_instruction_for_tests(0, vec![], vec![0])
+            .unwrap();
+        transaction_context.push().unwrap();
+        // ix #0 does a CPI
+        transaction_context
+            .configure_next_cpi_for_tests(0, vec![], vec![0, 0])
+            .unwrap();
+        transaction_context.push().unwrap();
+        // Returning from everything
+        transaction_context.pop().unwrap();
+        transaction_context.pop().unwrap();
+        // Execute ix #1
+        transaction_context
+            .configure_top_level_instruction_for_tests(0, vec![], vec![1])
+            .unwrap();
+        transaction_context.push().unwrap();
+        transaction_context.pop().unwrap();
+        // Execute ix #2
+        transaction_context
+            .configure_top_level_instruction_for_tests(0, vec![], vec![2])
+            .unwrap();
+        transaction_context.push().unwrap();
+        // ix #2 does a CPI
+        transaction_context
+            .configure_next_cpi_for_tests(0, vec![], vec![2, 0])
+            .unwrap();
+        transaction_context.push().unwrap();
+        // A nested CPI
+        transaction_context
+            .configure_next_cpi_for_tests(0, vec![], vec![2, 1])
+            .unwrap();
+        transaction_context.push().unwrap();
+        // Return from nested CPI
+        transaction_context.pop().unwrap();
+        // Return from CPI
+        transaction_context.pop().unwrap();
+        // ix #2 does another CPI
+        transaction_context
+            .configure_next_cpi_for_tests(0, vec![], vec![2, 2])
+            .unwrap();
+        transaction_context.push().unwrap();
+        // Return from everything related to ix #2
+        transaction_context.pop().unwrap();
+        transaction_context.pop().unwrap();
+        // Execute ix #3
+        transaction_context
+            .configure_top_level_instruction_for_tests(0, vec![], vec![3])
+            .unwrap();
+        transaction_context.push().unwrap();
+        // ix #3 does a CPI
+        transaction_context
+            .configure_next_cpi_for_tests(0, vec![], vec![3, 0])
+            .unwrap();
+        transaction_context.push().unwrap();
+        // ix #3 does a nested CPI
+        transaction_context
+            .configure_next_cpi_for_tests(0, vec![], vec![3, 1])
+            .unwrap();
+        transaction_context.push().unwrap();
+        // ix #3 does a second nested CPI
+        transaction_context
+            .configure_next_cpi_for_tests(0, vec![], vec![3, 2])
+            .unwrap();
+        transaction_context.push().unwrap();
+        // Return from everything related to ix #3
+        transaction_context.pop().unwrap();
+        transaction_context.pop().unwrap();
+        transaction_context.pop().unwrap();
+        transaction_context.pop().unwrap();
+
         let inner_instructions =
             TransactionBatchProcessor::<TestForkGraph>::deconstruct_transaction(
                 transaction_context,
@@ -1307,22 +1465,36 @@ mod tests {
             inner_instructions,
             vec![
                 vec![InnerInstruction {
-                    instruction: CompiledInstruction::new_from_raw_parts(0, vec![1], vec![]),
+                    instruction: CompiledInstruction::new_from_raw_parts(0, vec![0, 0], vec![]),
                     stack_height: 2,
                 }],
                 vec![],
                 vec![
                     InnerInstruction {
-                        instruction: CompiledInstruction::new_from_raw_parts(0, vec![4], vec![]),
+                        instruction: CompiledInstruction::new_from_raw_parts(0, vec![2, 0], vec![]),
                         stack_height: 2,
                     },
                     InnerInstruction {
-                        instruction: CompiledInstruction::new_from_raw_parts(0, vec![5], vec![]),
+                        instruction: CompiledInstruction::new_from_raw_parts(0, vec![2, 1], vec![]),
                         stack_height: 3,
                     },
                     InnerInstruction {
-                        instruction: CompiledInstruction::new_from_raw_parts(0, vec![6], vec![]),
+                        instruction: CompiledInstruction::new_from_raw_parts(0, vec![2, 2], vec![]),
                         stack_height: 2,
+                    },
+                ],
+                vec![
+                    InnerInstruction {
+                        instruction: CompiledInstruction::new_from_raw_parts(0, vec![3, 0], vec![]),
+                        stack_height: 2,
+                    },
+                    InnerInstruction {
+                        instruction: CompiledInstruction::new_from_raw_parts(0, vec![3, 1], vec![]),
+                        stack_height: 3,
+                    },
+                    InnerInstruction {
+                        instruction: CompiledInstruction::new_from_raw_parts(0, vec![3, 2], vec![]),
+                        stack_height: 4,
                     },
                 ]
             ]
@@ -1490,8 +1662,8 @@ mod tests {
             TransactionBatchProcessor::new(0, 0, Arc::downgrade(&fork_graph), None, None);
         let key = Pubkey::new_unique();
 
-        let mut account_set = HashSet::new();
-        account_set.insert(key);
+        let mut account_set = HashMap::new();
+        account_set.insert(key, 0);
 
         let mut program_cache_for_tx_batch = ProgramCacheForTxBatch::new(batch_processor.slot);
 
@@ -1526,8 +1698,8 @@ mod tests {
             .insert(key, account_data);
         let account_loader = (&mock_bank).into();
 
-        let mut account_set = HashSet::new();
-        account_set.insert(key);
+        let mut account_set = HashMap::new();
+        account_set.insert(key, 0);
         let mut loaded_missing = 0;
 
         for limit_to_load_programs in [false, true] {
@@ -1611,8 +1783,8 @@ mod tests {
         );
 
         assert_eq!(program_accounts_set.len(), 2);
-        assert!(program_accounts_set.contains(&key1));
-        assert!(program_accounts_set.contains(&key2));
+        assert!(program_accounts_set.contains_key(&key1));
+        assert!(program_accounts_set.contains_key(&key2));
     }
 
     #[test]
@@ -1694,7 +1866,7 @@ mod tests {
 
         assert_eq!(tx1_programs.len(), 1);
         assert!(
-            tx1_programs.contains(&account3_pubkey),
+            tx1_programs.contains_key(&account3_pubkey),
             "failed to find the program account",
         );
 
@@ -1706,11 +1878,11 @@ mod tests {
 
         assert_eq!(tx2_programs.len(), 2);
         assert!(
-            tx2_programs.contains(&account3_pubkey),
+            tx2_programs.contains_key(&account3_pubkey),
             "failed to find the program account",
         );
         assert!(
-            tx2_programs.contains(&account4_pubkey),
+            tx2_programs.contains_key(&account4_pubkey),
             "failed to find the program account",
         );
     }
@@ -1908,7 +2080,7 @@ mod tests {
             .write()
             .unwrap()
             .extract(
-                &mut vec![(key, ProgramCacheMatchCriteria::NoCriteria)],
+                &mut vec![(key, ProgramCacheMatchCriteria::NoCriteria, 0)],
                 &mut loaded_programs_for_tx_batch,
                 &program_runtime_environments,
                 true,
@@ -1925,11 +2097,8 @@ mod tests {
         assert_eq!(entry, Arc::new(program));
     }
 
-    #[test_case(false; "informal_loaded_size")]
-    #[test_case(true; "simd186_loaded_size")]
-    fn test_validate_transaction_fee_payer_exact_balance(
-        formalize_loaded_transaction_data_size: bool,
-    ) {
+    #[test]
+    fn test_validate_transaction_fee_payer_exact_balance() {
         let lamports_per_signature = 5000;
         let message = new_unchecked_sanitized_message(Message::new_with_blockhash(
             &[
@@ -1961,12 +2130,10 @@ mod tests {
         );
         let mut mock_accounts = HashMap::new();
         mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
-        let mut mock_bank = MockBankCallback {
+        let mock_bank = MockBankCallback {
             account_shared_data: Arc::new(RwLock::new(mock_accounts)),
             ..Default::default()
         };
-        mock_bank.feature_set.formalize_loaded_transaction_data_size =
-            formalize_loaded_transaction_data_size;
         let mut account_loader = (&mock_bank).into();
 
         let mut error_counters = TransactionErrorMetrics::default();
@@ -1996,12 +2163,6 @@ mod tests {
             account
         };
 
-        let base_account_size = if formalize_loaded_transaction_data_size {
-            TRANSACTION_ACCOUNT_BASE_SIZE
-        } else {
-            0
-        };
-
         assert_eq!(
             result,
             Ok(ValidatedTransactionDetails {
@@ -2016,88 +2177,9 @@ mod tests {
                     .loaded_accounts_data_size_limit,
                 fee_details: FeeDetails::new(transaction_fee, priority_fee),
                 loaded_fee_payer_account: LoadedTransactionAccount {
-                    loaded_size: base_account_size + fee_payer_account.data().len(),
+                    loaded_size: TRANSACTION_ACCOUNT_BASE_SIZE + fee_payer_account.data().len(),
                     account: post_validation_fee_payer_account,
                 },
-            })
-        );
-    }
-
-    #[test_case(false; "informal_loaded_size")]
-    #[test_case(true; "simd186_loaded_size")]
-    fn test_validate_transaction_fee_payer_rent_paying(
-        formalize_loaded_transaction_data_size: bool,
-    ) {
-        let lamports_per_signature = 5000;
-        let message = new_unchecked_sanitized_message(Message::new_with_blockhash(
-            &[],
-            Some(&Pubkey::new_unique()),
-            &Hash::new_unique(),
-        ));
-        let fee_payer_address = message.fee_payer();
-        let rent = Rent {
-            lamports_per_byte_year: 1_000_000,
-            ..Default::default()
-        };
-        let min_balance = rent.minimum_balance(0);
-        let transaction_fee = lamports_per_signature;
-        let starting_balance = min_balance - 1;
-        let fee_payer_account = AccountSharedData::new(starting_balance, 0, &Pubkey::default());
-
-        let mut mock_accounts = HashMap::new();
-        mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
-        let mut mock_bank = MockBankCallback {
-            account_shared_data: Arc::new(RwLock::new(mock_accounts)),
-            ..Default::default()
-        };
-        mock_bank.feature_set.formalize_loaded_transaction_data_size =
-            formalize_loaded_transaction_data_size;
-        let mut account_loader = (&mock_bank).into();
-
-        let mut error_counters = TransactionErrorMetrics::default();
-        let compute_budget_and_limits = SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
-            MockBankCallback::calculate_fee_details(&message, lamports_per_signature, 0),
-        );
-        let result =
-            TransactionBatchProcessor::<TestForkGraph>::validate_transaction_nonce_and_fee_payer(
-                &mut account_loader,
-                &message,
-                CheckedTransactionDetails::new(None, compute_budget_and_limits),
-                &Hash::default(),
-                lamports_per_signature,
-                &rent,
-                &mut error_counters,
-            );
-
-        let post_validation_fee_payer_account = {
-            let mut account = fee_payer_account.clone();
-            account.set_lamports(starting_balance - transaction_fee);
-            account
-        };
-
-        let base_account_size = if formalize_loaded_transaction_data_size {
-            TRANSACTION_ACCOUNT_BASE_SIZE
-        } else {
-            0
-        };
-
-        assert_eq!(
-            result,
-            Ok(ValidatedTransactionDetails {
-                rollback_accounts: RollbackAccounts::new(
-                    None, // nonce
-                    *fee_payer_address,
-                    post_validation_fee_payer_account.clone(),
-                    0, // rent epoch
-                ),
-                compute_budget: compute_budget_and_limits.budget,
-                loaded_accounts_bytes_limit: compute_budget_and_limits
-                    .loaded_accounts_data_size_limit,
-                fee_details: FeeDetails::new(transaction_fee, 0),
-                loaded_fee_payer_account: LoadedTransactionAccount {
-                    loaded_size: base_account_size + fee_payer_account.data().len(),
-                    account: post_validation_fee_payer_account,
-                }
             })
         );
     }
@@ -2137,7 +2219,7 @@ mod tests {
         let fee_payer_address = message.fee_payer();
         let fee_payer_account = AccountSharedData::new(1, 0, &Pubkey::default());
         let mut mock_accounts = HashMap::new();
-        mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
+        mock_accounts.insert(*fee_payer_address, fee_payer_account);
         let mock_bank = MockBankCallback {
             account_shared_data: Arc::new(RwLock::new(mock_accounts)),
             ..Default::default()
@@ -2181,7 +2263,7 @@ mod tests {
         let starting_balance = min_balance + transaction_fee - 1;
         let fee_payer_account = AccountSharedData::new(starting_balance, 0, &Pubkey::default());
         let mut mock_accounts = HashMap::new();
-        mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
+        mock_accounts.insert(*fee_payer_address, fee_payer_account);
         let mock_bank = MockBankCallback {
             account_shared_data: Arc::new(RwLock::new(mock_accounts)),
             ..Default::default()
@@ -2223,7 +2305,7 @@ mod tests {
         let fee_payer_address = message.fee_payer();
         let fee_payer_account = AccountSharedData::new(1_000_000, 0, &Pubkey::new_unique());
         let mut mock_accounts = HashMap::new();
-        mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
+        mock_accounts.insert(*fee_payer_address, fee_payer_account);
         let mock_bank = MockBankCallback {
             account_shared_data: Arc::new(RwLock::new(mock_accounts)),
             ..Default::default()
@@ -2365,9 +2447,8 @@ mod tests {
         }
     }
 
-    #[test_case(false; "informal_loaded_size")]
-    #[test_case(true; "simd186_loaded_size")]
-    fn test_validate_transaction_fee_payer_is_nonce(formalize_loaded_transaction_data_size: bool) {
+    #[test]
+    fn test_validate_transaction_fee_payer_is_nonce() {
         let lamports_per_signature = 5000;
         let rent = Rent::default();
         let compute_unit_limit = 1000u64;
@@ -2417,12 +2498,10 @@ mod tests {
 
             let mut mock_accounts = HashMap::new();
             mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
-            let mut mock_bank = MockBankCallback {
+            let mock_bank = MockBankCallback {
                 account_shared_data: Arc::new(RwLock::new(mock_accounts)),
                 ..Default::default()
             };
-            mock_bank.feature_set.formalize_loaded_transaction_data_size =
-                formalize_loaded_transaction_data_size;
             let mut account_loader = (&mock_bank).into();
 
             let mut error_counters = TransactionErrorMetrics::default();
@@ -2447,12 +2526,6 @@ mod tests {
                 account
             };
 
-            let base_account_size = if formalize_loaded_transaction_data_size {
-                TRANSACTION_ACCOUNT_BASE_SIZE
-            } else {
-                0
-            };
-
             assert_eq!(
                 result,
                 Ok(ValidatedTransactionDetails {
@@ -2467,7 +2540,7 @@ mod tests {
                         .loaded_accounts_data_size_limit,
                     fee_details: FeeDetails::new(transaction_fee, priority_fee),
                     loaded_fee_payer_account: LoadedTransactionAccount {
-                        loaded_size: base_account_size + fee_payer_account.data().len(),
+                        loaded_size: TRANSACTION_ACCOUNT_BASE_SIZE + fee_payer_account.data().len(),
                         account: post_validation_fee_payer_account,
                     }
                 })
@@ -2484,7 +2557,7 @@ mod tests {
             .unwrap();
 
             let mut mock_accounts = HashMap::new();
-            mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
+            mock_accounts.insert(*fee_payer_address, fee_payer_account);
             let mock_bank = MockBankCallback {
                 account_shared_data: Arc::new(RwLock::new(mock_accounts)),
                 ..Default::default()

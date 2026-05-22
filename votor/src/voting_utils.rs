@@ -1,22 +1,19 @@
-#![allow(dead_code)]
-
 use {
     crate::{
         commitment::{CommitmentAggregationData, CommitmentError},
-        consensus_metrics::ConsensusMetrics,
+        consensus_metrics::ConsensusMetricsEventSender,
         vote_history::{VoteHistory, VoteHistoryError},
         vote_history_storage::{SavedVoteHistory, SavedVoteHistoryVersions},
         voting_service::BLSOp,
     },
     agave_votor_messages::{
-        consensus_message::{ConsensusMessage, VoteMessage, BLS_KEYPAIR_DERIVE_SEED},
+        consensus_message::{BLS_KEYPAIR_DERIVE_SEED, ConsensusMessage, VoteMessage},
         vote::Vote,
     },
     crossbeam_channel::{SendError, Sender},
-    parking_lot::RwLock as PlRwLock,
     solana_bls_signatures::{
-        keypair::Keypair as BLSKeypair, pubkey::PubkeyCompressed as BLSPubkeyCompressed, BlsError,
-        Pubkey as BLSPubkey,
+        BlsError, Pubkey as BLSPubkey, keypair::Keypair as BLSKeypair,
+        pubkey::PubkeyCompressed as BLSPubkeyCompressed,
     },
     solana_clock::Slot,
     solana_keypair::Keypair,
@@ -32,9 +29,9 @@ use {
 pub enum GenerateVoteTxResult {
     // The following are transient errors
     // non voting validator, not eligible for refresh
-    // until authorized keypair is overriden
+    // until authorized keypair is overridden
     NonVoting,
-    // hot spare validator, not eligble for refresh
+    // hot spare validator, not eligible for refresh
     // until set identity is invoked
     HotSpare,
     // The hash verification at startup has not completed
@@ -121,20 +118,20 @@ pub struct VotingContext {
     // The BLS keypair should always change with authorized_voter_keypairs.
     pub derived_bls_keypairs: HashMap<Pubkey, Arc<BLSKeypair>>,
     pub has_new_vote_been_rooted: bool,
-    pub own_vote_sender: Sender<ConsensusMessage>,
+    pub own_vote_sender: Sender<Vec<ConsensusMessage>>,
     pub bls_sender: Sender<BLSOp>,
     pub commitment_sender: Sender<CommitmentAggregationData>,
     pub wait_to_vote_slot: Option<u64>,
     pub sharable_banks: SharableBanks,
-    pub consensus_metrics: Arc<PlRwLock<ConsensusMetrics>>,
+    pub consensus_metrics_sender: ConsensusMetricsEventSender,
 }
 
-fn get_bls_keypair(
-    context: &mut VotingContext,
+fn get_or_insert_bls_keypair(
+    derived_bls_keypairs: &mut HashMap<Pubkey, Arc<BLSKeypair>>,
     authorized_voter_keypair: &Arc<Keypair>,
 ) -> Result<Arc<BLSKeypair>, BlsError> {
     let pubkey = authorized_voter_keypair.pubkey();
-    if let Some(existing) = context.derived_bls_keypairs.get(&pubkey) {
+    if let Some(existing) = derived_bls_keypairs.get(&pubkey) {
         return Ok(existing.clone());
     }
 
@@ -143,23 +140,28 @@ fn get_bls_keypair(
         BLS_KEYPAIR_DERIVE_SEED,
     )?);
 
-    context
-        .derived_bls_keypairs
-        .insert(pubkey, bls_keypair.clone());
+    derived_bls_keypairs.insert(pubkey, bls_keypair.clone());
 
     Ok(bls_keypair)
 }
 
-fn generate_vote_tx(vote: &Vote, bank: &Bank, context: &mut VotingContext) -> GenerateVoteTxResult {
-    let vote_account_pubkey = context.vote_account_pubkey;
+pub fn generate_vote_tx(
+    vote: &Vote,
+    bank: &Bank,
+    vote_account_pubkey: Pubkey,
+    identity_keypair: &Arc<Keypair>,
+    authorized_voter_keypairs: &Arc<std::sync::RwLock<Vec<Arc<Keypair>>>>,
+    wait_to_vote_slot: Option<u64>,
+    derived_bls_keypairs: &mut HashMap<Pubkey, Arc<BLSKeypair>>,
+) -> GenerateVoteTxResult {
     let authorized_voter_keypair;
     let bls_pubkey_in_vote_account;
     {
-        let authorized_voter_keypairs = context.authorized_voter_keypairs.read().unwrap();
+        let authorized_voter_keypairs = authorized_voter_keypairs.read().unwrap();
         if authorized_voter_keypairs.is_empty() {
             return GenerateVoteTxResult::NonVoting;
         }
-        if let Some(slot) = context.wait_to_vote_slot {
+        if let Some(slot) = wait_to_vote_slot {
             if vote.slot() < slot {
                 return GenerateVoteTxResult::WaitToVoteSlot(slot);
             }
@@ -168,18 +170,18 @@ fn generate_vote_tx(vote: &Vote, bank: &Bank, context: &mut VotingContext) -> Ge
             return GenerateVoteTxResult::VoteAccountNotFound(vote_account_pubkey);
         };
         let vote_state_view = vote_account.vote_state_view();
-        if vote_state_view.node_pubkey() != &context.identity_keypair.pubkey() {
+        if vote_state_view.node_pubkey() != &identity_keypair.pubkey() {
             info!(
                 "Vote account node_pubkey mismatch: {} (expected: {}).  Unable to vote",
                 vote_state_view.node_pubkey(),
-                context.identity_keypair.pubkey()
+                identity_keypair.pubkey()
             );
             return GenerateVoteTxResult::HotSpare;
         }
         let Some(bls_pubkey_serialized) = vote_state_view.bls_pubkey_compressed() else {
             panic!(
                 "No BLS pubkey in vote account {}",
-                context.identity_keypair.pubkey()
+                identity_keypair.pubkey()
             );
         };
         bls_pubkey_in_vote_account =
@@ -188,7 +190,7 @@ fn generate_vote_tx(vote: &Vote, bank: &Bank, context: &mut VotingContext) -> Ge
                 .unwrap_or_else(|_| {
                     panic!(
                         "Failed to decompress BLS pubkey in vote account {}",
-                        context.identity_keypair.pubkey()
+                        identity_keypair.pubkey()
                     );
                 });
         let Some(authorized_voter_pubkey) = vote_state_view.get_authorized_voter(bank.epoch())
@@ -210,9 +212,9 @@ fn generate_vote_tx(vote: &Vote, bank: &Bank, context: &mut VotingContext) -> Ge
         authorized_voter_keypair = keypair.clone();
     }
 
-    let bls_keypair = get_bls_keypair(context, &authorized_voter_keypair)
+    let bls_keypair = get_or_insert_bls_keypair(derived_bls_keypairs, &authorized_voter_keypair)
         .unwrap_or_else(|e| panic!("Failed to derive my own BLS keypair: {e:?}"));
-    let my_bls_pubkey: BLSPubkey = bls_keypair.public;
+    let my_bls_pubkey: BLSPubkey = bls_keypair.public.into();
     if my_bls_pubkey != bls_pubkey_in_vote_account {
         panic!(
             "Vote account bls_pubkey mismatch: {bls_pubkey_in_vote_account:?} (expected: \
@@ -264,7 +266,15 @@ fn insert_vote_and_create_bls_message(
     }
 
     let bank = context.sharable_banks.root();
-    let message = match generate_vote_tx(&vote, &bank, context) {
+    let message = match generate_vote_tx(
+        &vote,
+        &bank,
+        context.vote_account_pubkey,
+        &context.identity_keypair,
+        &context.authorized_voter_keypairs,
+        context.wait_to_vote_slot,
+        &mut context.derived_bls_keypairs,
+    ) {
         GenerateVoteTxResult::ConsensusMessage(m) => m,
         e => {
             if e.is_transient_error() {
@@ -276,24 +286,12 @@ fn insert_vote_and_create_bls_message(
     };
     context
         .own_vote_sender
-        .send(message.clone())
+        .send(vec![message.clone()])
         .map_err(|_| SendError(()))?;
 
     // TODO: for refresh votes use a different BLSOp so we don't have to rewrite the same vote history to file
     let saved_vote_history =
         SavedVoteHistory::new(&context.vote_history, &context.identity_keypair)?;
-
-    match context
-        .consensus_metrics
-        .write()
-        .record_vote(context.vote_account_pubkey, &vote)
-    {
-        Ok(()) => (),
-        Err(err) => {
-            let slot = vote.slot();
-            error!("recording vote on slot {slot} failed with {err:?}");
-        }
-    }
 
     // Return vote for sending
     Ok(BLSOp::PushVote {
@@ -337,7 +335,7 @@ mod tests {
             bank_forks::BankForks,
             epoch_stakes::VersionedEpochStakes,
             genesis_utils::{
-                create_genesis_config_with_alpenglow_vote_accounts, ValidatorVoteKeypairs,
+                ValidatorVoteKeypairs, create_genesis_config_with_alpenglow_vote_accounts,
             },
         },
         std::sync::{Arc, RwLock},
@@ -357,7 +355,7 @@ mod tests {
     }
 
     fn setup_voting_context_and_bank_forks(
-        own_vote_sender: Sender<ConsensusMessage>,
+        own_vote_sender: Sender<Vec<ConsensusMessage>>,
         validator_keypairs: &[ValidatorVoteKeypairs],
         my_index: usize,
     ) -> VotingContext {
@@ -373,6 +371,9 @@ mod tests {
 
         let my_keys = &validator_keypairs[my_index];
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+        let bls_sender = unbounded().0;
+        let commitment_sender = unbounded().0;
+        let consensus_metrics_sender = unbounded().0;
         VotingContext {
             vote_history: VoteHistory::new(my_keys.node_keypair.pubkey(), 0),
             vote_account_pubkey: my_keys.vote_keypair.pubkey(),
@@ -383,11 +384,11 @@ mod tests {
             derived_bls_keypairs: HashMap::new(),
             has_new_vote_been_rooted: false,
             own_vote_sender,
-            bls_sender: unbounded().0,
-            commitment_sender: unbounded().0,
+            bls_sender,
+            commitment_sender,
             wait_to_vote_slot: None,
             sharable_banks,
-            consensus_metrics: Arc::new(PlRwLock::new(ConsensusMetrics::new(0))),
+            consensus_metrics_sender,
         }
     }
 
@@ -440,7 +441,7 @@ mod tests {
 
         // Check that own vote sender receives the vote
         let received_message = own_vote_receiver.recv().unwrap();
-        assert_eq!(received_message, expected_message);
+        assert_eq!(received_message, vec![expected_message]);
     }
 
     #[test]
@@ -457,15 +458,19 @@ mod tests {
         // If we haven't reached wait_to_vote_slot yet, return Ok(None)
         voting_context.wait_to_vote_slot = Some(4);
         let vote = Vote::new_finalization_vote(2);
-        assert!(generate_vote_message(vote, false, &mut voting_context)
-            .unwrap()
-            .is_none());
+        assert!(
+            generate_vote_message(vote, false, &mut voting_context)
+                .unwrap()
+                .is_none()
+        );
 
         // If we have reached wait_to_vote_slot, we should be able to vote
         voting_context.wait_to_vote_slot = Some(1);
-        assert!(generate_vote_message(vote, false, &mut voting_context)
-            .unwrap()
-            .is_some());
+        assert!(
+            generate_vote_message(vote, false, &mut voting_context)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -483,17 +488,21 @@ mod tests {
         voting_context.authorized_voter_keypairs = Arc::new(std::sync::RwLock::new(vec![]));
         let vote = Vote::new_skip_vote(5);
         // For non-voting nodes, we just return Ok(None)
-        assert!(generate_vote_message(vote, false, &mut voting_context)
-            .unwrap()
-            .is_none());
+        assert!(
+            generate_vote_message(vote, false, &mut voting_context)
+                .unwrap()
+                .is_none()
+        );
 
         // Recover correct value to vote again
         voting_context.authorized_voter_keypairs = Arc::new(RwLock::new(vec![Arc::new(
             validator_keypairs[my_index].vote_keypair.insecure_clone(),
         )]));
-        assert!(generate_vote_message(vote, false, &mut voting_context)
-            .unwrap()
-            .is_some());
+        assert!(
+            generate_vote_message(vote, false, &mut voting_context)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -510,16 +519,20 @@ mod tests {
         // Wrong identity keypair
         voting_context.identity_keypair = Arc::new(Keypair::new());
         let vote = Vote::new_notarization_vote(6, Hash::new_unique());
-        assert!(generate_vote_message(vote, true, &mut voting_context)
-            .unwrap()
-            .is_none());
+        assert!(
+            generate_vote_message(vote, true, &mut voting_context)
+                .unwrap()
+                .is_none()
+        );
 
         // Recover correct value to vote again
         voting_context.identity_keypair =
             Arc::new(validator_keypairs[my_index].node_keypair.insecure_clone());
-        assert!(generate_vote_message(vote, true, &mut voting_context)
-            .unwrap()
-            .is_some());
+        assert!(
+            generate_vote_message(vote, true, &mut voting_context)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -536,15 +549,19 @@ mod tests {
         // Wrong vote account pubkey
         voting_context.vote_account_pubkey = Pubkey::new_unique();
         let vote = Vote::new_notarization_vote(7, Hash::new_unique());
-        assert!(generate_vote_message(vote, true, &mut voting_context)
-            .unwrap()
-            .is_none());
+        assert!(
+            generate_vote_message(vote, true, &mut voting_context)
+                .unwrap()
+                .is_none()
+        );
 
         // Recover correct value to vote again
         voting_context.vote_account_pubkey = validator_keypairs[my_index].vote_keypair.pubkey();
-        assert!(generate_vote_message(vote, true, &mut voting_context)
-            .unwrap()
-            .is_some());
+        assert!(
+            generate_vote_message(vote, true, &mut voting_context)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -564,9 +581,11 @@ mod tests {
             Arc::new(BLSKeypair::new()),
         );
         let vote = Vote::new_notarization_vote(8, Hash::new_unique());
-        assert!(generate_vote_message(vote, true, &mut voting_context)
-            .unwrap()
-            .is_none());
+        assert!(
+            generate_vote_message(vote, true, &mut voting_context)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -635,9 +654,11 @@ mod tests {
             .epoch_schedule()
             .get_first_slot_in_epoch(1);
         let vote = Vote::new_notarization_vote(first_slot_in_epoch_1, Hash::new_unique());
-        assert!(generate_vote_message(vote, false, &mut voting_context)
-            .unwrap()
-            .is_some());
+        assert!(
+            generate_vote_message(vote, false, &mut voting_context)
+                .unwrap()
+                .is_some()
+        );
 
         // If we try to vote for a slot in epoch 2, we should get NoRankFound error
         let first_slot_in_epoch_2 = voting_context
@@ -646,8 +667,10 @@ mod tests {
             .epoch_schedule()
             .get_first_slot_in_epoch(2);
         let vote = Vote::new_notarization_vote(first_slot_in_epoch_2, Hash::new_unique());
-        assert!(generate_vote_message(vote, false, &mut voting_context)
-            .unwrap()
-            .is_none());
+        assert!(
+            generate_vote_message(vote, false, &mut voting_context)
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -8,11 +8,12 @@
 //! as sender's pubkey.
 
 use {
+    chrono::{NaiveDate, NaiveDateTime, NaiveTime, Utc},
     clap::Parser,
     crossbeam_channel::bounded,
     log::{debug, info},
     solana_keypair::Keypair,
-    solana_net_utils::sockets::{bind_to_with_config, SocketConfiguration},
+    solana_net_utils::sockets::{SocketConfiguration, bind_to_with_config},
     solana_pubkey::Pubkey,
     solana_streamer::{
         nonblocking::{quic::SpawnNonBlockingServerResult, swqos::SwQosConfig},
@@ -28,7 +29,7 @@ use {
         sync::{Arc, RwLock},
         time::Duration,
     },
-    tokio::time::{sleep, Instant},
+    tokio::time::sleep,
     tokio_util::sync::CancellationToken,
 };
 
@@ -67,8 +68,10 @@ pub fn load_staked_nodes_overrides(path: &String) -> anyhow::Result<HashMap<Pubk
 
 #[derive(Debug, Parser)]
 struct Cli {
-    #[arg(short, long, default_value_t = 1)]
-    max_connections_per_peer: usize,
+    #[arg(short, long, default_value_t = 10)]
+    max_connections_per_staked_peer: usize,
+    #[arg(short, long, default_value_t = 10)]
+    max_connections_per_unstaked_peer: usize,
 
     #[arg(short, long, default_value = "0.0.0.0:8008")]
     bind_to: SocketAddr,
@@ -112,30 +115,37 @@ async fn main() -> anyhow::Result<()> {
         stats,
         thread: run_thread,
         max_concurrent_connections: _,
-    } = solana_streamer::nonblocking::quic::spawn_server_with_cancel(
+    } = solana_streamer::nonblocking::testing_utilities::spawn_stake_weighted_qos_server(
         "quic_streamer_test",
         [socket.try_clone()?],
         &keypair,
         sender,
         staked_nodes,
         QuicStreamerConfig {
-            max_connections_per_peer: cli.max_connections_per_peer,
             ..QuicStreamerConfig::default()
         },
-        SwQosConfig::default(),
+        SwQosConfig {
+            max_connections_per_staked_peer: cli.max_connections_per_staked_peer,
+            max_connections_per_unstaked_peer: cli.max_connections_per_unstaked_peer,
+            ..Default::default()
+        },
         cancel.clone(),
     )?;
     info!("Server listening on {}", socket.local_addr()?);
 
     let path = cli.log_file.clone();
     let logger_thread = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let start = Instant::now();
+        let solana_epoch = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2020, 3, 16).unwrap(),
+            NaiveTime::MIN,
+        );
         let logfile = std::fs::File::create(&path)?;
         info!("Logfile in {}", &path);
         let mut logfile = std::io::BufWriter::new(logfile);
         let mut sum = 0;
         for batch in receiver {
-            let delta_time = start.elapsed().as_micros() as u32;
+            let now = Utc::now().naive_utc();
+            let delta_time = (now - solana_epoch).num_microseconds().unwrap() as u64;
             for pkt in batch.iter() {
                 let pkt = pkt.to_bytes_packet();
                 if pkt.buffer().len() < 32 {
@@ -143,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let pubkey: [u8; 32] = pkt.buffer()[0..32].try_into()?;
                 logfile.write_all(&pubkey)?;
-                let pkt_len = pkt.buffer().len();
+                let pkt_len = pkt.buffer().len() as u64;
                 logfile.write_all(&pkt_len.to_ne_bytes())?;
                 logfile.write_all(&delta_time.to_ne_bytes())?;
                 let pubkey = Pubkey::new_from_array(pubkey);

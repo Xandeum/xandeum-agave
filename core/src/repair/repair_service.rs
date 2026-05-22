@@ -3,7 +3,7 @@
 use {
     super::standard_repair_handler::StandardRepairHandler,
     crate::{
-        cluster_info_vote_listener::VerifiedVoteReceiver,
+        cluster_info_vote_listener::VerifiedVoterSlotsReceiver,
         cluster_slots_service::cluster_slots::ClusterSlots,
         repair::{
             ancestor_hashes_service::{
@@ -13,17 +13,17 @@ use {
             outstanding_requests::OutstandingRequests,
             repair_weight::RepairWeight,
             serve_repair::{
-                self, RepairPeers, RepairProtocol, RepairRequestHeader, ServeRepair,
-                ShredRepairType, REPAIR_PEERS_CACHE_CAPACITY,
+                self, REPAIR_PEERS_CACHE_CAPACITY, RepairPeers, RepairProtocol,
+                RepairRequestHeader, ServeRepair, ShredRepairType,
             },
         },
     },
     bytes::Bytes,
     crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender},
     lru::LruCache,
-    rand::seq::SliceRandom,
+    rand::prelude::IndexedRandom as _,
     solana_client::connection_cache::Protocol,
-    solana_clock::{Slot, DEFAULT_TICKS_PER_SECOND, MS_PER_TICK},
+    solana_clock::{DEFAULT_TICKS_PER_SECOND, MS_PER_TICK, Slot},
     solana_epoch_schedule::EpochSchedule,
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
@@ -38,17 +38,17 @@ use {
         bank::Bank,
         bank_forks::{BankForks, SharableBanks},
     },
-    solana_streamer::sendmmsg::{batch_send, SendPktsError},
+    solana_streamer::sendmmsg::{SendPktsError, batch_send},
     solana_time_utils::timestamp,
     std::{
-        collections::{hash_map::Entry, HashMap, HashSet},
+        collections::{HashMap, HashSet, hash_map::Entry},
         iter::Iterator,
         net::{SocketAddr, UdpSocket},
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
-        thread::{self, sleep, Builder, JoinHandle},
+        thread::{self, Builder, JoinHandle, sleep},
         time::{Duration, Instant},
     },
     tokio::sync::mpsc::Sender as AsyncSender,
@@ -146,8 +146,10 @@ impl Default for RepairMetrics {
 }
 
 impl RepairMetrics {
+    const REPORT_INTERVAL: Duration = Duration::from_secs(2);
+
     pub fn maybe_report(&mut self) {
-        if self.last_report.elapsed().as_secs() > 2 {
+        if self.last_report.elapsed() > Self::REPORT_INTERVAL {
             self.stats.report();
             self.timing.report();
             self.best_repairs_stats.report();
@@ -203,7 +205,7 @@ pub struct RepairTiming {
     pub set_root_elapsed: u64,
     pub dump_slots_elapsed: u64,
     pub get_votes_elapsed: u64,
-    pub add_votes_elapsed: u64,
+    pub add_voters_elapsed: u64,
     pub purge_outstanding_repairs: u64,
     pub handle_popular_pruned_forks: u64,
     pub get_best_orphans_elapsed: u64,
@@ -222,7 +224,7 @@ impl RepairTiming {
             ("set-root-elapsed", self.set_root_elapsed, i64),
             ("dump-slots-elapsed", self.dump_slots_elapsed, i64),
             ("get-votes-elapsed", self.get_votes_elapsed, i64),
-            ("add-votes-elapsed", self.add_votes_elapsed, i64),
+            ("add-voters-elapsed", self.add_voters_elapsed, i64),
             (
                 "purge-outstanding-repairs",
                 self.purge_outstanding_repairs,
@@ -364,8 +366,6 @@ pub struct RepairInfo {
     pub repair_validators: Option<HashSet<Pubkey>>,
     // Validators which should be given priority when serving
     pub repair_whitelist: Arc<RwLock<HashSet<Pubkey>>>,
-    // A given list of slots to repair when in wen_restart
-    pub wen_restart_repair_slots: Option<Arc<RwLock<Vec<Slot>>>>,
 }
 
 pub struct RepairSlotRange {
@@ -384,7 +384,7 @@ impl Default for RepairSlotRange {
 
 struct RepairChannels {
     repair_request_quic_sender: AsyncSender<(SocketAddr, Bytes)>,
-    verified_vote_receiver: VerifiedVoteReceiver,
+    verified_voter_slots_receiver: VerifiedVoterSlotsReceiver,
     dumped_slots_receiver: DumpedSlotsReceiver,
     popular_pruned_forks_sender: PopularPrunedForksSender,
 }
@@ -397,7 +397,7 @@ pub struct RepairServiceChannels {
 impl RepairServiceChannels {
     pub fn new(
         repair_request_quic_sender: AsyncSender<(SocketAddr, Bytes)>,
-        verified_vote_receiver: VerifiedVoteReceiver,
+        verified_voter_slots_receiver: VerifiedVoterSlotsReceiver,
         dumped_slots_receiver: DumpedSlotsReceiver,
         popular_pruned_forks_sender: PopularPrunedForksSender,
         ancestor_hashes_request_quic_sender: AsyncSender<(SocketAddr, Bytes)>,
@@ -407,7 +407,7 @@ impl RepairServiceChannels {
         Self {
             repair_channels: RepairChannels {
                 repair_request_quic_sender,
-                verified_vote_receiver,
+                verified_voter_slots_receiver,
                 dumped_slots_receiver,
                 popular_pruned_forks_sender,
             },
@@ -485,7 +485,7 @@ impl RepairService {
         repair_weight: &mut RepairWeight,
         popular_pruned_forks_requests: &mut HashSet<Slot>,
         dumped_slots_receiver: &DumpedSlotsReceiver,
-        verified_vote_receiver: &VerifiedVoteReceiver,
+        verified_voter_slots_receiver: &VerifiedVoterSlotsReceiver,
         repair_metrics: &mut RepairMetrics,
     ) {
         // Purge outdated slots from the weighting heuristic
@@ -526,7 +526,7 @@ impl RepairService {
         // Add new votes to the weighting heuristic
         let mut get_votes_elapsed = Measure::start("get_votes_elapsed");
         let mut slot_to_vote_pubkeys: HashMap<Slot, Vec<Pubkey>> = HashMap::new();
-        verified_vote_receiver
+        verified_voter_slots_receiver
             .try_iter()
             .for_each(|(vote_pubkey, vote_slots)| {
                 for slot in vote_slots {
@@ -538,25 +538,25 @@ impl RepairService {
             });
         get_votes_elapsed.stop();
 
-        let mut add_votes_elapsed = Measure::start("add_votes");
-        repair_weight.add_votes(
+        let mut add_voters_elapsed = Measure::start("add_voters");
+        repair_weight.add_voters(
             blockstore,
             slot_to_vote_pubkeys.into_iter(),
             root_bank.epoch_stakes_map(),
             root_bank.epoch_schedule(),
         );
-        add_votes_elapsed.stop();
+        add_voters_elapsed.stop();
 
         repair_metrics.timing.set_root_elapsed += set_root_elapsed.as_us();
         repair_metrics.timing.dump_slots_elapsed += dump_slots_elapsed.as_us();
         repair_metrics.timing.get_votes_elapsed += get_votes_elapsed.as_us();
-        repair_metrics.timing.add_votes_elapsed += add_votes_elapsed.as_us();
+        repair_metrics.timing.add_voters_elapsed += add_voters_elapsed.as_us();
     }
 
     fn identify_repairs(
         blockstore: &Blockstore,
         root_bank: Arc<Bank>,
-        repair_info: &RepairInfo,
+        _repair_info: &RepairInfo,
         repair_weight: &mut RepairWeight,
         outstanding_repairs: &mut HashMap<ShredRepairType, u64>,
         repair_metrics: &mut RepairMetrics,
@@ -569,25 +569,17 @@ impl RepairService {
         purge_outstanding_repairs.stop();
         repair_metrics.timing.purge_outstanding_repairs = purge_outstanding_repairs.as_us();
 
-        match repair_info.wen_restart_repair_slots.clone() {
-            Some(slots_to_repair) => Self::generate_repairs_for_wen_restart(
-                blockstore,
-                MAX_REPAIR_LENGTH,
-                &slots_to_repair.read().unwrap(),
-                outstanding_repairs,
-            ),
-            None => repair_weight.get_best_weighted_repairs(
-                blockstore,
-                root_bank.epoch_stakes_map(),
-                root_bank.epoch_schedule(),
-                MAX_ORPHANS,
-                MAX_REPAIR_LENGTH,
-                MAX_UNKNOWN_LAST_INDEX_REPAIRS,
-                MAX_CLOSEST_COMPLETION_REPAIRS,
-                repair_metrics,
-                outstanding_repairs,
-            ),
-        }
+        repair_weight.get_best_weighted_repairs(
+            blockstore,
+            root_bank.epoch_stakes_map(),
+            root_bank.epoch_schedule(),
+            MAX_ORPHANS,
+            MAX_REPAIR_LENGTH,
+            MAX_UNKNOWN_LAST_INDEX_REPAIRS,
+            MAX_CLOSEST_COMPLETION_REPAIRS,
+            repair_metrics,
+            outstanding_repairs,
+        )
     }
 
     fn handle_popular_pruned_forks(
@@ -690,7 +682,7 @@ impl RepairService {
     ) {
         let RepairChannels {
             repair_request_quic_sender,
-            verified_vote_receiver,
+            verified_voter_slots_receiver,
             dumped_slots_receiver,
             popular_pruned_forks_sender,
         } = repair_channels;
@@ -711,7 +703,7 @@ impl RepairService {
             repair_weight,
             popular_pruned_forks_requests,
             dumped_slots_receiver,
-            verified_vote_receiver,
+            verified_voter_slots_receiver,
             repair_metrics,
         );
 
@@ -753,17 +745,24 @@ impl RepairService {
         repair_info: RepairInfo,
         outstanding_requests: &RwLock<OutstandingShredRepairs>,
     ) {
-        let sharable_banks = repair_info.bank_forks.read().unwrap().sharable_banks();
+        let (sharable_banks, migration_status) = {
+            let bank_forks_r = repair_info.bank_forks.read().unwrap();
+            (
+                bank_forks_r.sharable_banks(),
+                bank_forks_r.migration_status(),
+            )
+        };
         let root_bank_slot = sharable_banks.root().slot();
         let mut repair_tracker = RepairTracker {
-            sharable_banks,
+            sharable_banks: sharable_banks.clone(),
             repair_weight: RepairWeight::new(root_bank_slot),
             serve_repair: {
                 ServeRepair::new(
                     repair_info.cluster_info.clone(),
-                    repair_info.bank_forks.read().unwrap().sharable_banks(),
+                    sharable_banks,
                     repair_info.repair_whitelist.clone(),
                     Box::new(StandardRepairHandler::new(blockstore.clone())),
+                    migration_status,
                 )
             },
             repair_metrics: RepairMetrics::default(),
@@ -914,35 +913,6 @@ impl RepairService {
         }
     }
 
-    pub(crate) fn generate_repairs_for_wen_restart(
-        blockstore: &Blockstore,
-        max_repairs: usize,
-        slots: &Vec<Slot>,
-        outstanding_repairs: &mut HashMap<ShredRepairType, u64>,
-    ) -> Vec<ShredRepairType> {
-        let mut repairs: Vec<ShredRepairType> = Vec::new();
-        for slot in slots {
-            if let Some(slot_meta) = blockstore.meta(*slot).unwrap() {
-                // When in wen_restart, turbine is not running, so there is
-                // no need to wait after first shred.
-                let new_repairs = Self::generate_repairs_for_slot_not_throttled_by_tick(
-                    blockstore,
-                    *slot,
-                    &slot_meta,
-                    max_repairs - repairs.len(),
-                    outstanding_repairs,
-                );
-                repairs.extend(new_repairs);
-            } else {
-                repairs.push(ShredRepairType::HighestShred(*slot, 0));
-            }
-            if repairs.len() >= max_repairs {
-                break;
-            }
-        }
-        repairs
-    }
-
     fn get_repair_peers(
         cluster_info: Arc<ClusterInfo>,
         cluster_slots: Arc<ClusterSlots>,
@@ -974,7 +944,7 @@ impl RepairService {
             .collect();
 
         // Sample a subset of the repair peers weighted by stake.
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let Ok(weighted_sample_repair_peers) = repair_peers.choose_multiple_weighted(
             &mut rng,
             NUM_PEERS_TO_SAMPLE_FOR_REPAIRS,
@@ -1284,16 +1254,15 @@ mod test {
         solana_keypair::Keypair,
         solana_ledger::{
             blockstore::{
-                make_chaining_slot_entries, make_many_slot_entries, make_slot_entries, Blockstore,
+                Blockstore, make_chaining_slot_entries, make_many_slot_entries, make_slot_entries,
             },
-            genesis_utils::{create_genesis_config, GenesisConfigInfo},
+            genesis_utils::{GenesisConfigInfo, create_genesis_config},
             get_tmp_ledger_path_auto_delete,
             shred::max_ticks_per_n_shreds,
         },
-        solana_net_utils::sockets::bind_to_localhost_unique,
+        solana_net_utils::{SocketAddrSpace, sockets::bind_to_localhost_unique},
         solana_runtime::bank::Bank,
         solana_signer::Signer,
-        solana_streamer::socket::SocketAddrSpace,
         solana_time_utils::timestamp,
         std::collections::HashSet,
     };
@@ -1318,7 +1287,7 @@ mod test {
 
         // Send a repair request
         RepairService::request_repair_for_shred_from_address(
-            cluster_info.clone(),
+            cluster_info,
             pubkey,
             address,
             slot,
@@ -1437,7 +1406,7 @@ mod test {
             // between shreds received; So this should either insert the
             // last shred in each slot, or exclude missing shreds after the
             // last inserted shred from expected repairs.
-            if index % nth == 0 || index + 1 == num_shreds_per_slot {
+            if index.is_multiple_of(nth) || index + 1 == num_shreds_per_slot {
                 shreds_to_write.insert(0, shreds.remove(i as usize));
             } else if i < num_shreds_per_slot {
                 missing_indexes_per_slot.insert(0, index);
@@ -1657,11 +1626,13 @@ mod test {
         let cluster_info = Arc::new(new_test_cluster_info());
         let identity_keypair = cluster_info.keypair();
         let serve_repair = {
+            let bank_forks_r = bank_forks.read().unwrap();
             ServeRepair::new(
                 cluster_info,
-                bank_forks.read().unwrap().sharable_banks(),
+                bank_forks_r.sharable_banks(),
                 Arc::new(RwLock::new(HashSet::default())),
                 Box::new(StandardRepairHandler::new(blockstore.clone())),
+                bank_forks_r.migration_status(),
             )
         };
         let mut duplicate_slot_repair_statuses = HashMap::new();
@@ -1695,11 +1666,13 @@ mod test {
             &RwLock::new(OutstandingRequests::default()),
             &identity_keypair,
         );
-        assert!(duplicate_slot_repair_statuses
-            .get(&dead_slot)
-            .unwrap()
-            .repair_pubkey_and_addr
-            .is_none());
+        assert!(
+            duplicate_slot_repair_statuses
+                .get(&dead_slot)
+                .unwrap()
+                .repair_pubkey_and_addr
+                .is_none()
+        );
         assert!(duplicate_slot_repair_statuses.contains_key(&dead_slot));
 
         // Give the slot a repair address
@@ -1759,11 +1732,13 @@ mod test {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
         let serve_repair = {
+            let bank_forks_r = bank_forks.read().unwrap();
             ServeRepair::new(
                 cluster_info.clone(),
-                bank_forks.read().unwrap().sharable_banks(),
+                bank_forks_r.sharable_banks(),
                 Arc::new(RwLock::new(HashSet::default())),
                 Box::new(StandardRepairHandler::new(blockstore)),
+                bank_forks_r.migration_status(),
             )
         };
         let valid_repair_peer = Node::new_localhost().info;
@@ -1825,67 +1800,5 @@ mod test {
             &my_pubkey,
         );
         assert_ne!(duplicate_status.repair_pubkey_and_addr, dummy_addr);
-    }
-
-    #[test]
-    fn test_generate_repairs_for_wen_restart() {
-        agave_logger::setup();
-        let ledger_path = get_tmp_ledger_path_auto_delete!();
-        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
-        let max_repairs = 3;
-
-        let slots: Vec<u64> = vec![2, 3, 5, 7];
-        let num_entries_per_slot = max_ticks_per_n_shreds(3, None) + 1;
-
-        let shreds = make_chaining_slot_entries(&slots, num_entries_per_slot, 0);
-        for (i, (mut slot_shreds, _)) in shreds.into_iter().enumerate() {
-            slot_shreds.remove(i);
-            blockstore.insert_shreds(slot_shreds, None, false).unwrap();
-        }
-
-        let mut slots_to_repair: Vec<Slot> = vec![];
-
-        // When slots_to_repair is empty, ignore all and return empty result.
-        let result = RepairService::generate_repairs_for_wen_restart(
-            &blockstore,
-            max_repairs,
-            &slots_to_repair,
-            &mut HashMap::default(),
-        );
-        assert!(result.is_empty());
-
-        // When asked to repair slot with missing shreds and some unknown slot, return correct results.
-        slots_to_repair = vec![3, 81];
-        let result = RepairService::generate_repairs_for_wen_restart(
-            &blockstore,
-            max_repairs,
-            &slots_to_repair,
-            &mut HashMap::default(),
-        );
-        assert_eq!(
-            result,
-            vec![
-                ShredRepairType::Shred(3, 1),
-                ShredRepairType::HighestShred(81, 0),
-            ],
-        );
-
-        // Test that it will not generate more than max_repairs.e().unwrap();
-        slots_to_repair = vec![2, 82, 7, 83, 84];
-        let result = RepairService::generate_repairs_for_wen_restart(
-            &blockstore,
-            max_repairs,
-            &slots_to_repair,
-            &mut HashMap::default(),
-        );
-        assert_eq!(result.len(), max_repairs);
-        assert_eq!(
-            result,
-            vec![
-                ShredRepairType::Shred(2, 0),
-                ShredRepairType::HighestShred(82, 0),
-                ShredRepairType::Shred(7, 3),
-            ],
-        );
     }
 }

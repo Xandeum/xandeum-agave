@@ -35,17 +35,21 @@ use {
     },
     crate::banking_trace::Channels,
     agave_banking_stage_ingress_types::BankingPacketBatch,
+    solana_accounts_db::account_locks::validate_account_locks,
+    solana_address_lookup_table_interface::state::estimate_last_valid_slot,
     solana_clock::Slot,
-    solana_message::{v0::LoadedAddresses, SimpleAddressLoader},
+    solana_message::{SimpleAddressLoader, v0::LoadedAddresses},
     solana_poh::{poh_recorder::PohRecorder, transaction_recorder::TransactionRecorder},
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_runtime_transaction::{
         runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
     },
-    solana_svm_transaction::message_address_table_lookup::SVMMessageAddressTableLookup,
+    solana_svm_transaction::{
+        message_address_table_lookup::SVMMessageAddressTableLookup, svm_message::SVMMessage,
+    },
     solana_transaction::{
         sanitized::{MessageHash, SanitizedTransaction},
-        versioned::{sanitized::SanitizedVersionedTransaction, VersionedTransaction},
+        versioned::{VersionedTransaction, sanitized::SanitizedVersionedTransaction},
     },
     solana_transaction_error::AddressLoaderError,
     solana_unified_scheduler_pool::{BankingStageHelper, DefaultSchedulerPool},
@@ -56,7 +60,6 @@ use {
     },
 };
 
-#[allow(dead_code)]
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 pub(crate) fn ensure_banking_stage_setup(
     pool: &DefaultSchedulerPool,
@@ -66,8 +69,12 @@ pub(crate) fn ensure_banking_stage_setup(
     transaction_recorder: TransactionRecorder,
     num_threads: NonZeroUsize,
 ) {
+    if !pool.block_production_supported() {
+        return;
+    }
+
     let sharable_banks = bank_forks.read().unwrap().sharable_banks();
-    let unified_receiver = channels.unified_receiver().clone();
+    let banking_packet_receiver = channels.receiver_for_unified_scheduler().clone();
 
     let (is_exited, decision_maker) = {
         let poh_recorder = poh_recorder.read().unwrap();
@@ -77,8 +84,11 @@ pub(crate) fn ensure_banking_stage_setup(
         )
     };
 
-    let banking_stage_monitor =
-        Box::new(DecisionMakerWrapper::new(is_exited, decision_maker.clone()));
+    let banking_stage_monitor = Box::new(DecisionMakerWrapper::new(
+        channels.clone_is_unified_for_unified_scheduler(),
+        is_exited,
+        decision_maker.clone(),
+    ));
     let banking_packet_handler = Box::new(
         move |helper: &BankingStageHelper, batches: BankingPacketBatch| {
             let decision = decision_maker.make_consume_or_forward_decision();
@@ -105,14 +115,17 @@ pub(crate) fn ensure_banking_stage_setup(
                     )
                     .ok()?;
 
-                    // WARN: Ignoring deactivation slot here can lead to the production of invalid
-                    // blocks. Currently, this code is not used in prod.
-                    let (loaded_addresses, _deactivation_slot) =
+                    let (loaded_addresses, deactivation_slot) =
                         resolve_addresses_with_deactivation(&tx, &bank).ok()?;
                     let tx = RuntimeTransaction::<SanitizedTransaction>::try_from(
                         tx,
                         SimpleAddressLoader::Enabled(loaded_addresses),
                         bank.get_reserved_account_keys(),
+                    )
+                    .ok()?;
+                    validate_account_locks(
+                        tx.account_keys(),
+                        bank.get_transaction_account_lock_limit(),
                     )
                     .ok()?;
 
@@ -125,7 +138,13 @@ pub(crate) fn ensure_banking_stage_setup(
                         calculate_priority_and_cost(&tx, &compute_budget_limits.into(), &bank);
                     let task_id = BankingStageHelper::new_task_id(task_id_base + i, priority);
 
-                    Some(helper.create_new_task(tx, task_id, packet.meta().size))
+                    Some(helper.create_new_task(
+                        tx,
+                        task_id,
+                        packet.meta().size,
+                        bank.epoch(),
+                        estimate_last_valid_slot(bank.slot().min(deactivation_slot)),
+                    ))
                 });
 
                 for task in tasks {
@@ -137,7 +156,7 @@ pub(crate) fn ensure_banking_stage_setup(
 
     pool.register_banking_stage(
         Some(num_threads.get()),
-        unified_receiver,
+        banking_packet_receiver,
         banking_packet_handler,
         transaction_recorder,
         banking_stage_monitor,

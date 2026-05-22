@@ -3,8 +3,8 @@ use jemallocator::Jemalloc;
 #[path = "receive_and_buffer_utils.rs"]
 mod utils;
 use {
-    criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput},
-    crossbeam_channel::{unbounded, Receiver, Sender},
+    criterion::{Criterion, Throughput, criterion_group, criterion_main},
+    crossbeam_channel::{Receiver, Sender, unbounded},
     solana_core::banking_stage::{
         scheduler_messages::{ConsumeWork, FinishedConsumeWork},
         transaction_scheduler::{
@@ -17,7 +17,10 @@ use {
         },
     },
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
-    std::time::{Duration, Instant},
+    std::{
+        hint::black_box,
+        time::{Duration, Instant},
+    },
 };
 
 #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
@@ -215,6 +218,7 @@ fn timing_scheduler<T: ReceiveAndBuffer, S: Scheduler<T::Transaction>>(
                         .schedule(
                             black_box(&mut container),
                             u64::MAX, // no budget
+                            false,
                             bench_env.filter_1,
                             bench_env.filter_2,
                         )

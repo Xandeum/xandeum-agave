@@ -111,6 +111,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
         &mut self,
         container: &mut S,
         budget: u64,
+        _relax_intrabatch_account_locks: bool,
         pre_graph_filter: impl Fn(&[&Tx], &mut [bool]),
         pre_lock_filter: impl Fn(&TransactionState<Tx>) -> PreLockFilterAction,
     ) -> Result<SchedulingSummary, SchedulerError> {
@@ -444,7 +445,7 @@ mod tests {
             scheduler_messages::{MaxAge, TransactionId},
             transaction_scheduler::transaction_state_container::TransactionStateContainer,
         },
-        crossbeam_channel::{unbounded, Receiver},
+        crossbeam_channel::{Receiver, unbounded},
         itertools::Itertools,
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
@@ -454,7 +455,7 @@ mod tests {
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
-        solana_transaction::{sanitized::SanitizedTransaction, Transaction},
+        solana_transaction::{Transaction, sanitized::SanitizedTransaction},
         std::borrow::Borrow,
     };
 
@@ -584,6 +585,7 @@ mod tests {
             scheduler.schedule(
                 &mut container,
                 u64::MAX, // no budget
+                false,
                 test_pre_graph_filter,
                 test_pre_lock_filter
             ),
@@ -603,6 +605,7 @@ mod tests {
             .schedule(
                 &mut container,
                 u64::MAX, // no budget
+                false,
                 test_pre_graph_filter,
                 test_pre_lock_filter,
             )
@@ -624,6 +627,7 @@ mod tests {
             .schedule(
                 &mut container,
                 0, // zero budget. nothing should be scheduled
+                false,
                 test_pre_graph_filter,
                 test_pre_lock_filter,
             )
@@ -645,6 +649,7 @@ mod tests {
             .schedule(
                 &mut container,
                 u64::MAX, // no budget
+                false,
                 test_pre_graph_filter,
                 test_pre_lock_filter,
             )
@@ -667,6 +672,7 @@ mod tests {
             .schedule(
                 &mut container,
                 u64::MAX, // no budget
+                false,
                 test_pre_graph_filter,
                 test_pre_lock_filter,
             )
@@ -694,6 +700,7 @@ mod tests {
             .schedule(
                 &mut container,
                 u64::MAX, // no budget
+                false,
                 test_pre_graph_filter,
                 test_pre_lock_filter,
             )
@@ -740,6 +747,7 @@ mod tests {
             .schedule(
                 &mut container,
                 u64::MAX, // no budget
+                false,
                 test_pre_graph_filter,
                 test_pre_lock_filter,
             )
@@ -755,6 +763,7 @@ mod tests {
             .schedule(
                 &mut container,
                 u64::MAX, // no budget
+                false,
                 test_pre_graph_filter,
                 test_pre_lock_filter,
             )
@@ -774,6 +783,7 @@ mod tests {
             .schedule(
                 &mut container,
                 u64::MAX, // no budget
+                false,
                 test_pre_graph_filter,
                 test_pre_lock_filter,
             )
@@ -788,7 +798,7 @@ mod tests {
     fn test_schedule_over_full_container() {
         let (mut scheduler, _work_receivers, _finished_work_sender) = create_test_frame(1);
 
-        // set up a container is larger enough that single pass of schedulling will not deplete it.
+        // set up a container is larger enough that single pass of scheduling will not deplete it.
         let capacity = scheduler
             .config
             .max_scanned_transactions_per_scheduling_pass
@@ -802,6 +812,7 @@ mod tests {
             .schedule(
                 &mut container,
                 u64::MAX, // no budget
+                false,
                 test_pre_graph_filter,
                 test_pre_lock_filter,
             )

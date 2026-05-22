@@ -1,6 +1,5 @@
 #![allow(clippy::arithmetic_side_effects)]
 
-pub mod client_option;
 pub mod connection_cache;
 pub mod nonblocking;
 pub mod send_and_confirm_transactions_in_parallel;
@@ -14,7 +13,7 @@ pub mod blockhash_query {
 }
 pub mod client_error {
     pub use solana_rpc_client_api::client_error::{
-        reqwest, Error as ClientError, ErrorKind as ClientErrorKind, Result,
+        Error as ClientError, ErrorKind as ClientErrorKind, Result, reqwest,
     };
 }
 /// Durable transaction nonce helpers.

@@ -5,8 +5,8 @@ use solana_sysvar::recent_blockhashes::{Entry as BlockhashesEntry, RecentBlockha
 use {
     agave_syscalls::{
         SyscallAbort, SyscallGetClockSysvar, SyscallGetEpochScheduleSysvar, SyscallGetRentSysvar,
-        SyscallInvokeSignedRust, SyscallLog, SyscallMemcmp, SyscallMemcpy, SyscallMemmove,
-        SyscallMemset, SyscallSetReturnData,
+        SyscallGetSysvar, SyscallInvokeSignedRust, SyscallLog, SyscallMemcmp, SyscallMemcpy,
+        SyscallMemmove, SyscallMemset, SyscallPanic, SyscallSetReturnData,
     },
     solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
     solana_clock::{Clock, Slot, UnixTimestamp},
@@ -161,8 +161,9 @@ impl MockBankCallback {
             .unwrap()
             .insert(Rent::id(), account_data);
 
-        // SystemInstruction::AdvanceNonceAccount asserts RecentBlockhashes is non-empty
-        // but then just gets the blockhash from InvokeContext. so the sysvar doesnt need real entries
+        // SystemInstruction::AdvanceNonceAccount asserts RecentBlockhashes is
+        // non-empty but then just gets the blockhash from InvokeContext. So,
+        // the sysvar doesn't need real entries
         #[allow(deprecated)]
         let recent_blockhashes = vec![BlockhashesEntry::default()];
 
@@ -371,6 +372,7 @@ pub fn create_custom_loader<'a>() -> BuiltinProgram<InvokeContext<'a, 'a>> {
         enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V3,
         optimize_rodata: false,
         aligned_memory_mapping: false,
+        allow_memory_region_zero: true,
     };
 
     // These functions are system calls the compile contract calls during execution, so they
@@ -411,6 +413,12 @@ pub fn create_custom_loader<'a>() -> BuiltinProgram<InvokeContext<'a, 'a>> {
             "sol_get_epoch_schedule_sysvar",
             SyscallGetEpochScheduleSysvar::vm,
         )
+        .expect("Registration failed");
+    loader
+        .register_function("sol_panic_", SyscallPanic::vm)
+        .expect("Registration failed");
+    loader
+        .register_function("sol_get_sysvar", SyscallGetSysvar::vm)
         .expect("Registration failed");
     loader
 }

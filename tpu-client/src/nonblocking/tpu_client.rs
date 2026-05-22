@@ -1,22 +1,21 @@
 pub use crate::tpu_client::Result;
 use {
-    crate::tpu_client::{RecentLeaderSlots, TpuClientConfig, MAX_FANOUT_SLOTS},
+    crate::tpu_client::{MAX_FANOUT_SLOTS, RecentLeaderSlots, TpuClientConfig},
     bincode::serialize,
     futures_util::{future::join_all, stream::StreamExt},
     log::*,
-    solana_clock::{Slot, DEFAULT_MS_PER_SLOT, NUM_CONSECUTIVE_LEADER_SLOTS},
+    solana_clock::{DEFAULT_MS_PER_SLOT, NUM_CONSECUTIVE_LEADER_SLOTS, Slot},
     solana_commitment_config::CommitmentConfig,
     solana_connection_cache::{
         connection_cache::{
-            ConnectionCache, ConnectionManager, ConnectionPool, NewConnectionConfig, Protocol,
-            DEFAULT_CONNECTION_POOL_SIZE,
+            ConnectionCache, ConnectionManager, ConnectionPool, DEFAULT_CONNECTION_POOL_SIZE,
+            NewConnectionConfig, Protocol,
         },
         nonblocking::client_connection::ClientConnection,
     },
     solana_epoch_schedule::EpochSchedule,
     solana_pubkey::Pubkey,
     solana_pubsub_client::nonblocking::pubsub_client::{PubsubClient, PubsubClientError},
-    solana_quic_definitions::QUIC_PORT_OFFSET,
     solana_rpc_client::nonblocking::rpc_client::RpcClient,
     solana_rpc_client_api::{
         client_error::{Error as ClientError, ErrorKind, Result as ClientResult},
@@ -31,14 +30,14 @@ use {
         net::SocketAddr,
         str::FromStr,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
     },
     thiserror::Error,
     tokio::{
         task::JoinHandle,
-        time::{sleep, timeout, Duration, Instant},
+        time::{Duration, Instant, sleep, timeout},
     },
 };
 #[cfg(feature = "spinner")]
@@ -196,12 +195,7 @@ impl LeaderTpuCache {
             .filter_map(|contact_info| {
                 let pubkey = Pubkey::from_str(&contact_info.pubkey).ok()?;
                 let socket = match protocol {
-                    Protocol::QUIC => contact_info.tpu_quic.or_else(|| {
-                        let mut socket = contact_info.tpu?;
-                        let port = socket.port().checked_add(QUIC_PORT_OFFSET)?;
-                        socket.set_port(port);
-                        Some(socket)
-                    }),
+                    Protocol::QUIC => contact_info.tpu_quic,
                     Protocol::UDP => contact_info.tpu,
                 }?;
                 Some((pubkey, socket))

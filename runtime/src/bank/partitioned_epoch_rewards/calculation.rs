@@ -1,17 +1,18 @@
 use {
     super::{
-        epoch_rewards_hasher::hash_rewards_into_partitions, Bank, CalculateValidatorRewardsResult,
-        EpochRewardCalculateParamInfo, FilteredStakeDelegations, PartitionedRewardsCalculation,
-        PartitionedStakeReward, PartitionedStakeRewards, StakeRewardCalculation,
-        VoteRewardsAccounts, VoteRewardsAccountsStorable, REWARD_CALCULATION_NUM_BLOCKS,
+        Bank, CachedVoteAccounts, CalculateValidatorRewardsResult, EpochRewardCalculateParamInfo,
+        FilteredStakeDelegations, PartitionedRewardsCalculation, PartitionedStakeReward,
+        PartitionedStakeRewards, REWARD_CALCULATION_NUM_BLOCKS, RewardCommissionAccounts,
+        RewardCommissionAccountsStorable, StakeRewardCalculation,
+        epoch_rewards_hasher::hash_rewards_into_partitions,
     },
     crate::{
         bank::{
-            null_tracer, PrevEpochInflationRewards, RewardCalcTracer, RewardCalculationEvent,
-            RewardsMetrics, VoteReward, VoteRewards,
+            EpochInflationRewards, RewardCalcTracer, RewardCalculationEvent, RewardCommission,
+            RewardCommissions, RewardsMetrics, null_tracer,
         },
         inflation_rewards::{
-            points::{calculate_points, PointValue},
+            points::{DelegatedVoteState, PointValue, calculate_points},
             redeem_rewards,
         },
         stake_account::StakeAccount,
@@ -21,8 +22,8 @@ use {
     agave_feature_set as feature_set,
     log::{debug, info},
     rayon::{
-        iter::{IndexedParallelIterator, ParallelIterator},
         ThreadPool,
+        iter::{IndexedParallelIterator, ParallelIterator},
     },
     solana_clock::{Epoch, Slot},
     solana_measure::{measure::Measure, measure_us},
@@ -30,62 +31,66 @@ use {
     solana_pubkey::Pubkey,
     solana_stake_interface::{stake_history::StakeHistory, state::Delegation},
     solana_sysvar::epoch_rewards::EpochRewards,
-    solana_vote::vote_account::VoteAccounts,
-    std::sync::{atomic::Ordering::Relaxed, Arc},
+    std::sync::{Arc, atomic::Ordering::Relaxed},
 };
 
 #[derive(Debug)]
 struct DelegationRewards {
     stake_reward: PartitionedStakeReward,
-    vote_pubkey: Pubkey,
-    vote_reward: VoteReward,
+    commission_pubkey: Pubkey,
+    reward_commission: RewardCommission,
 }
 
 #[derive(Default)]
 struct RewardsAccumulator {
-    vote_rewards: VoteRewards,
+    reward_commissions: RewardCommissions,
     num_stake_rewards: usize,
     total_stake_rewards_lamports: u64,
 }
 
 impl RewardsAccumulator {
-    fn add_reward(&mut self, vote_pubkey: Pubkey, vote_reward: VoteReward, stakers_reward: u64) {
-        self.vote_rewards
-            .entry(vote_pubkey)
-            .and_modify(|dst_vote_reward| {
-                dst_vote_reward.vote_rewards = dst_vote_reward
-                    .vote_rewards
-                    .saturating_add(vote_reward.vote_rewards)
+    fn add_reward(
+        &mut self,
+        commission_pubkey: Pubkey,
+        reward_commission: RewardCommission,
+        stakers_reward: u64,
+    ) {
+        self.reward_commissions
+            .entry(commission_pubkey)
+            .and_modify(|dst_reward_commission| {
+                dst_reward_commission.commission_lamports = dst_reward_commission
+                    .commission_lamports
+                    .saturating_add(reward_commission.commission_lamports)
             })
-            .or_insert(vote_reward);
+            .or_insert(reward_commission);
         self.num_stake_rewards = self.num_stake_rewards.saturating_add(1);
         self.total_stake_rewards_lamports = self
             .total_stake_rewards_lamports
             .saturating_add(stakers_reward);
     }
 
-    /// Merges two instances by combining their vote rewards and stake rewards.
+    /// Merges two instances by combining their reward commissions and stake rewards.
     ///
-    /// To minimize reallocations, the instance with more vote rewards is used
+    /// To minimize reallocations, the instance with more reward commissions is used
     /// as the base and the smaller instance is merged into it.
     fn accumulate_into_larger(self, rhs: Self) -> Self {
-        // Check which instance has more vote rewards. Treat the bigger one
+        // Check which instance has more reward commissions. Treat the bigger one
         // as a destination, which is going to be extended. This way we make
         // the reallocation as small as possible.
-        let (mut dst, src) = if self.vote_rewards.len() >= rhs.vote_rewards.len() {
+        let (mut dst, src) = if self.reward_commissions.len() >= rhs.reward_commissions.len() {
             (self, rhs)
         } else {
             (rhs, self)
         };
-        for (vote_pubkey, vote_reward) in src.vote_rewards {
-            dst.vote_rewards
-                .entry(vote_pubkey)
-                .and_modify(|dst_vote_reward: &mut VoteReward| {
-                    dst_vote_reward.vote_rewards = dst_vote_reward
-                        .vote_rewards
-                        .saturating_add(vote_reward.vote_rewards)
+        for (commission_pubkey, reward_commission) in src.reward_commissions {
+            dst.reward_commissions
+                .entry(commission_pubkey)
+                .and_modify(|dst_reward_commission: &mut RewardCommission| {
+                    dst_reward_commission.commission_lamports = dst_reward_commission
+                        .commission_lamports
+                        .saturating_add(reward_commission.commission_lamports)
                 })
-                .or_insert(vote_reward);
+                .or_insert(reward_commission);
         }
         dst.num_stake_rewards = dst.num_stake_rewards.saturating_add(src.num_stake_rewards);
         dst.total_stake_rewards_lamports = dst
@@ -107,20 +112,20 @@ impl Bank {
         rewards_calculation: &PartitionedRewardsCalculation,
         rewards_metrics: &RewardsMetrics,
     ) {
-        self.distribute_vote_rewards(parent_epoch, rewards_calculation, rewards_metrics);
+        self.distribute_reward_commissions(parent_epoch, rewards_calculation, rewards_metrics);
 
         let slot = self.slot();
         let distribution_starting_block_height =
             self.block_height() + REWARD_CALCULATION_NUM_BLOCKS;
 
         let PartitionedRewardsCalculation {
-            vote_account_rewards,
+            reward_commission_accounts,
             stake_rewards,
             point_value,
             ..
         } = rewards_calculation;
 
-        let distributed_rewards = vote_account_rewards.total_vote_rewards_lamports;
+        let distributed_rewards = reward_commission_accounts.total_reward_commission_lamports;
         let stake_rewards = Arc::clone(&stake_rewards.stake_rewards);
 
         let num_partitions = self.get_reward_distribution_num_blocks(&stake_rewards);
@@ -144,12 +149,12 @@ impl Bank {
         );
     }
 
-    // Calculate rewards from previous epoch and distribute vote rewards
+    // Calculate rewards from previous epoch and distribute reward commissions
     pub(in crate::bank) fn calculate_rewards(
         &self,
         stake_history: &StakeHistory,
         stake_delegations: Vec<(&Pubkey, &StakeAccount<Delegation>)>,
-        cached_vote_accounts: &VoteAccounts,
+        cached_vote_accounts: CachedVoteAccounts<'_>,
         prev_epoch: Epoch,
         reward_calc_tracer: Option<impl Fn(&RewardCalculationEvent) + Send + Sync>,
         thread_pool: &ThreadPool,
@@ -196,26 +201,25 @@ impl Bank {
         rewards_calculation
     }
 
-    pub(in crate::bank) fn distribute_vote_rewards(
+    pub(in crate::bank) fn distribute_reward_commissions(
         &mut self,
         prev_epoch: Epoch,
         rewards_calculation: &PartitionedRewardsCalculation,
         rewards_metrics: &RewardsMetrics,
     ) {
         let PartitionedRewardsCalculation {
-            vote_account_rewards,
+            reward_commission_accounts,
             stake_rewards,
             validator_rate,
             foundation_rate,
-            prev_epoch_duration_in_years,
             capitalization,
             point_value,
             ..
         } = rewards_calculation;
 
-        let total_vote_rewards = vote_account_rewards.total_vote_rewards_lamports;
-        self.store_vote_accounts_partitioned(vote_account_rewards, rewards_metrics);
-        self.update_vote_rewards(vote_account_rewards);
+        let total_reward_commissions = reward_commission_accounts.total_reward_commission_lamports;
+        self.store_commission_accounts_partitioned(reward_commission_accounts, rewards_metrics);
+        self.update_reward_commissions(reward_commission_accounts);
 
         let StakeRewardCalculation {
             total_stake_rewards_lamports,
@@ -223,20 +227,23 @@ impl Bank {
         } = stake_rewards;
 
         // verify that we didn't pay any more than we expected to
-        assert!(point_value.rewards >= total_vote_rewards + total_stake_rewards_lamports);
+        assert!(point_value.rewards >= total_reward_commissions + total_stake_rewards_lamports);
         info!(
-            "distributed vote rewards: {} out of {}, remaining {}",
-            total_vote_rewards, point_value.rewards, total_stake_rewards_lamports
+            "distributed reward commissions: {} out of {}, remaining {}",
+            total_reward_commissions, point_value.rewards, total_stake_rewards_lamports
         );
 
         let (num_stake_accounts, num_vote_accounts) = {
             let stakes = self.stakes_cache.stakes();
+            let filtered_vote_accounts =
+                self.maybe_filter_vote_accounts_for_vat(stakes.vote_accounts());
             (
                 stakes.stake_delegations().len(),
-                stakes.vote_accounts().len(),
+                filtered_vote_accounts.len(),
             )
         };
-        self.capitalization.fetch_add(total_vote_rewards, Relaxed);
+        self.capitalization
+            .fetch_add(total_reward_commissions, Relaxed);
 
         let active_stake = if let Some(stake_history_entry) =
             self.stakes_cache.stakes().history().get(prev_epoch)
@@ -252,12 +259,7 @@ impl Bank {
             ("epoch", prev_epoch, i64),
             ("validator_rate", *validator_rate, f64),
             ("foundation_rate", *foundation_rate, f64),
-            (
-                "epoch_duration_in_years",
-                *prev_epoch_duration_in_years,
-                f64
-            ),
-            ("validator_rewards", total_vote_rewards, i64),
+            ("validator_rewards", total_reward_commissions, i64),
             ("active_stake", active_stake, i64),
             ("pre_capitalization", *capitalization, i64),
             ("post_capitalization", self.capitalization(), i64),
@@ -266,21 +268,21 @@ impl Bank {
         );
     }
 
-    fn store_vote_accounts_partitioned(
+    fn store_commission_accounts_partitioned(
         &self,
-        vote_account_rewards: &VoteRewardsAccounts,
+        reward_commission_accounts: &RewardCommissionAccounts,
         metrics: &RewardsMetrics,
     ) {
         let (_, measure_us) = measure_us!({
-            let storable = VoteRewardsAccountsStorable {
+            let storable = RewardCommissionAccountsStorable {
                 slot: self.slot(),
-                vote_rewards_accounts: vote_account_rewards,
+                reward_commission_accounts,
             };
             self.store_accounts(storable);
         });
 
         metrics
-            .store_vote_accounts_us
+            .store_commission_accounts_us
             .fetch_add(measure_us, Relaxed);
     }
 
@@ -289,22 +291,21 @@ impl Bank {
         &self,
         stake_history: &StakeHistory,
         stake_delegations: &'a FilteredStakeDelegations<'a>,
-        cached_vote_accounts: &VoteAccounts,
-        prev_epoch: Epoch,
+        cached_vote_accounts: CachedVoteAccounts<'_>,
+        rewarded_epoch: Epoch,
         reward_calc_tracer: Option<impl Fn(&RewardCalculationEvent) + Send + Sync>,
         thread_pool: &ThreadPool,
         metrics: &mut RewardsMetrics,
     ) -> PartitionedRewardsCalculation {
         let capitalization = self.capitalization();
-        let PrevEpochInflationRewards {
-            validator_rewards,
-            prev_epoch_duration_in_years,
+        let EpochInflationRewards {
+            validator_rewards_lamports,
             validator_rate,
             foundation_rate,
-        } = self.calculate_previous_epoch_inflation_rewards(capitalization, prev_epoch);
+        } = self.calculate_epoch_inflation_rewards(capitalization, rewarded_epoch);
 
         let CalculateValidatorRewardsResult {
-            vote_rewards_accounts: vote_account_rewards,
+            reward_commission_accounts,
             stake_reward_calculation: stake_rewards,
             point_value,
         } = self
@@ -312,8 +313,8 @@ impl Bank {
                 stake_history,
                 stake_delegations,
                 cached_vote_accounts,
-                prev_epoch,
-                validator_rewards,
+                rewarded_epoch,
+                validator_rewards_lamports,
                 reward_calc_tracer,
                 thread_pool,
                 metrics,
@@ -326,22 +327,21 @@ impl Bank {
         );
 
         PartitionedRewardsCalculation {
-            vote_account_rewards,
+            reward_commission_accounts,
             stake_rewards,
             validator_rate,
             foundation_rate,
-            prev_epoch_duration_in_years,
             capitalization,
             point_value,
         }
     }
 
-    /// Calculate epoch reward and return vote and stake rewards.
+    /// Calculate epoch reward and return stake rewards and commissions.
     fn calculate_validator_rewards<'a>(
         &self,
         stake_history: &StakeHistory,
         stake_delegations: &'a FilteredStakeDelegations<'a>,
-        cached_vote_accounts: &VoteAccounts,
+        cached_vote_accounts: CachedVoteAccounts<'_>,
         rewarded_epoch: Epoch,
         rewards: u64,
         reward_calc_tracer: Option<impl RewardCalcTracer>,
@@ -351,14 +351,14 @@ impl Bank {
         self.calculate_reward_points_partitioned(
             stake_history,
             stake_delegations,
-            cached_vote_accounts,
+            &cached_vote_accounts,
             rewards,
             thread_pool,
             metrics,
         )
         .map(|point_value| {
-            let (vote_rewards_accounts, stake_reward_calculation) = self
-                .calculate_stake_vote_rewards(
+            let (reward_commission_accounts, stake_reward_calculation) = self
+                .calculate_stake_rewards_and_commissions(
                     stake_history,
                     stake_delegations,
                     cached_vote_accounts,
@@ -369,7 +369,7 @@ impl Bank {
                     metrics,
                 );
             CalculateValidatorRewardsResult {
-                vote_rewards_accounts,
+                reward_commission_accounts,
                 stake_reward_calculation,
                 point_value,
             }
@@ -386,7 +386,7 @@ impl Bank {
         {
             let min_stake_delegation = stake_utils::get_minimum_delegation(
                 self.feature_set
-                    .is_active(&agave_feature_set::stake_raise_minimum_delegation_to_1_sol::id()),
+                    .is_active(&agave_feature_set::upgrade_bpf_stake_program_to_v5::id()),
             )
             .max(LAMPORTS_PER_SOL);
             Some(min_stake_delegation)
@@ -403,6 +403,7 @@ impl Bank {
     /// after snapshot restore.
     fn get_epoch_params_for_recalculation<'a>(
         &'a self,
+        rewarded_epoch: Epoch,
         stakes: &'a Stakes<StakeAccount<Delegation>>,
     ) -> EpochRewardCalculateParamInfo<'a> {
         // Use `stakes` for stake-related info
@@ -410,16 +411,17 @@ impl Bank {
         let stake_delegations = stakes.stake_delegations_vec();
         let stake_delegations = self.filter_stake_delegations(stake_delegations);
 
-        // Use `EpochStakes` for vote accounts
+        // Use the vote-account snapshot from epoch_stakes, which is VAT-filtered
+        // when admission filtering is enabled. Recalculation should match the
+        // vote-account admission policy used for distribution.
         let leader_schedule_epoch = self.epoch_schedule().get_leader_schedule_epoch(self.slot());
-        let cached_vote_accounts = self
+        let distribution_epoch_vote_accounts = self
             .epoch_stakes(leader_schedule_epoch)
-            .expect(
-                "calculation should always run after \
-                 Bank::update_epoch_stakes(leader_schedule_epoch)",
-            )
+            .expect("calculation should always run after Bank::update_epoch_stakes()")
             .stakes()
             .vote_accounts();
+        let cached_vote_accounts =
+            self.get_cached_vote_accounts(rewarded_epoch, distribution_epoch_vote_accounts);
 
         EpochRewardCalculateParamInfo {
             stake_history,
@@ -428,6 +430,7 @@ impl Bank {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn redeem_delegation_rewards(
         &self,
         rewarded_epoch: Epoch,
@@ -435,9 +438,11 @@ impl Bank {
         stake_account: &StakeAccount<Delegation>,
         point_value: &PointValue,
         stake_history: &StakeHistory,
-        cached_vote_accounts: &VoteAccounts,
+        cached_vote_accounts: &CachedVoteAccounts<'_>,
         reward_calc_tracer: Option<impl RewardCalcTracer>,
         new_rate_activation_epoch: Option<Epoch>,
+        delay_commission_updates: bool,
+        commission_rate_in_basis_points: bool,
     ) -> Option<DelegationRewards> {
         // curry closure to add the contextual stake_pubkey
         let reward_calc_tracer = reward_calc_tracer.as_ref().map(|outer| {
@@ -447,42 +452,72 @@ impl Bank {
             }
         });
 
+        let CachedVoteAccounts {
+            snapshot_epoch_vote_accounts,
+            rewarded_epoch_vote_accounts,
+            distribution_epoch_vote_accounts,
+        } = cached_vote_accounts;
+
         let stake_pubkey = *stake_pubkey;
         let vote_pubkey = stake_account.delegation().voter_pubkey;
-        let Some(vote_account) = cached_vote_accounts.get(&vote_pubkey) else {
+        let Some(vote_account) = distribution_epoch_vote_accounts.get(&vote_pubkey) else {
             debug!("could not find vote account {vote_pubkey} in cache");
             return None;
         };
         let vote_state = vote_account.vote_state_view();
         let stake_state = stake_account.stake_state();
 
+        // Fetch the voter commission from past epochs to attempt to
+        // delay the effect of commission updates by at least one
+        // full epoch.
+        // When `commission_rate_in_basis_points` is true, use the new field
+        // `inflation_rewards_commission_bps`; otherwise use the legacy
+        // percentage field and convert to basis points by multiplying by 100.
+        let commission_bps = if delay_commission_updates {
+            let vote_state_for_commission = snapshot_epoch_vote_accounts
+                .and_then(|eva| eva.get(&vote_pubkey))
+                .or_else(|| rewarded_epoch_vote_accounts.and_then(|eva| eva.get(&vote_pubkey)))
+                .map(|vote_account| vote_account.vote_state_view())
+                .unwrap_or(vote_state);
+            if commission_rate_in_basis_points {
+                vote_state_for_commission.inflation_rewards_commission()
+            } else {
+                vote_state_for_commission.commission() as u16 * 100
+            }
+        } else if commission_rate_in_basis_points {
+            vote_state.inflation_rewards_commission()
+        } else {
+            vote_state.commission() as u16 * 100
+        };
+
         match redeem_rewards(
             rewarded_epoch,
             stake_state,
-            vote_state,
+            commission_bps,
+            DelegatedVoteState::from(vote_state),
             point_value,
             stake_history,
             reward_calc_tracer,
             new_rate_activation_epoch,
+            commission_rate_in_basis_points,
         ) {
-            Ok((stake_reward, vote_rewards, stake)) => {
-                let commission = vote_state.commission();
+            Ok((stake_reward, commission_lamports, stake)) => {
                 let stake_reward = PartitionedStakeReward {
                     stake_pubkey,
                     stake,
                     stake_reward,
-                    commission,
+                    commission_bps,
                 };
                 let vote_account = vote_account.into();
-                let vote_reward = VoteReward {
-                    commission,
-                    vote_account,
-                    vote_rewards,
+                let reward_commission = RewardCommission {
+                    commission_bps,
+                    commission_account: vote_account,
+                    commission_lamports,
                 };
                 Some(DelegationRewards {
                     stake_reward,
-                    vote_pubkey,
-                    vote_reward,
+                    commission_pubkey: vote_pubkey,
+                    reward_commission,
                 })
             }
             Err(e) => {
@@ -492,27 +527,33 @@ impl Bank {
         }
     }
 
-    /// Calculates epoch rewards for stake/vote accounts
-    /// Returns vote rewards, stake rewards, and the sum of all stake rewards in lamports
-    fn calculate_stake_vote_rewards<'a>(
+    /// Calculates epoch rewards for stake/commission accounts
+    /// Returns commission accounts, stake rewards, and the sum of all stake rewards in lamports
+    fn calculate_stake_rewards_and_commissions<'a>(
         &self,
         stake_history: &StakeHistory,
         stake_delegations: &'a FilteredStakeDelegations<'a>,
-        cached_vote_accounts: &VoteAccounts,
+        cached_vote_accounts: CachedVoteAccounts<'_>,
         rewarded_epoch: Epoch,
         point_value: PointValue,
         thread_pool: &ThreadPool,
         reward_calc_tracer: Option<impl RewardCalcTracer>,
         metrics: &mut RewardsMetrics,
-    ) -> (VoteRewardsAccounts, StakeRewardCalculation) {
+    ) -> (RewardCommissionAccounts, StakeRewardCalculation) {
         let new_warmup_cooldown_rate_epoch = self.new_warmup_cooldown_rate_epoch();
+        let delay_commission_updates = self
+            .feature_set
+            .is_active(&agave_feature_set::delay_commission_updates::id());
+        let commission_rate_in_basis_points = self
+            .feature_set
+            .is_active(&feature_set::commission_rate_in_basis_points::id());
 
         let mut measure_redeem_rewards = Measure::start("redeem-rewards");
         // For N stake delegations, where N is >1,000,000, we produce:
         // * N stake rewards,
-        // * M vote rewards, where M is a number of stake nodes. Currently, way
-        //   smaller number than 1,000,000. And we can expect it to always be
-        //   significantly smaller than number of delegations.
+        // * M reward commission accounts, where M is a number of stake nodes.
+        //   Currently, way smaller number than 1,000,000. And we can expect it
+        //   to always be significantly smaller than number of delegations.
         //
         // Producing the stake reward with rayon triggers a lot of
         // (re)allocations. To avoid that, we allocate it at the start and
@@ -532,22 +573,24 @@ impl Bank {
                                 stake_account,
                                 &point_value,
                                 stake_history,
-                                cached_vote_accounts,
+                                &cached_vote_accounts,
                                 reward_calc_tracer.as_ref(),
                                 new_warmup_cooldown_rate_epoch,
+                                delay_commission_updates,
+                                commission_rate_in_basis_points,
                             )
                         });
                     let (stake_reward, maybe_reward_record) = match maybe_reward_record {
                         Some(res) => {
                             let DelegationRewards {
                                 stake_reward,
-                                vote_pubkey,
-                                vote_reward,
+                                commission_pubkey,
+                                reward_commission,
                             } = res;
                             let stakers_reward = stake_reward.stake_reward;
                             (
                                 Some(stake_reward),
-                                Some((stakers_reward, vote_pubkey, vote_reward)),
+                                Some((stakers_reward, commission_pubkey, reward_commission)),
                             )
                         }
                         None => (None, None),
@@ -563,8 +606,13 @@ impl Bank {
                 })
                 .fold(
                     RewardsAccumulator::default,
-                    |mut rewards_accumulator, (stake_reward, vote_pubkey, vote_reward)| {
-                        rewards_accumulator.add_reward(vote_pubkey, vote_reward, stake_reward);
+                    |mut rewards_accumulator,
+                     (stakers_reward, commission_pubkey, reward_commission)| {
+                        rewards_accumulator.add_reward(
+                            commission_pubkey,
+                            reward_commission,
+                            stakers_reward,
+                        );
                         rewards_accumulator
                     },
                 )
@@ -576,7 +624,7 @@ impl Bank {
                 )
         });
         let RewardsAccumulator {
-            vote_rewards,
+            reward_commissions,
             num_stake_rewards,
             total_stake_rewards_lamports,
         } = rewards_accumulator;
@@ -584,12 +632,12 @@ impl Bank {
         unsafe {
             stake_rewards.assume_init(num_stake_rewards);
         }
-        let vote_rewards = Self::calc_vote_accounts_to_store(vote_rewards);
+        let reward_commission_accounts = Self::calculate_commission_accounts(reward_commissions);
         measure_redeem_rewards.stop();
         metrics.redeem_rewards_us = measure_redeem_rewards.as_us();
 
         (
-            vote_rewards,
+            reward_commission_accounts,
             StakeRewardCalculation {
                 stake_rewards: Arc::new(stake_rewards),
                 total_stake_rewards_lamports,
@@ -603,11 +651,16 @@ impl Bank {
         &self,
         stake_history: &StakeHistory,
         stake_delegations: &'a FilteredStakeDelegations<'a>,
-        cached_vote_accounts: &VoteAccounts,
+        cached_vote_accounts: &CachedVoteAccounts<'_>,
         rewards: u64,
         thread_pool: &ThreadPool,
         metrics: &RewardsMetrics,
     ) -> Option<PointValue> {
+        let CachedVoteAccounts {
+            distribution_epoch_vote_accounts,
+            ..
+        } = cached_vote_accounts;
+
         let solana_vote_program: Pubkey = solana_vote_program::id();
         let new_warmup_cooldown_rate_epoch = self.new_warmup_cooldown_rate_epoch();
         let (points, measure_us) = measure_us!(thread_pool.install(|| {
@@ -617,7 +670,8 @@ impl Bank {
                 .map(|(_stake_pubkey, stake_account)| {
                     let vote_pubkey = stake_account.delegation().voter_pubkey;
 
-                    let Some(vote_account) = cached_vote_accounts.get(&vote_pubkey) else {
+                    let Some(vote_account) = distribution_epoch_vote_accounts.get(&vote_pubkey)
+                    else {
                         return 0;
                     };
                     if vote_account.owner() != &solana_vote_program {
@@ -626,7 +680,7 @@ impl Bank {
 
                     calculate_points(
                         stake_account.stake_state(),
-                        vote_account.vote_state_view(),
+                        DelegatedVoteState::from(vote_account.vote_state_view()),
                         stake_history,
                         new_warmup_cooldown_rate_epoch,
                     )
@@ -640,9 +694,9 @@ impl Bank {
     }
 
     /// If rewards are still active, recalculates partitioned stake rewards and
-    /// updates Bank::epoch_reward_status. This method assumes that vote rewards
-    /// have already been calculated and delivered, and *only* recalculates
-    /// stake rewards
+    /// updates Bank::epoch_reward_status. This method assumes that reward
+    /// commissions have already been calculated and delivered, and *only*
+    /// recalculates stake rewards
     pub(in crate::bank) fn recalculate_partitioned_rewards_if_active<F, TP>(
         &mut self,
         thread_pool_builder: F,
@@ -653,7 +707,7 @@ impl Bank {
         let epoch_rewards_sysvar = self.get_epoch_rewards_sysvar();
         if epoch_rewards_sysvar.active {
             let thread_pool = thread_pool_builder();
-            let (stake_rewards, partition_indices) =
+            let (_, stake_rewards, partition_indices) =
                 self.recalculate_stake_rewards(&epoch_rewards_sysvar, thread_pool.borrow());
             self.set_epoch_reward_status_distribution(
                 epoch_rewards_sysvar.distribution_starting_block_height,
@@ -670,7 +724,11 @@ impl Bank {
         &self,
         epoch_rewards_sysvar: &EpochRewards,
         thread_pool: &ThreadPool,
-    ) -> (Arc<PartitionedStakeRewards>, Vec<Vec<usize>>) {
+    ) -> (
+        RewardCommissionAccounts,
+        Arc<PartitionedStakeRewards>,
+        Vec<Vec<usize>>,
+    ) {
         assert!(epoch_rewards_sysvar.active);
         // If rewards are active, the rewarded epoch is always the immediately
         // preceding epoch.
@@ -686,30 +744,31 @@ impl Bank {
             stake_history,
             stake_delegations,
             cached_vote_accounts,
-        } = self.get_epoch_params_for_recalculation(&stakes);
+        } = self.get_epoch_params_for_recalculation(rewarded_epoch, &stakes);
 
         // On recalculation, only the `StakeRewardCalculation::stake_rewards`
-        // field is relevant. It is assumed that vote-account rewards have
+        // field is relevant. It is assumed that reward commission accounts have
         // already been calculated and delivered, while
         // `StakeRewardCalculation::total_rewards` only reflects rewards that
         // have not yet been distributed.
-        let (_, StakeRewardCalculation { stake_rewards, .. }) = self.calculate_stake_vote_rewards(
-            &stake_history,
-            &stake_delegations,
-            cached_vote_accounts,
-            rewarded_epoch,
-            point_value,
-            thread_pool,
-            null_tracer(),
-            &mut RewardsMetrics::default(), // This is required, but not reporting anything at the moment
-        );
+        let (reward_commission_accounts, StakeRewardCalculation { stake_rewards, .. }) = self
+            .calculate_stake_rewards_and_commissions(
+                &stake_history,
+                &stake_delegations,
+                cached_vote_accounts,
+                rewarded_epoch,
+                point_value,
+                thread_pool,
+                null_tracer(),
+                &mut RewardsMetrics::default(), // This is required, but not reporting anything at the moment
+            );
         drop(stakes);
         let partition_indices = hash_rewards_into_partitions(
             &stake_rewards,
             &epoch_rewards_sysvar.parent_blockhash,
             epoch_rewards_sysvar.num_partitions as usize,
         );
-        (stake_rewards, partition_indices)
+        (reward_commission_accounts, stake_rewards, partition_indices)
     }
 }
 
@@ -719,110 +778,127 @@ mod tests {
         super::*,
         crate::{
             bank::{
-                null_tracer,
+                RewardCommission, RewardInfo, null_tracer,
                 partitioned_epoch_rewards::{
-                    tests::{
-                        build_partitioned_stake_rewards, create_default_reward_bank,
-                        create_reward_bank, create_reward_bank_with_specific_stakes,
-                        populate_vote_accounts_with_votes, RewardBank, SLOTS_PER_EPOCH,
-                    },
                     EpochRewardPhase, EpochRewardStatus, PartitionedStakeRewards,
                     StartBlockHeightAndPartitionedRewards,
+                    tests::{
+                        RewardBank, SLOTS_PER_EPOCH, build_partitioned_stake_rewards,
+                        create_default_reward_bank, create_reward_bank,
+                        create_reward_bank_with_specific_stakes, populate_vote_accounts_with_votes,
+                    },
                 },
                 tests::create_genesis_config,
-                RewardInfo, VoteReward,
             },
+            genesis_utils::{self, GenesisConfigInfo, deactivate_features},
             stake_account::StakeAccount,
             stake_utils,
-            stakes::{tests::create_staked_node_accounts, Stakes},
+            stakes::{Stakes, tests::create_staked_node_accounts},
         },
-        agave_feature_set::FeatureSet,
+        agave_feature_set::{FeatureSet, delay_commission_updates},
+        agave_votor_messages::consensus_message::BLS_KEYPAIR_DERIVE_SEED,
         rayon::ThreadPoolBuilder,
-        solana_account::{accounts_equal, state_traits::StateMut, ReadableAccount},
+        solana_account::{
+            AccountSharedData, ReadableAccount, accounts_equal, state_traits::StateMut,
+        },
         solana_accounts_db::partitioned_rewards::PartitionedEpochRewardsConfig,
+        solana_bls_signatures::keypair::Keypair as BLSKeypair,
+        solana_clock::Clock,
+        solana_epoch_schedule::EpochSchedule,
+        solana_keypair::Keypair,
         solana_native_token::LAMPORTS_PER_SOL,
         solana_reward_info::RewardType,
-        solana_stake_interface::state::{Delegation, StakeStateV2},
-        solana_vote_interface::state::VoteStateV4,
-        solana_vote_program::vote_state,
+        solana_signer::Signer,
+        solana_stake_interface::{
+            stake_flags::StakeFlags,
+            state::{Authorized, Delegation, Meta, Stake, StakeStateV2},
+        },
+        solana_vote_interface::state::{
+            BLS_PUBLIC_KEY_COMPRESSED_SIZE, VoteInitV2, VoteStateV4, VoteStateVersions,
+        },
+        solana_vote_program::vote_state::{self, create_bls_proof_of_possession},
         std::{
             collections::HashSet,
             sync::{Arc, RwLockReadGuard},
         },
+        test_case::test_case,
     };
 
     #[test]
-    fn test_store_vote_accounts_partitioned() {
+    fn test_store_commission_accounts_partitioned() {
         let (genesis_config, _mint_keypair) = create_genesis_config(1_000_000 * LAMPORTS_PER_SOL);
         let bank = Bank::new_for_tests(&genesis_config);
 
-        let expected_vote_rewards_num = 100;
-
-        let vote_rewards = (0..expected_vote_rewards_num)
-            .map(|_| (Pubkey::new_unique(), VoteReward::new_random()))
+        let num_reward_commissions = 100;
+        let reward_commissions = (0..num_reward_commissions)
+            .map(|_| (Pubkey::new_unique(), RewardCommission::new_random()))
             .collect::<Vec<_>>();
 
-        let mut vote_rewards_account = VoteRewardsAccounts::default();
-        vote_rewards
+        let mut reward_commission_accounts = RewardCommissionAccounts::default();
+        reward_commissions
             .iter()
-            .for_each(|(vote_key, vote_reward_info)| {
+            .for_each(|(commission_pubkey, reward_commission)| {
                 let info = RewardInfo {
                     reward_type: RewardType::Voting,
-                    lamports: vote_reward_info.vote_rewards as i64,
-                    post_balance: vote_reward_info.vote_rewards,
-                    commission: Some(vote_reward_info.commission),
+                    lamports: reward_commission.commission_lamports as i64,
+                    post_balance: reward_commission.commission_lamports,
+                    commission_bps: Some(reward_commission.commission_bps),
                 };
-                vote_rewards_account.accounts_with_rewards.push((
-                    *vote_key,
+                reward_commission_accounts.accounts_with_rewards.push((
+                    *commission_pubkey,
                     info,
-                    vote_reward_info.vote_account.clone(),
+                    reward_commission.commission_account.clone(),
                 ));
-                vote_rewards_account.total_vote_rewards_lamports += vote_reward_info.vote_rewards;
+                reward_commission_accounts.total_reward_commission_lamports +=
+                    reward_commission.commission_lamports;
             });
 
         let metrics = RewardsMetrics::default();
 
-        let total_vote_rewards = vote_rewards_account.total_vote_rewards_lamports;
-        bank.store_vote_accounts_partitioned(&vote_rewards_account, &metrics);
+        let total_reward_commissions = reward_commission_accounts.total_reward_commission_lamports;
+        bank.store_commission_accounts_partitioned(&reward_commission_accounts, &metrics);
         assert_eq!(
-            expected_vote_rewards_num,
-            vote_rewards_account.accounts_with_rewards.len()
+            num_reward_commissions,
+            reward_commission_accounts.accounts_with_rewards.len()
         );
         assert_eq!(
-            vote_rewards
+            reward_commissions
                 .iter()
-                .map(|(_, vote_reward_info)| vote_reward_info.vote_rewards)
+                .map(|(_, reward_commission)| reward_commission.commission_lamports)
                 .sum::<u64>(),
-            total_vote_rewards
+            total_reward_commissions
         );
 
         // load accounts to make sure they were stored correctly
-        vote_rewards
+        reward_commissions
             .iter()
-            .for_each(|(vote_key, vote_reward_info)| {
+            .for_each(|(commission_pubkey, reward_commission)| {
                 let loaded_account = bank
-                    .load_slow_with_fixed_root(&bank.ancestors, vote_key)
+                    .load_slow_with_fixed_root(&bank.ancestors, commission_pubkey)
                     .unwrap();
                 assert!(accounts_equal(
                     &loaded_account.0,
-                    &vote_reward_info.vote_account
+                    &reward_commission.commission_account
                 ));
             });
     }
 
     #[test]
-    fn test_store_vote_accounts_partitioned_empty() {
+    fn test_store_commission_accounts_partitioned_empty() {
         let (genesis_config, _mint_keypair) = create_genesis_config(1_000_000 * LAMPORTS_PER_SOL);
         let bank = Bank::new_for_tests(&genesis_config);
 
         let expected = 0;
-        let vote_rewards = VoteRewardsAccounts::default();
+        let reward_commission_accounts = RewardCommissionAccounts::default();
         let metrics = RewardsMetrics::default();
-        let total_vote_rewards = vote_rewards.total_vote_rewards_lamports;
+        let total_reward_commissions = reward_commission_accounts.total_reward_commission_lamports;
 
-        bank.store_vote_accounts_partitioned(&vote_rewards, &metrics);
-        assert_eq!(expected, vote_rewards.accounts_with_rewards.len());
-        assert_eq!(0, total_vote_rewards);
+        bank.store_commission_accounts_partitioned(&reward_commission_accounts, &metrics);
+        assert_eq!(
+            expected,
+            reward_commission_accounts.accounts_with_rewards.len()
+        );
+        assert_eq!(0, total_reward_commissions);
     }
 
     #[test]
@@ -852,37 +928,41 @@ mod tests {
         let expected_rewards = 100_000_000_000;
 
         let stakes = bank.stakes_cache.stakes();
+        let rewarded_epoch = 1;
         let EpochRewardCalculateParamInfo {
             stake_history,
             stake_delegations,
             cached_vote_accounts,
-        } = bank.get_epoch_params_for_recalculation(&stakes);
+        } = bank.get_epoch_params_for_recalculation(rewarded_epoch, &stakes);
         let calculated_rewards = bank.calculate_validator_rewards(
             &stake_history,
             &stake_delegations,
             cached_vote_accounts,
-            1,
+            rewarded_epoch,
             expected_rewards,
             null_tracer(),
             &thread_pool,
             &mut rewards_metrics,
         );
 
-        let vote_rewards = &calculated_rewards.as_ref().unwrap().vote_rewards_accounts;
+        let reward_commission_accounts = &calculated_rewards
+            .as_ref()
+            .unwrap()
+            .reward_commission_accounts;
         let stake_rewards = &calculated_rewards
             .as_ref()
             .unwrap()
             .stake_reward_calculation;
 
-        let total_vote_rewards: u64 = vote_rewards
+        let total_reward_commissions: u64 = reward_commission_accounts
             .accounts_with_rewards
             .iter()
             .map(|(_, reward_info, _)| reward_info.lamports)
             .sum::<i64>() as u64;
 
-        // assert that total rewards matches the sum of vote rewards and stake rewards
+        // assert that total rewards matches the sum of reward commissions and stake rewards
         assert_eq!(
-            stake_rewards.total_stake_rewards_lamports + total_vote_rewards,
+            stake_rewards.total_stake_rewards_lamports + total_reward_commissions,
             expected_rewards
         );
 
@@ -906,16 +986,17 @@ mod tests {
         let expected_rewards = 100_000_000_000;
 
         let stakes: RwLockReadGuard<Stakes<StakeAccount<Delegation>>> = bank.stakes_cache.stakes();
+        let rewarded_epoch = bank.epoch().saturating_sub(1);
         let EpochRewardCalculateParamInfo {
             stake_history,
             stake_delegations,
             cached_vote_accounts,
-        } = bank.get_epoch_params_for_recalculation(&stakes);
+        } = bank.get_epoch_params_for_recalculation(rewarded_epoch, &stakes);
 
         let point_value = bank.calculate_reward_points_partitioned(
             &stake_history,
             &stake_delegations,
-            cached_vote_accounts,
+            &cached_vote_accounts,
             expected_rewards,
             &thread_pool,
             &rewards_metrics,
@@ -938,22 +1019,474 @@ mod tests {
         let rewards_metrics: RewardsMetrics = RewardsMetrics::default();
         let expected_rewards = 100_000_000_000;
         let stakes: RwLockReadGuard<Stakes<StakeAccount<Delegation>>> = bank.stakes_cache.stakes();
+        let rewarded_epoch = bank.epoch().saturating_sub(1);
         let EpochRewardCalculateParamInfo {
             stake_history,
             stake_delegations,
             cached_vote_accounts,
-        } = bank.get_epoch_params_for_recalculation(&stakes);
+        } = bank.get_epoch_params_for_recalculation(rewarded_epoch, &stakes);
 
         let point_value = bank.calculate_reward_points_partitioned(
             &stake_history,
             &stake_delegations,
-            cached_vote_accounts,
+            &cached_vote_accounts,
             expected_rewards,
             &thread_pool,
             &rewards_metrics,
         );
 
         assert!(point_value.is_none());
+    }
+
+    struct EpochOperations {
+        epoch: Epoch,
+        vote_operations: Vec<(Pubkey, VoteOperations)>,
+    }
+
+    #[derive(Default)]
+    struct VoteOperations {
+        expected_reward_commission: Option<u8>,
+        // ops to perform before epoch ends
+        create_with_balance: Option<u64>,
+        delegate_stake_amount: Option<u64>,
+        new_commission: Option<u8>,
+        earned_credits: Option<u64>,
+    }
+
+    fn recalculate_reward_commission_for_tests(
+        bank: &Bank,
+        commission_pubkey: &Pubkey,
+    ) -> Option<RewardInfo> {
+        let epoch_rewards_sysvar = bank.get_epoch_rewards_sysvar();
+        let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let (reward_commissions, ..) =
+            bank.recalculate_stake_rewards(&epoch_rewards_sysvar, &thread_pool);
+        reward_commissions
+            .accounts_with_rewards
+            .iter()
+            .find(|(reward_address, ..)| reward_address == commission_pubkey)
+            .map(|(_, reward, _)| *reward)
+    }
+
+    fn apply_epoch_operations(mut bank: Bank, op: EpochOperations) -> Bank {
+        assert_eq!(bank.epoch(), op.epoch);
+        for (vote_address, vote_op) in &op.vote_operations {
+            if let Some(balance) = &vote_op.create_with_balance {
+                // Create a BLS pubkey so the vote account passes VAT filtering
+                let identity = Keypair::new();
+                let bls_keypair =
+                    BLSKeypair::derive_from_signer(&identity, BLS_KEYPAIR_DERIVE_SEED).unwrap();
+                let (bls_pubkey, bls_pop) =
+                    create_bls_proof_of_possession(vote_address, &bls_keypair);
+                let vote_init = VoteInitV2 {
+                    node_pubkey: identity.pubkey(),
+                    authorized_voter: identity.pubkey(),
+                    authorized_voter_bls_pubkey: bls_pubkey,
+                    authorized_voter_bls_proof_of_possession: bls_pop,
+                    ..VoteInitV2::default()
+                };
+                let vote_state = VoteStateV4::new(&vote_init, &Clock::default());
+                let mut account = solana_account::AccountSharedData::new(
+                    *balance,
+                    VoteStateV4::size_of(),
+                    &solana_vote_program::id(),
+                );
+                account
+                    .serialize_data(&VoteStateVersions::new_v4(vote_state))
+                    .unwrap();
+                bank.store_account(vote_address, &account);
+            }
+
+            if let Some(stake_amount) = &vote_op.delegate_stake_amount {
+                let size = StakeStateV2::size_of();
+                let rent_exempt_reserve = bank.rent_collector().rent.minimum_balance(size);
+                let lamports = rent_exempt_reserve + stake_amount;
+                let mut stake_account =
+                    AccountSharedData::new(lamports, size, &solana_sdk_ids::stake::id());
+
+                let meta = Meta {
+                    authorized: Authorized::auto(&Pubkey::new_unique()),
+                    rent_exempt_reserve,
+                    ..Meta::default()
+                };
+
+                let stake = Stake {
+                    delegation: Delegation::new(vote_address, *stake_amount, bank.epoch()),
+                    credits_observed: 0,
+                };
+
+                stake_account
+                    .set_state(&StakeStateV2::Stake(meta, stake, StakeFlags::empty()))
+                    .expect("set_state");
+
+                bank.store_account(&Pubkey::new_unique(), &stake_account);
+            }
+
+            let modify_vote_state = |modify_fn: &dyn Fn(&mut VoteStateV4)| {
+                let mut vote_account = bank.get_account(vote_address).unwrap();
+                let vote_state_versions = vote_account
+                    .deserialize_data::<VoteStateVersions>()
+                    .unwrap();
+                let VoteStateVersions::V4(mut vote_state) = vote_state_versions else {
+                    panic!("unexpected version");
+                };
+
+                modify_fn(&mut vote_state);
+
+                vote_account
+                    .serialize_data(&VoteStateVersions::V4(vote_state))
+                    .unwrap();
+                bank.store_account(vote_address, &vote_account);
+            };
+
+            if let Some(commission) = vote_op.new_commission {
+                modify_vote_state(&|vote_state: &mut VoteStateV4| {
+                    vote_state.inflation_rewards_commission_bps = commission as u16 * 100;
+                });
+            }
+
+            if let Some(earned_credits) = vote_op.earned_credits {
+                modify_vote_state(&|vote_state: &mut VoteStateV4| {
+                    let last_credits = vote_state
+                        .epoch_credits
+                        .last()
+                        .map(|(_epoch, credits, _)| *credits)
+                        .unwrap_or(0);
+                    vote_state.epoch_credits.push((
+                        bank.epoch,
+                        last_credits + earned_credits,
+                        last_credits,
+                    ));
+                });
+            }
+        }
+
+        // Advance bank to next epoch
+        let slot = bank.slot + SLOTS_PER_EPOCH;
+        let prev_bank = Arc::new(bank);
+        bank = Bank::new_from_parent(prev_bank.clone(), &Pubkey::new_unique(), slot);
+
+        for (vote_address, vote_op) in &op.vote_operations {
+            let expected_commission = vote_op.expected_reward_commission;
+            let recalculated_vote_reward =
+                recalculate_reward_commission_for_tests(&bank, vote_address);
+            let vote_reward = bank
+                .rewards
+                .read()
+                .unwrap()
+                .iter()
+                .find(|(address, _reward)| address == vote_address)
+                .map(|(_address, reward)| *reward);
+
+            let prev_vote_balance = prev_bank
+                .get_account(vote_address)
+                .unwrap_or_default()
+                .lamports();
+            let vote_balance = bank.get_balance(vote_address);
+
+            if let Some(expected_commission) = &expected_commission {
+                let reward_lamports = vote_balance - prev_vote_balance;
+                let expected_vote_reward = RewardInfo {
+                    reward_type: RewardType::Voting,
+                    lamports: reward_lamports as i64,
+                    post_balance: vote_balance,
+                    commission_bps: Some(*expected_commission as u16 * 100),
+                };
+
+                assert_eq!(
+                    vote_reward,
+                    Some(expected_vote_reward),
+                    "epoch {}: unexpected reward info",
+                    op.epoch
+                );
+
+                assert_eq!(
+                    recalculated_vote_reward,
+                    Some(expected_vote_reward),
+                    "epoch {}: unexpected recalculated reward info",
+                    op.epoch
+                );
+            } else {
+                assert!(
+                    vote_reward.map(|reward| reward.lamports).unwrap_or(0) == 0,
+                    "epoch {}: expected no reward",
+                    op.epoch
+                );
+                assert!(
+                    recalculated_vote_reward
+                        .map(|reward| reward.lamports)
+                        .unwrap_or(0)
+                        == 0,
+                    "epoch {}: expected no recalculated reward",
+                    op.epoch
+                );
+            }
+        }
+
+        bank
+    }
+
+    #[test_case(true; "delay_commission_updates")]
+    #[test_case(false; "instant_commission_updates")]
+    fn test_calculate_stake_vote_rewards_new_vote_account(delay_commission_updates: bool) {
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = genesis_utils::create_genesis_config_with_leader(
+            1_000_000 * LAMPORTS_PER_SOL,
+            &Pubkey::new_unique(),
+            42 * LAMPORTS_PER_SOL,
+        );
+
+        genesis_config.epoch_schedule = EpochSchedule::new(SLOTS_PER_EPOCH);
+        if !delay_commission_updates {
+            deactivate_features(&mut genesis_config, &vec![delay_commission_updates::id()]);
+        }
+
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        let vote_address = Pubkey::new_unique();
+
+        // No reward should be given in the epoch that a vote account is
+        // delegated to for the first time
+        bank = apply_epoch_operations(
+            bank,
+            EpochOperations {
+                epoch: 0,
+                vote_operations: vec![(
+                    vote_address,
+                    VoteOperations {
+                        create_with_balance: Some(LAMPORTS_PER_SOL),
+                        new_commission: Some(1),
+                        earned_credits: Some(1000),
+                        delegate_stake_amount: Some(LAMPORTS_PER_SOL),
+                        ..VoteOperations::default()
+                    },
+                )],
+            },
+        );
+
+        // Check that if a vote account didn't exist two epochs ago (normal for
+        // new vote accounts), that the reward commission falls back to the
+        // commission from the end of the rewarded epoch.
+        bank = {
+            let expected_commission = if delay_commission_updates { 1 } else { 2 };
+            apply_epoch_operations(
+                bank,
+                EpochOperations {
+                    epoch: 1,
+                    vote_operations: vec![(
+                        vote_address,
+                        VoteOperations {
+                            new_commission: Some(2),
+                            earned_credits: Some(1000),
+                            expected_reward_commission: Some(expected_commission),
+                            ..VoteOperations::default()
+                        },
+                    )],
+                },
+            )
+        };
+
+        let expected_commission = if delay_commission_updates { 1 } else { 3 };
+        apply_epoch_operations(
+            bank,
+            EpochOperations {
+                epoch: 2,
+                vote_operations: vec![(
+                    vote_address,
+                    VoteOperations {
+                        new_commission: Some(3),
+                        earned_credits: Some(1000),
+                        expected_reward_commission: Some(expected_commission),
+                        ..VoteOperations::default()
+                    },
+                )],
+            },
+        );
+    }
+
+    #[test]
+    fn test_calculate_stake_vote_rewards_prestaked_vote_account() {
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = genesis_utils::create_genesis_config_with_leader(
+            1_000_000 * LAMPORTS_PER_SOL,
+            &Pubkey::new_unique(),
+            42 * LAMPORTS_PER_SOL,
+        );
+
+        genesis_config.epoch_schedule = EpochSchedule::new(SLOTS_PER_EPOCH);
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        assert!(bank.feature_set.is_active(&delay_commission_updates::id()));
+
+        let vote_address = Pubkey::new_unique();
+        bank = apply_epoch_operations(
+            bank,
+            EpochOperations {
+                epoch: 0,
+                vote_operations: vec![(
+                    vote_address,
+                    VoteOperations {
+                        delegate_stake_amount: Some(LAMPORTS_PER_SOL),
+                        ..VoteOperations::default()
+                    },
+                )],
+            },
+        );
+
+        // Check that if a new vote account is somehow already staked and
+        // earning rewards in the epoch in which it was created, the reward
+        // commission falls back to the latest commission rate for that epoch
+        bank = apply_epoch_operations(
+            bank,
+            EpochOperations {
+                epoch: 1,
+                vote_operations: vec![(
+                    vote_address,
+                    VoteOperations {
+                        create_with_balance: Some(LAMPORTS_PER_SOL),
+                        new_commission: Some(1),
+                        earned_credits: Some(1000),
+                        expected_reward_commission: Some(1),
+                        ..VoteOperations::default()
+                    },
+                )],
+            },
+        );
+
+        // And similarly, check that if a vote account didn't exist two epochs
+        // ago, the reward commission falls back to the commission from the
+        // previous epoch
+        bank = apply_epoch_operations(
+            bank,
+            EpochOperations {
+                epoch: 2,
+                vote_operations: vec![(
+                    vote_address,
+                    VoteOperations {
+                        new_commission: Some(2),
+                        earned_credits: Some(1000),
+                        expected_reward_commission: Some(1),
+                        ..VoteOperations::default()
+                    },
+                )],
+            },
+        );
+
+        apply_epoch_operations(
+            bank,
+            EpochOperations {
+                epoch: 3,
+                vote_operations: vec![(
+                    vote_address,
+                    VoteOperations {
+                        new_commission: Some(3),
+                        earned_credits: Some(1000),
+                        expected_reward_commission: Some(1),
+                        ..VoteOperations::default()
+                    },
+                )],
+            },
+        );
+    }
+
+    #[test]
+    fn test_calculate_stake_vote_rewards_genesis_vote_account() {
+        let GenesisConfigInfo {
+            mut genesis_config,
+            voting_keypair,
+            ..
+        } = genesis_utils::create_genesis_config_with_leader(
+            1_000_000 * LAMPORTS_PER_SOL,
+            &Pubkey::new_unique(),
+            42 * LAMPORTS_PER_SOL,
+        );
+
+        genesis_config.epoch_schedule = EpochSchedule::new(SLOTS_PER_EPOCH);
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        assert!(bank.feature_set.is_active(&delay_commission_updates::id()));
+
+        let genesis_vote_address = voting_keypair.pubkey();
+
+        // Check that staked genesis vote accounts use the initial commission
+        // rate for the first reward epoch
+        bank = apply_epoch_operations(
+            bank,
+            EpochOperations {
+                epoch: 0,
+                vote_operations: vec![(
+                    genesis_vote_address,
+                    VoteOperations {
+                        new_commission: Some(1),
+                        earned_credits: Some(1000),
+                        expected_reward_commission: Some(0),
+                        ..VoteOperations::default()
+                    },
+                )],
+            },
+        );
+
+        // Check that staked genesis vote accounts use the initial commission
+        // rate for the second reward epoch too.
+        bank = apply_epoch_operations(
+            bank,
+            EpochOperations {
+                epoch: 1,
+                vote_operations: vec![(
+                    genesis_vote_address,
+                    VoteOperations {
+                        new_commission: Some(2),
+                        earned_credits: Some(1000),
+                        expected_reward_commission: Some(0),
+                        ..VoteOperations::default()
+                    },
+                )],
+            },
+        );
+
+        bank = apply_epoch_operations(
+            bank,
+            EpochOperations {
+                epoch: 2,
+                vote_operations: vec![(
+                    genesis_vote_address,
+                    VoteOperations {
+                        earned_credits: Some(1000),
+                        expected_reward_commission: Some(1),
+                        ..VoteOperations::default()
+                    },
+                )],
+            },
+        );
+
+        bank = apply_epoch_operations(
+            bank,
+            EpochOperations {
+                epoch: 3,
+                vote_operations: vec![(
+                    genesis_vote_address,
+                    VoteOperations {
+                        earned_credits: Some(1000),
+                        expected_reward_commission: Some(2),
+                        ..VoteOperations::default()
+                    },
+                )],
+            },
+        );
+
+        apply_epoch_operations(
+            bank,
+            EpochOperations {
+                epoch: 4,
+                vote_operations: vec![(
+                    genesis_vote_address,
+                    VoteOperations {
+                        earned_credits: Some(1000),
+                        expected_reward_commission: Some(2),
+                        ..VoteOperations::default()
+                    },
+                )],
+            },
+        );
     }
 
     #[test]
@@ -989,17 +1522,18 @@ mod tests {
             stake_history,
             stake_delegations,
             cached_vote_accounts,
-        } = bank.get_epoch_params_for_recalculation(&stakes);
-        let (vote_rewards_accounts, stake_reward_calculation) = bank.calculate_stake_vote_rewards(
-            &stake_history,
-            &stake_delegations,
-            cached_vote_accounts,
-            rewarded_epoch,
-            point_value,
-            &thread_pool,
-            reward_calc_tracer,
-            &mut rewards_metrics,
-        );
+        } = bank.get_epoch_params_for_recalculation(rewarded_epoch, &stakes);
+        let (vote_rewards_accounts, stake_reward_calculation) = bank
+            .calculate_stake_rewards_and_commissions(
+                &stake_history,
+                &stake_delegations,
+                cached_vote_accounts,
+                rewarded_epoch,
+                point_value,
+                &thread_pool,
+                reward_calc_tracer,
+                &mut rewards_metrics,
+            );
         drop(stakes);
 
         let vote_account = bank
@@ -1008,15 +1542,11 @@ mod tests {
             .0;
         let vote_state = VoteStateV4::deserialize(vote_account.data(), vote_pubkey).unwrap();
 
-        assert_eq!(
-            vote_rewards_accounts.accounts_with_rewards.len(),
-            vote_rewards_accounts.accounts_with_rewards.len()
-        );
         assert_eq!(vote_rewards_accounts.accounts_with_rewards.len(), 1);
         let (vote_pubkey_from_result, rewards, account) =
             &vote_rewards_accounts.accounts_with_rewards[0];
         let vote_rewards = 0;
-        let commission = (vote_state.inflation_rewards_commission_bps / 100) as u8;
+        let commission_bps = vote_state.inflation_rewards_commission_bps;
         assert_eq!(account.lamports(), vote_account.lamports());
         assert!(accounts_equal(account, &vote_account));
         assert_eq!(
@@ -1025,7 +1555,7 @@ mod tests {
                 reward_type: RewardType::Voting,
                 lamports: vote_rewards as i64,
                 post_balance: vote_account.lamports(),
-                commission: Some(commission),
+                commission_bps: Some(commission_bps),
             }
         );
         assert_eq!(vote_pubkey_from_result, vote_pubkey);
@@ -1041,7 +1571,7 @@ mod tests {
                 stake,
                 stake_pubkey,
                 stake_reward,
-                commission,
+                commission_bps,
             }
         };
         assert_eq!(
@@ -1084,7 +1614,7 @@ mod tests {
             stake_history,
             stake_delegations,
             cached_vote_accounts,
-        } = bank.get_epoch_params_for_recalculation(&stakes);
+        } = bank.get_epoch_params_for_recalculation(rewarded_epoch, &stakes);
         let PartitionedRewardsCalculation {
             stake_rewards:
                 StakeRewardCalculation {
@@ -1104,7 +1634,7 @@ mod tests {
         drop(stakes);
 
         let epoch_rewards_sysvar = bank.get_epoch_rewards_sysvar();
-        let (recalculated_rewards, recalculated_partition_indices) =
+        let (_, recalculated_rewards, recalculated_partition_indices) =
             bank.recalculate_stake_rewards(&epoch_rewards_sysvar, &thread_pool);
 
         let recalculated_rewards =
@@ -1132,7 +1662,7 @@ mod tests {
         let bank = Arc::new(Bank::new_from_parent(bank, &Pubkey::default(), new_slot));
 
         let epoch_rewards_sysvar = bank.get_epoch_rewards_sysvar();
-        let (recalculated_rewards, recalculated_partition_indices) =
+        let (_, recalculated_rewards, recalculated_partition_indices) =
             bank.recalculate_stake_rewards(&epoch_rewards_sysvar, &thread_pool);
 
         // Note that recalculated rewards are **NOT** the same as expected
@@ -1189,7 +1719,7 @@ mod tests {
             stake_history,
             stake_delegations,
             cached_vote_accounts,
-        } = bank.get_epoch_params_for_recalculation(&stakes);
+        } = bank.get_epoch_params_for_recalculation(rewarded_epoch, &stakes);
         let PartitionedRewardsCalculation {
             stake_rewards:
                 StakeRewardCalculation {
@@ -1217,7 +1747,7 @@ mod tests {
         let expected_stake_rewards =
             build_partitioned_stake_rewards(&expected_stake_rewards, &expected_partition_indices);
 
-        let (recalculated_rewards, recalculated_partition_indices) =
+        let (_, recalculated_rewards, recalculated_partition_indices) =
             bank.recalculate_stake_rewards(&epoch_rewards_sysvar, &thread_pool);
         let recalculated_rewards =
             build_partitioned_stake_rewards(&recalculated_rewards, &recalculated_partition_indices);
@@ -1264,7 +1794,7 @@ mod tests {
             stake_history,
             stake_delegations,
             cached_vote_accounts,
-        } = bank.get_epoch_params_for_recalculation(&stakes);
+        } = bank.get_epoch_params_for_recalculation(rewarded_epoch, &stakes);
         let PartitionedRewardsCalculation {
             stake_rewards:
                 StakeRewardCalculation {
@@ -1424,108 +1954,210 @@ mod tests {
     }
 
     #[test]
+    fn test_initialize_after_snapshot_restore_preserves_vat_filtered_rewards() {
+        let num_validators = crate::bank::MAX_ALPENGLOW_VOTE_ACCOUNTS + 1;
+        let num_rewards_per_block = 64;
+        // Use unique stakes so VAT filtering deterministically excludes exactly
+        // the lowest-staked validator instead of dropping an entire tie group.
+        let stakes = (0..num_validators)
+            .map(|index| 2_000_000_000 + (num_validators - index) as u64)
+            .collect::<Vec<_>>();
+        let (
+            RewardBank {
+                bank,
+                voters,
+                stakers,
+            },
+            bank_forks,
+        ) = create_reward_bank_with_specific_stakes(
+            stakes,
+            num_rewards_per_block,
+            SLOTS_PER_EPOCH - 1,
+        );
+
+        let filtered_vote_pubkey = *voters.last().unwrap();
+        let filtered_stake_pubkey = *stakers.last().unwrap();
+
+        // Advance to the epoch boundary, which computes the original in-memory
+        // reward list and updates EpochStakes for the new epoch.
+        let new_slot = bank.slot() + 1;
+        let mut bank = Bank::new_from_parent(bank, &Pubkey::default(), new_slot);
+
+        let leader_schedule_epoch = bank.epoch_schedule().get_leader_schedule_epoch(bank.slot());
+        let filtered_epoch_vote_accounts = bank
+            .epoch_stakes(leader_schedule_epoch)
+            .unwrap()
+            .stakes()
+            .vote_accounts();
+        assert_eq!(
+            bank.stakes_cache.stakes().vote_accounts().len(),
+            num_validators
+        );
+        assert_eq!(
+            filtered_epoch_vote_accounts.len(),
+            crate::bank::MAX_ALPENGLOW_VOTE_ACCOUNTS
+        );
+        assert!(
+            filtered_epoch_vote_accounts
+                .get(&filtered_vote_pubkey)
+                .is_none()
+        );
+
+        let EpochRewardStatus::Active(EpochRewardPhase::Calculation(calculation_status)) =
+            bank.epoch_reward_status.clone()
+        else {
+            panic!("{:?} not active calculation", bank.epoch_reward_status);
+        };
+        assert_eq!(
+            calculation_status.all_stake_rewards.num_rewards(),
+            crate::bank::MAX_ALPENGLOW_VOTE_ACCOUNTS
+        );
+        assert!(
+            calculation_status
+                .all_stake_rewards
+                .enumerated_rewards_iter()
+                .all(|(_, reward)| reward.stake_pubkey != filtered_stake_pubkey)
+        );
+
+        // Simulate snapshot restore: re-apply features from accounts and
+        // rebuild epoch_reward_status from snapshot-stable state.
+        bank.feature_set = Arc::new(FeatureSet::default());
+        let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        bank.initialize_after_snapshot_restore(|| &thread_pool);
+
+        let EpochRewardStatus::Active(EpochRewardPhase::Distribution(distribution_status)) =
+            bank.epoch_reward_status.clone()
+        else {
+            panic!("{:?} not active distribution", bank.epoch_reward_status);
+        };
+        assert_eq!(
+            distribution_status.all_stake_rewards.num_rewards(),
+            crate::bank::MAX_ALPENGLOW_VOTE_ACCOUNTS
+        );
+        assert!(
+            distribution_status
+                .all_stake_rewards
+                .enumerated_rewards_iter()
+                .all(|(_, reward)| reward.stake_pubkey != filtered_stake_pubkey)
+        );
+
+        assert_eq!(
+            calculation_status.distribution_starting_block_height,
+            distribution_status.distribution_starting_block_height
+        );
+        assert_eq!(
+            calculation_status.all_stake_rewards,
+            distribution_status.all_stake_rewards
+        );
+        let _ = &bank_forks; // Keep in scope so parent banks retain fork_graph
+    }
+
+    #[test]
     fn test_reward_accumulator() {
         let mut accumulator1 = RewardsAccumulator::default();
         let mut accumulator2 = RewardsAccumulator::default();
 
-        let vote_pubkey_a = Pubkey::new_unique();
-        let node_pubkey_a = Pubkey::new_unique();
-        let vote_account_a = vote_state::create_v4_account_with_authorized(
-            &node_pubkey_a,
-            &vote_pubkey_a,
-            &vote_pubkey_a,
-            None,
-            2000,
-            100,
-        );
-        let vote_pubkey_b = Pubkey::new_unique();
-        let node_pubkey_b = Pubkey::new_unique();
-        let vote_account_b = vote_state::create_v4_account_with_authorized(
-            &node_pubkey_b,
-            &vote_pubkey_b,
-            &vote_pubkey_b,
-            None,
-            2000,
-            100,
-        );
-        let vote_pubkey_c = Pubkey::new_unique();
-        let node_pubkey_c = Pubkey::new_unique();
-        let vote_account_c = vote_state::create_v4_account_with_authorized(
-            &node_pubkey_c,
-            &vote_pubkey_c,
-            &vote_pubkey_c,
-            None,
-            2000,
-            100,
-        );
+        let commission_pubkey_a = Pubkey::new_unique();
+        let commission_account_a = AccountSharedData::default();
+
+        let commission_pubkey_b = Pubkey::new_unique();
+        let commission_account_b = AccountSharedData::default();
+
+        let commission_pubkey_c = Pubkey::new_unique();
+        let commission_account_c = AccountSharedData::default();
 
         accumulator1.add_reward(
-            vote_pubkey_a,
-            VoteReward {
-                vote_account: vote_account_a.clone(),
-                commission: 10,
-                vote_rewards: 50,
+            commission_pubkey_a,
+            RewardCommission {
+                commission_account: commission_account_a.clone(),
+                commission_bps: 1_000,
+                commission_lamports: 50,
             },
             50,
         );
         accumulator1.add_reward(
-            vote_pubkey_b,
-            VoteReward {
-                vote_account: vote_account_b.clone(),
-                commission: 10,
-                vote_rewards: 50,
+            commission_pubkey_b,
+            RewardCommission {
+                commission_account: commission_account_b.clone(),
+                commission_bps: 1_000,
+                commission_lamports: 50,
             },
             50,
         );
         accumulator2.add_reward(
-            vote_pubkey_b,
-            VoteReward {
-                vote_account: vote_account_b,
-                commission: 10,
-                vote_rewards: 30,
+            commission_pubkey_b,
+            RewardCommission {
+                commission_account: commission_account_b,
+                commission_bps: 1_000,
+                commission_lamports: 30,
             },
             30,
         );
         accumulator2.add_reward(
-            vote_pubkey_c,
-            VoteReward {
-                vote_account: vote_account_c,
-                commission: 10,
-                vote_rewards: 50,
+            commission_pubkey_c,
+            RewardCommission {
+                commission_account: commission_account_c,
+                commission_bps: 1_000,
+                commission_lamports: 50,
             },
             50,
         );
 
         assert_eq!(accumulator1.num_stake_rewards, 2);
         assert_eq!(accumulator1.total_stake_rewards_lamports, 100);
-        let vote_reward_a_1 = accumulator1.vote_rewards.get(&vote_pubkey_a).unwrap();
-        assert_eq!(vote_reward_a_1.commission, 10);
-        assert_eq!(vote_reward_a_1.vote_rewards, 50);
-        let vote_reward_b_1 = accumulator1.vote_rewards.get(&vote_pubkey_b).unwrap();
-        assert_eq!(vote_reward_b_1.commission, 10);
-        assert_eq!(vote_reward_b_1.vote_rewards, 50);
+        let reward_commission_a_1 = accumulator1
+            .reward_commissions
+            .get(&commission_pubkey_a)
+            .unwrap();
+        assert_eq!(reward_commission_a_1.commission_bps, 1_000);
+        assert_eq!(reward_commission_a_1.commission_lamports, 50);
 
-        let vote_reward_b_2 = accumulator2.vote_rewards.get(&vote_pubkey_b).unwrap();
-        assert_eq!(vote_reward_b_2.commission, 10);
-        assert_eq!(vote_reward_b_2.vote_rewards, 30);
-        let vote_reward_c_2 = accumulator2.vote_rewards.get(&vote_pubkey_c).unwrap();
-        assert_eq!(vote_reward_c_2.commission, 10);
-        assert_eq!(vote_reward_c_2.vote_rewards, 50);
+        let reward_commission_b_1 = accumulator1
+            .reward_commissions
+            .get(&commission_pubkey_b)
+            .unwrap();
+        assert_eq!(reward_commission_b_1.commission_bps, 1_000);
+        assert_eq!(reward_commission_b_1.commission_lamports, 50);
+
+        let reward_commission_b_2 = accumulator2
+            .reward_commissions
+            .get(&commission_pubkey_b)
+            .unwrap();
+        assert_eq!(reward_commission_b_2.commission_bps, 1_000);
+        assert_eq!(reward_commission_b_2.commission_lamports, 30);
+
+        let reward_commission_c_2 = accumulator2
+            .reward_commissions
+            .get(&commission_pubkey_c)
+            .unwrap();
+        assert_eq!(reward_commission_c_2.commission_bps, 1_000);
+        assert_eq!(reward_commission_c_2.commission_lamports, 50);
 
         let accumulator = accumulator1.accumulate_into_larger(accumulator2);
 
         assert_eq!(accumulator.num_stake_rewards, 4);
         assert_eq!(accumulator.total_stake_rewards_lamports, 180);
-        let vote_reward_a = accumulator.vote_rewards.get(&vote_pubkey_a).unwrap();
-        assert_eq!(vote_reward_a.commission, 10);
-        assert_eq!(vote_reward_a.vote_rewards, 50);
-        let vote_reward_b = accumulator.vote_rewards.get(&vote_pubkey_b).unwrap();
-        assert_eq!(vote_reward_b.commission, 10);
-        // sum of the vote rewards from both accumulators
-        assert_eq!(vote_reward_b.vote_rewards, 80);
-        let vote_reward_c = accumulator.vote_rewards.get(&vote_pubkey_c).unwrap();
-        assert_eq!(vote_reward_c.commission, 10);
-        assert_eq!(vote_reward_c.vote_rewards, 50);
+        let reward_commission_a = accumulator
+            .reward_commissions
+            .get(&commission_pubkey_a)
+            .unwrap();
+        assert_eq!(reward_commission_a.commission_bps, 1_000);
+        assert_eq!(reward_commission_a.commission_lamports, 50);
+
+        let reward_commission_b = accumulator
+            .reward_commissions
+            .get(&commission_pubkey_b)
+            .unwrap();
+        assert_eq!(reward_commission_b.commission_bps, 1_000);
+        // sum of the reward commissions from both accumulators
+        assert_eq!(reward_commission_b.commission_lamports, 80);
+
+        let reward_commission_c = accumulator
+            .reward_commissions
+            .get(&commission_pubkey_c)
+            .unwrap();
+        assert_eq!(reward_commission_c.commission_bps, 1_000);
+        assert_eq!(reward_commission_c.commission_lamports, 50);
     }
 
     #[test]
@@ -1543,10 +2175,13 @@ mod tests {
                 vote_pubkey,
                 vote_state::create_v4_account_with_authorized(
                     &vote_pubkey,
-                    &Pubkey::new_unique(),
-                    &Pubkey::new_unique(),
-                    None,
+                    &vote_pubkey,
+                    [0u8; BLS_PUBLIC_KEY_COMPRESSED_SIZE],
+                    &vote_pubkey,
                     0,
+                    &vote_pubkey,
+                    0,
+                    &vote_pubkey,
                     100_000_000_000,
                 )
                 .into(),
@@ -1558,10 +2193,13 @@ mod tests {
                 &vote_pubkey,
                 &vote_state::create_v4_account_with_authorized(
                     &vote_pubkey,
-                    &Pubkey::new_unique(),
-                    &Pubkey::new_unique(),
-                    None,
+                    &vote_pubkey,
+                    [0u8; BLS_PUBLIC_KEY_COMPRESSED_SIZE],
+                    &vote_pubkey,
                     0,
+                    &vote_pubkey,
+                    0,
+                    &vote_pubkey,
                     100_000_000_000,
                 ),
                 &genesis_config.rent,
@@ -1573,7 +2211,7 @@ mod tests {
         }
 
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
-        let slots_per_epoch = bank.epoch_schedule().slots_per_epoch;
+        let next_epoch_slot = bank.get_slots_in_epoch(bank.epoch);
         {
             let cache = bank.epoch_rewards_calculation_cache.lock().unwrap();
             assert!(
@@ -1583,7 +2221,7 @@ mod tests {
         }
 
         let bank_fork1 =
-            Bank::new_from_parent(Arc::clone(&bank), &Pubkey::default(), slots_per_epoch);
+            Bank::new_from_parent(Arc::clone(&bank), &Pubkey::default(), next_epoch_slot);
         {
             let cache = bank_fork1.epoch_rewards_calculation_cache.lock().unwrap();
             assert!(
@@ -1592,7 +2230,7 @@ mod tests {
             );
         }
 
-        let bank_fork2 = Bank::new_from_parent(bank, &Pubkey::default(), slots_per_epoch);
+        let bank_fork2 = Bank::new_from_parent(bank, &Pubkey::default(), next_epoch_slot);
         {
             let cache = bank_fork2.epoch_rewards_calculation_cache.lock().unwrap();
             assert!(
@@ -1627,7 +2265,7 @@ mod tests {
         expected_cache_len: usize,
         expected_voters: &HashSet<Pubkey>,
         expected_stakers: &HashSet<Pubkey>,
-        expected_vote_rewards: u64,
+        expected_reward_commissions: u64,
         expected_stake_rewards: u64,
         expected_rewards: u64,
         expected_points: u128,
@@ -1636,11 +2274,11 @@ mod tests {
         let cache = bank.epoch_rewards_calculation_cache.lock().unwrap();
         assert_eq!(cache.len(), expected_cache_len);
         let partitioned = cache.get(&bank.parent_hash()).unwrap().as_ref();
-        let VoteRewardsAccounts {
+        let RewardCommissionAccounts {
             accounts_with_rewards,
-            total_vote_rewards_lamports,
+            total_reward_commission_lamports,
             ..
-        } = &partitioned.vote_account_rewards;
+        } = &partitioned.reward_commission_accounts;
         let StakeRewardCalculation {
             stake_rewards,
             total_stake_rewards_lamports,
@@ -1659,12 +2297,18 @@ mod tests {
             .collect();
         assert_eq!(expected_voters, &voters);
         assert_eq!(expected_stakers, &stakers);
-        assert_eq!(*total_vote_rewards_lamports, expected_vote_rewards);
+        assert_eq!(
+            *total_reward_commission_lamports,
+            expected_reward_commissions
+        );
         assert_eq!(*total_stake_rewards_lamports, expected_stake_rewards);
         assert_eq!(point_value.rewards, expected_rewards);
         assert_eq!(point_value.points, expected_points);
         if let Some(parent_cap) = parent_capitalization {
-            assert_eq!(bank.capitalization(), parent_cap + expected_vote_rewards);
+            assert_eq!(
+                bank.capitalization(),
+                parent_cap + expected_reward_commissions
+            );
         }
     }
 
@@ -1700,9 +2344,9 @@ mod tests {
             1,                     // expected_cache_len
             &voters,               // expected_voters
             &stakers,              // expected_stakers
-            0,                     // expected_vote_rewards
-            12300,                 // expected_stake_rewards
-            12392,                 // expected_rewards
+            0,                     // expected_reward_commissions
+            499500,                // expected_stake_rewards
+            499542,                // expected_rewards
             8_400_000_000_000u128, // expected_points
             None,                  // parent_capitalization
         );
@@ -1721,9 +2365,9 @@ mod tests {
             2,                           // expected_cache_len
             &voters,                     // expected_voters
             &stakers,                    // expected_stakers
-            1245,                        // expected_vote_rewards
-            11810,                       // expected_stake_rewards
-            13163,                       // expected_rewards
+            5555,                        // expected_reward_commissions
+            494730,                      // expected_stake_rewards
+            500313,                      // expected_rewards
             9_450_000_000_000u128,       // expected_points
             Some(parent_capitalization), // parent_capitalization
         );
@@ -1742,9 +2386,9 @@ mod tests {
             3,                           // expected_cache_len
             &voters,                     // expected_voters
             &stakers,                    // expected_stakers
-            1525,                        // expected_vote_rewards
-            13930,                       // expected_stake_rewards
-            15629,                       // expected_rewards
+            17300,                       // expected_reward_commissions
+            485365,                      // expected_stake_rewards
+            502779,                      // expected_rewards
             12_810_000_000_000u128,      // expected_points
             Some(parent_capitalization), // parent_capitalization
         );

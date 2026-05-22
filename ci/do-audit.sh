@@ -18,8 +18,6 @@ while [[ -n $1 ]]; do
 done
 
 cargo_audit_ignores=(
-  # === main repo ===
-  #
   # Crate:     ed25519-dalek
   # Version:   1.0.1
   # Title:     Double Public Key Signing Function Oracle Attack on `ed25519-dalek`
@@ -40,8 +38,6 @@ cargo_audit_ignores=(
   # jsonrpc-core-client v18.0.0 -> jsonrpc-client-transports v18.0.0 -> url v1.7.2 -> idna v0.1.5
   --ignore RUSTSEC-2024-0421
 
-  # === programs/sbf ===
-  #
   # Crate:     curve25519-dalek
   # Version:   3.2.1
   # Title:     Timing variability in `curve25519-dalek`'s `Scalar29::sub`/`Scalar52::sub`
@@ -60,38 +56,6 @@ cargo_audit_ignores=(
   # Solution:  Upgrade to >=0.12.3
   --ignore RUSTSEC-2024-0376
 
-	# Crate:     bytes
-	# Version:   1.10.1
-	# Title:     Integer overflow in `BytesMut::reserve`
-	# Date:      2026-02-03
-	# ID:        RUSTSEC-2026-0007
-	# URL:       https://github.com/advisories/GHSA-434x-w66g-qw3r
-	# Solution:  Upgrade to >=1.11.1
-	--ignore RUSTSEC-2026-0007
-
-	# Crate:     time
-	# Version:   0.3.9
-	# Title:     Denial of Service via Stack Exhaustion
-	# Date:      2026-02-05
-	# ID:        RUSTSEC-2026-0009
-	# URL:       https://rustsec.org/advisories/RUSTSEC-2026-0009
-	# Severity:  6.8 (medium)
-	# Solution:  Upgrade to >=0.3.47
-	--ignore RUSTSEC-2026-0009
-
-  # Crate:     quinn-proto
-  # Version:   0.11.13
-  # Title:     Denial of service in Quinn endpoints
-  # Date:      2026-03-09
-  # ID:        RUSTSEC-2026-0037
-  # URL:       https://rustsec.org/advisories/RUSTSEC-2026-0037
-  # Severity:  8.7 (high)
-  # Solution:  Upgrade to >=0.11.14
-  #
-  # AGAVE OK: we backported the fix to 0.11.13 vendored
-  --ignore RUSTSEC-2026-0037
-
-
   # Crate:     rustls-webpki
   # Version:   0.101.7
   # Title:     CRLs not considered authoritative by Distribution Point due to faulty matching logic
@@ -100,9 +64,41 @@ cargo_audit_ignores=(
   # URL:       https://rustsec.org/advisories/RUSTSEC-2026-0049
   # Solution:  Upgrade to >=0.103.10
   #
-  # AGAVE OK: we patched the 0.103.6 release tag for corresponding dependents. here we
-  # ignore for those on incompatible 0.101.7
+  # NOTE: we took the fix for 0.103.6 dependents. 0.101.7 is unaffected
   --ignore RUSTSEC-2026-0049
+
+  # Crate:     rustls-webpki
+  # Version:   0.101.7
+  # Title:     Name constraints for URI names were incorrectly accepted
+  # Date:      2026-04-14
+  # ID:        RUSTSEC-2026-0098
+  # URL:       https://rustsec.org/advisories/RUSTSEC-2026-0098
+  # Solution:  Upgrade to >=0.103.12, <0.104.0-alpha.1 OR >=0.104.0-alpha.6
+  #
+  # AVAVE OK: we picked upstream fix atop our vendored branches
+  --ignore RUSTSEC-2026-0098
+
+  # Crate:     rustls-webpki
+  # Version:   0.101.7
+  # Title:     Name constraints were accepted for certificates asserting a wildcard name
+  # Date:      2026-04-14
+  # ID:        RUSTSEC-2026-0099
+  # URL:       https://rustsec.org/advisories/RUSTSEC-2026-0099
+  # Solution:  Upgrade to >=0.103.12, <0.104.0-alpha.1 OR >=0.104.0-alpha.6
+  #
+  # AVAVE OK: we picked upstream fix atop our vendored branches
+  --ignore RUSTSEC-2026-0099
+
+  # Crate:     rustls-webpki
+  # Version:   0.101.7
+  # Title:     Reachable panic in certificate revocation list parsing
+  # Date:      2026-04-22
+  # ID:        RUSTSEC-2026-0104
+  # URL:       https://rustsec.org/advisories/RUSTSEC-2026-0104
+  # Solution:  Upgrade to >=0.103.13, <0.104.0-alpha.1 OR >=0.104.0-alpha.7
+  #
+  # AGAVE OK: vendored the upstream fix again
+  --ignore RUSTSEC-2026-0104
 )
 scripts/cargo-for-all-lock-files.sh audit "${cargo_audit_ignores[@]}" | $dep_tree_filter
 # we want the `cargo audit` exit code, not `$dep_tree_filter`'s

@@ -67,7 +67,7 @@ impl From<SavedVoteHistory> for SavedVoteHistoryVersions {
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiExample),
-    frozen_abi(digest = "42PkuFNWFBZ6X7QoPKtpLu6SY8bxmd6KVGJbVsNBm46m")
+    frozen_abi(digest = "J6vB6FWFT8CFEvxndXWes461hroo8Q5L9Wq9cv4FEzaQ")
 )]
 #[derive(Default, Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct SavedVoteHistory {
@@ -193,7 +193,7 @@ mod test {
         let mut vote_history = VoteHistory::new(pubkey, 0);
         let saved_vote_history = SavedVoteHistory::new(&vote_history, &keypair).unwrap();
         let saved_vote_history_versions = SavedVoteHistoryVersions::from(saved_vote_history);
-        assert!(storage.store(&saved_vote_history_versions).is_ok());
+        storage.store(&saved_vote_history_versions).unwrap();
         let restored_vote_history = storage.load(&pubkey).unwrap();
         assert_eq!(restored_vote_history.root(), 0);
 
@@ -202,7 +202,7 @@ mod test {
         vote_history.add_vote(Vote::new_skip_vote(2));
         let saved_vote_history = SavedVoteHistory::new(&vote_history, &keypair).unwrap();
         let saved_vote_history_versions = SavedVoteHistoryVersions::from(saved_vote_history);
-        assert!(storage.store(&saved_vote_history_versions).is_ok());
+        storage.store(&saved_vote_history_versions).unwrap();
         let restored_vote_history = storage.load(&pubkey).unwrap();
         assert_eq!(restored_vote_history.root(), 1);
         assert_eq!(
@@ -235,7 +235,7 @@ mod test {
         let saved_vote_history = SavedVoteHistory::new(&vote_history, &keypair).unwrap();
         let saved_vote_history_versions = SavedVoteHistoryVersions::from(saved_vote_history);
         // NullVoteHistoryStorage::save() always succeeds
-        assert!(storage.store(&saved_vote_history_versions).is_ok());
+        storage.store(&saved_vote_history_versions).unwrap();
         assert!(storage.load(&pubkey).is_err());
     }
 }

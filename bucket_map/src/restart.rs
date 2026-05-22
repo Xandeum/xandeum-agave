@@ -6,7 +6,7 @@ use {
     std::{
         collections::HashMap,
         fmt::{Debug, Formatter},
-        fs::{self, remove_file, OpenOptions},
+        fs::{self, OpenOptions, remove_file},
         io::{Seek, SeekFrom, Write},
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
@@ -206,7 +206,7 @@ impl Restart {
 
     /// get one `RestartableBucket` for each bucket.
     /// If a potentially reusable file exists, then put that file's path in `RestartableBucket` for that bucket.
-    /// Delete all files that cannot possibly be re-used.
+    /// Delete all files that cannot possibly be reused.
     pub(crate) fn get_restartable_buckets(
         restart: Option<&Arc<Mutex<Restart>>>,
         drives: &Arc<Vec<PathBuf>>,
@@ -326,10 +326,10 @@ mod test {
             .collect::<Vec<_>>();
 
         let skip = 2; // skip this file
-                      // note starting at 1 to avoid default values of 0 for file_name
-                      // create 4 bucket files.
-                      // 1,3,4 will match buckets 0,2,3
-                      // 5 is an extra file that will get deleted
+        // note starting at 1 to avoid default values of 0 for file_name
+        // create 4 bucket files.
+        // 1,3,4 will match buckets 0,2,3
+        // 5 is an extra file that will get deleted
         (0..config.max_buckets + 1).for_each(|i| {
             if i == skip {
                 return;
@@ -559,7 +559,7 @@ mod test {
         test_get(&restart, buckets, last_offset);
         (4..6).for_each(|offset| test_set_get(&restart, buckets, offset));
         drop(restart);
-        // create a new file without deleting old one. Make sure it is default and not re-used.
+        // create a new file without deleting old one. Make sure it is default and not reused.
         let restart = Arc::new(Mutex::new(Restart::new(&config).unwrap()));
         test_default_restart(&restart, &config);
     }

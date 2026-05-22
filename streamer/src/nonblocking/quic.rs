@@ -1,41 +1,36 @@
-#[allow(deprecated)]
-use crate::quic::QuicServerParams;
 use {
     crate::{
         nonblocking::{
-            connection_rate_limiter::{ConnectionRateLimiter, TotalConnectionRateLimiter},
-            qos::{ConnectionContext, QosController},
-            stream_throttle::ConnectionStreamCounter,
-            swqos::{SwQos, SwQosConfig},
+            connection_rate_limiter::ConnectionRateLimiter,
+            qos::{ConnectionContext, OpaqueStreamerCounter, QosController},
         },
-        quic::{configure_server, QuicServerError, QuicStreamerConfig, StreamerStats},
+        quic::{QuicServerError, QuicStreamerConfig, StreamerStats, configure_server},
         streamer::StakedNodes,
     },
     bytes::{BufMut, Bytes, BytesMut},
-    crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError},
-    futures::{stream::FuturesUnordered, Future, StreamExt as _},
+    crossbeam_channel::{Sender, TrySendError},
+    futures::{Future, StreamExt as _, stream::FuturesUnordered},
     indexmap::map::{Entry, IndexMap},
     quinn::{Accept, Connecting, Connection, Endpoint, EndpointConfig, TokioRuntime},
-    rand::{thread_rng, Rng},
+    rand::{Rng, rng},
     smallvec::SmallVec,
     solana_keypair::Keypair,
     solana_measure::measure::Measure,
+    solana_net_utils::token_bucket::TokenBucket,
     solana_packet::{Meta, PACKET_DATA_SIZE},
-    solana_perf::packet::{BytesPacket, BytesPacketBatch, PacketBatch, PACKETS_PER_BATCH},
+    solana_perf::packet::{BytesPacket, PacketBatch},
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     solana_tls_utils::get_pubkey_from_tls_certificate,
     solana_transaction_metrics_tracker::signature_if_should_track_packet,
     std::{
-        array,
-        fmt,
+        array, fmt,
         iter::repeat_with,
         net::{IpAddr, SocketAddr, UdpSocket},
         pin::Pin,
-        // CAUTION: be careful not to introduce any awaits while holding an RwLock.
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, RwLock,
+            atomic::{AtomicU64, Ordering},
         },
         task::Poll,
         time::{Duration, Instant},
@@ -50,8 +45,8 @@ use {
         // (i.e. lock order is always async Mutex -> RwLock). Also, be careful not to
         // introduce any other awaits while holding the RwLock.
         select,
-        task::{self, JoinHandle},
-        time::{sleep, timeout},
+        task::JoinHandle,
+        time::timeout,
     },
     tokio_util::{sync::CancellationToken, task::TaskTracker},
 };
@@ -66,10 +61,6 @@ const CONNECTION_CLOSE_REASON_DROPPED_ENTRY: &[u8] = b"dropped";
 pub(crate) const CONNECTION_CLOSE_CODE_DISALLOWED: u32 = 2;
 pub(crate) const CONNECTION_CLOSE_REASON_DISALLOWED: &[u8] = b"disallowed";
 
-pub(crate) const CONNECTION_CLOSE_CODE_EXCEED_MAX_STREAM_COUNT: u32 = 3;
-pub(crate) const CONNECTION_CLOSE_REASON_EXCEED_MAX_STREAM_COUNT: &[u8] =
-    b"exceed_max_stream_count";
-
 const CONNECTION_CLOSE_CODE_TOO_MANY: u32 = 4;
 const CONNECTION_CLOSE_REASON_TOO_MANY: &[u8] = b"too_many";
 
@@ -79,12 +70,10 @@ const CONNECTION_CLOSE_REASON_INVALID_STREAM: &[u8] = b"invalid_stream";
 /// Total new connection counts per second. Heuristically taken from
 /// the default staked and unstaked connection limits. Might be adjusted
 /// later.
-const TOTAL_CONNECTIONS_PER_SECOND: u64 = 2500;
+const TOTAL_CONNECTIONS_PER_SECOND: f64 = 2500.0;
 
-/// The threshold of the size of the connection rate limiter map. When
-/// the map size is above this, we will trigger a cleanup of older
-/// entries used by past requests.
-const CONNECTION_RATE_LIMITER_CLEANUP_SIZE_THRESHOLD: usize = 100_000;
+/// Max burst of connections above sustained rate to pass through
+const MAX_CONNECTION_BURST: u64 = 1000;
 
 /// Timeout for connection handshake. Timer starts once we get Initial from the
 /// peer, and is canceled when we get a Handshake packet from them.
@@ -105,7 +94,9 @@ pub(crate) const MIN_RTT: Duration = Duration::from_millis(2);
 #[derive(Clone)]
 struct PacketAccumulator {
     pub meta: Meta,
-    pub chunks: SmallVec<[Bytes; 2]>,
+    // the capacity here should match or exceed the capacity of the chunks
+    // array used by handle_connection()
+    pub chunks: SmallVec<[Bytes; 4]>,
     pub start_time: Instant,
 }
 
@@ -138,108 +129,8 @@ pub struct SpawnNonBlockingServerResult {
     pub max_concurrent_connections: usize,
 }
 
-#[deprecated(since = "3.0.0", note = "Use spawn_server instead")]
-#[allow(deprecated)]
-pub fn spawn_server_multi(
-    name: &'static str,
-    sockets: impl IntoIterator<Item = UdpSocket>,
-    keypair: &Keypair,
-    packet_sender: Sender<PacketBatch>,
-    exit: Arc<AtomicBool>,
-    staked_nodes: Arc<RwLock<StakedNodes>>,
-    quic_server_params: QuicServerParams,
-) -> Result<SpawnNonBlockingServerResult, QuicServerError> {
-    #[allow(deprecated)]
-    spawn_server(
-        name,
-        sockets,
-        keypair,
-        packet_sender,
-        exit,
-        staked_nodes,
-        quic_server_params,
-    )
-}
-
-#[deprecated(since = "3.1.0", note = "Use spawn_server_with_cancel instead")]
-#[allow(deprecated)]
-pub fn spawn_server(
-    name: &'static str,
-    sockets: impl IntoIterator<Item = UdpSocket>,
-    keypair: &Keypair,
-    packet_sender: Sender<PacketBatch>,
-    exit: Arc<AtomicBool>,
-    staked_nodes: Arc<RwLock<StakedNodes>>,
-    quic_server_params: QuicServerParams,
-) -> Result<SpawnNonBlockingServerResult, QuicServerError> {
-    let cancel = CancellationToken::new();
-    tokio::spawn({
-        let cancel = cancel.clone();
-        async move {
-            loop {
-                if exit.load(Ordering::Relaxed) {
-                    cancel.cancel();
-                    break;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        }
-    });
-    let quic_server_config = QuicStreamerConfig::from(&quic_server_params);
-    let qos_config = SwQosConfig {
-        max_streams_per_ms: quic_server_params.max_streams_per_ms,
-    };
-    spawn_server_with_cancel(
-        name,
-        sockets,
-        keypair,
-        packet_sender,
-        staked_nodes,
-        quic_server_config,
-        qos_config,
-        cancel,
-    )
-}
-
 /// Spawn a streamer instance in the current tokio runtime.
-pub fn spawn_server_with_cancel(
-    name: &'static str,
-    sockets: impl IntoIterator<Item = UdpSocket>,
-    keypair: &Keypair,
-    packet_sender: Sender<PacketBatch>,
-    staked_nodes: Arc<RwLock<StakedNodes>>,
-    quic_server_params: QuicStreamerConfig,
-    qos_config: SwQosConfig,
-    cancel: CancellationToken,
-) -> Result<SpawnNonBlockingServerResult, QuicServerError>
-where
-{
-    let stats = Arc::<StreamerStats>::default();
-
-    let swqos = Arc::new(SwQos::new(
-        qos_config,
-        quic_server_params.max_staked_connections,
-        quic_server_params.max_unstaked_connections,
-        quic_server_params.max_connections_per_peer,
-        stats.clone(),
-        staked_nodes,
-        cancel.clone(),
-    ));
-
-    spawn_server_with_cancel_and_qos(
-        name,
-        stats,
-        sockets,
-        keypair,
-        packet_sender,
-        quic_server_params,
-        swqos,
-        cancel,
-    )
-}
-
-/// Spawn a streamer instance in the current tokio runtime.
-pub(crate) fn spawn_server_with_cancel_and_qos<Q, C>(
+pub(crate) fn spawn_server<Q, C>(
     name: &'static str,
     stats: Arc<StreamerStats>,
     sockets: impl IntoIterator<Item = UdpSocket>,
@@ -269,17 +160,8 @@ where
             .map_err(QuicServerError::EndpointFailed)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (packet_batch_sender, packet_batch_receiver) =
-        bounded(quic_server_params.accumulator_channel_size);
-    task::spawn_blocking({
-        let cancel = cancel.clone();
-        let stats = stats.clone();
-        move || {
-            run_packet_batch_sender(packet_sender, packet_batch_receiver, stats, cancel);
-        }
-    });
 
-    let max_concurrent_connections = quic_server_params.max_concurrent_connections();
+    let max_concurrent_connections = qos.max_concurrent_connections();
     let handle = tokio::spawn({
         let endpoints = endpoints.clone();
         let stats = stats.clone();
@@ -287,7 +169,7 @@ where
             let tasks = run_server(
                 name,
                 endpoints.clone(),
-                packet_batch_sender,
+                packet_sender,
                 stats.clone(),
                 quic_server_params,
                 cancel,
@@ -356,7 +238,7 @@ impl ClientConnectionTracker {
 async fn run_server<Q, C>(
     name: &'static str,
     endpoints: Vec<Endpoint>,
-    packet_batch_sender: Sender<PacketAccumulator>,
+    packet_batch_sender: Sender<PacketBatch>,
     stats: Arc<StreamerStats>,
     quic_server_params: QuicStreamerConfig,
     cancel: CancellationToken,
@@ -367,10 +249,17 @@ where
     C: ConnectionContext + Send + Sync + 'static,
 {
     let quic_server_params = Arc::new(quic_server_params);
+    let num_shards = (quic_server_params.num_threads.get() * 2).next_power_of_two();
     let rate_limiter = Arc::new(ConnectionRateLimiter::new(
         quic_server_params.max_connections_per_ipaddr_per_min,
+        // allow for 10x burst to make sure we can accommodate legitimate
+        // bursts from container environments running multiple pods on same IP
+        quic_server_params.max_connections_per_ipaddr_per_min * 10,
+        num_shards,
     ));
-    let overall_connection_rate_limiter = Arc::new(TotalConnectionRateLimiter::new(
+    let overall_connection_rate_limiter = Arc::new(TokenBucket::new(
+        MAX_CONNECTION_BURST,
+        MAX_CONNECTION_BURST,
         TOTAL_CONNECTIONS_PER_SECOND,
     ));
 
@@ -425,18 +314,34 @@ where
                 .total_incoming_connection_attempts
                 .fetch_add(1, Ordering::Relaxed);
 
-            // first do per IpAddr rate limiting
-            if rate_limiter.len() > CONNECTION_RATE_LIMITER_CLEANUP_SIZE_THRESHOLD {
-                rate_limiter.retain_recent();
+            // check overall connection request rate limiter
+            if overall_connection_rate_limiter.current_tokens() == 0 {
+                stats
+                    .connection_rate_limited_across_all
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "Ignoring incoming connection from {} due to overall rate limit.",
+                    incoming.remote_address()
+                );
+                incoming.ignore();
+                continue;
             }
-            stats
-                .connection_rate_limiter_length
-                .store(rate_limiter.len(), Ordering::Relaxed);
+            // then perform per IpAddr rate limiting
+            if !rate_limiter.is_allowed(&incoming.remote_address().ip()) {
+                stats
+                    .connection_rate_limited_per_ipaddr
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    "Ignoring incoming connection from {} due to per-IP rate limiting.",
+                    incoming.remote_address()
+                );
+                incoming.ignore();
+                continue;
+            }
 
-            let Ok(client_connection_tracker) = ClientConnectionTracker::new(
-                stats.clone(),
-                quic_server_params.max_concurrent_connections(),
-            ) else {
+            let Ok(client_connection_tracker) =
+                ClientConnectionTracker::new(stats.clone(), qos.max_concurrent_connections())
+            else {
                 stats
                     .refused_connections_too_many_open_connections
                     .fetch_add(1, Ordering::Relaxed);
@@ -506,21 +411,26 @@ pub fn get_connection_stake(
 #[derive(Debug)]
 pub(crate) enum ConnectionHandlerError {
     ConnectionAddError,
-    MaxStreamError,
 }
 
-pub(crate) fn update_open_connections_stat(
+pub(crate) fn update_open_connections_stat<S: OpaqueStreamerCounter>(
     stats: &StreamerStats,
-    connection_table: &ConnectionTable,
+    connection_table: &ConnectionTable<S>,
 ) {
     if connection_table.is_staked() {
         stats
             .open_staked_connections
             .store(connection_table.table_size(), Ordering::Relaxed);
+        stats
+            .peak_open_staked_connections
+            .fetch_max(connection_table.table_size(), Ordering::Relaxed);
     } else {
         stats
             .open_unstaked_connections
             .store(connection_table.table_size(), Ordering::Relaxed);
+        stats
+            .peak_open_unstaked_connections
+            .fetch_max(connection_table.table_size(), Ordering::Relaxed);
     }
 }
 
@@ -528,9 +438,9 @@ pub(crate) fn update_open_connections_stat(
 async fn setup_connection<Q, C>(
     connecting: Connecting,
     rate_limiter: Arc<ConnectionRateLimiter>,
-    overall_connection_rate_limiter: Arc<TotalConnectionRateLimiter>,
+    overall_connection_rate_limiter: Arc<TokenBucket>,
     client_connection_tracker: ClientConnectionTracker,
-    packet_sender: Sender<PacketAccumulator>,
+    packet_sender: Sender<PacketBatch>,
     stats: Arc<StreamerStats>,
     server_params: Arc<QuicStreamerConfig>,
     qos: Arc<Q>,
@@ -548,7 +458,10 @@ async fn setup_connection<Q, C>(
         match connecting_result {
             Ok(new_connection) => {
                 debug!("Got a connection {from:?}");
-                if !rate_limiter.is_allowed(&from.ip()) {
+                // now that we have observed the handshake we can be certain
+                // that the initiator owns an IP address, we can update rate
+                // limiters on the server
+                if !rate_limiter.register_connection(&from.ip()) {
                     debug!("Reject connection from {from:?} -- rate limiting exceeded");
                     stats
                         .connection_rate_limited_per_ipaddr
@@ -560,7 +473,7 @@ async fn setup_connection<Q, C>(
                     return;
                 }
 
-                if !overall_connection_rate_limiter.is_allowed() {
+                if overall_connection_rate_limiter.consume_tokens(1).is_err() {
                     debug!(
                         "Reject connection from {:?} -- total rate limiting exceeded",
                         from.ip()
@@ -647,129 +560,6 @@ fn handle_connection_error(e: quinn::ConnectionError, stats: &StreamerStats, fro
     }
 }
 
-// Holder(s) of the Sender<PacketAccumulator> on the other end should not
-// wait for this function to exit
-fn run_packet_batch_sender(
-    packet_sender: Sender<PacketBatch>,
-    packet_receiver: Receiver<PacketAccumulator>,
-    stats: Arc<StreamerStats>,
-    cancel: CancellationToken,
-) {
-    let mut channel_disconnected = false;
-    trace!("enter packet_batch_sender");
-    loop {
-        let mut packet_perf_measure: Vec<([u8; 64], Instant)> = Vec::default();
-        let mut packet_batch = BytesPacketBatch::with_capacity(PACKETS_PER_BATCH);
-        let mut total_bytes: usize = 0;
-
-        stats
-            .total_packet_batches_allocated
-            .fetch_add(1, Ordering::Relaxed);
-        stats
-            .total_packets_allocated
-            .fetch_add(PACKETS_PER_BATCH, Ordering::Relaxed);
-
-        loop {
-            if cancel.is_cancelled() || channel_disconnected {
-                return;
-            }
-            if !packet_batch.is_empty() {
-                let len = packet_batch.len();
-                track_streamer_fetch_packet_performance(&packet_perf_measure, &stats);
-
-                if let Err(e) = packet_sender.try_send(packet_batch.into()) {
-                    stats
-                        .total_packet_batch_send_err
-                        .fetch_add(1, Ordering::Relaxed);
-                    trace!("Send error: {e}");
-
-                    // The downstream channel is disconnected, this error is not recoverable.
-                    if matches!(e, TrySendError::Disconnected(_)) {
-                        cancel.cancel();
-                        return;
-                    }
-                } else {
-                    stats
-                        .total_packet_batches_sent
-                        .fetch_add(1, Ordering::Relaxed);
-
-                    stats
-                        .total_packets_sent_to_consumer
-                        .fetch_add(len, Ordering::Relaxed);
-
-                    stats
-                        .total_bytes_sent_to_consumer
-                        .fetch_add(total_bytes, Ordering::Relaxed);
-
-                    trace!("Sent {len} packet batch");
-                }
-                break;
-            }
-
-            // On the first receive, we block on recv not to use excessive CPU when the channel is idle.
-            // This will not block the exit as the channel will be dropped on the sender's side.
-            //
-            // On subsequent receives, we call try_recv, so that we do not get blocked waiting for packets
-            // when we already have something in the batch.
-            //
-            // For setting channel_disconnected, we can ignore TryRecvError::Disconnected on try_recv and
-            // set it on the next iteration (if we don't exit early anyway from cancel token)
-            let mut first = true;
-            let mut recv = || {
-                if first {
-                    first = false;
-                    // recv is only an error if empty and disconnected
-                    packet_receiver.recv().map_err(|_| {
-                        channel_disconnected = true;
-                        TryRecvError::Disconnected
-                    })
-                } else {
-                    packet_receiver.try_recv()
-                }
-            };
-            while let Ok(mut packet_accumulator) = recv() {
-                // 86% of transactions/packets come in one chunk. In that case,
-                // we can just move the chunk to the `Packet` and no copy is
-                // made.
-                // 14% of them come in multiple chunks. In that case, we copy
-                // them into one `Bytes` buffer. We make a copy once, with
-                // intention to not do it again.
-                let num_chunks = packet_accumulator.chunks.len();
-                let mut packet = if packet_accumulator.chunks.len() == 1 {
-                    BytesPacket::new(
-                        packet_accumulator.chunks.pop().expect("expected one chunk"),
-                        packet_accumulator.meta,
-                    )
-                } else {
-                    let size: usize = packet_accumulator.chunks.iter().map(Bytes::len).sum();
-                    let mut buf = BytesMut::with_capacity(size);
-                    for chunk in packet_accumulator.chunks {
-                        buf.put_slice(&chunk);
-                    }
-                    BytesPacket::new(buf.freeze(), packet_accumulator.meta)
-                };
-
-                total_bytes += packet.meta().size;
-
-                if let Some(signature) = signature_if_should_track_packet(&packet).ok().flatten() {
-                    packet_perf_measure.push((*signature, packet_accumulator.start_time));
-                    // we set the PERF_TRACK_PACKET on
-                    packet.meta_mut().set_track_performance(true);
-                }
-                packet_batch.push(packet);
-                stats
-                    .total_chunks_processed_by_batcher
-                    .fetch_add(num_chunks, Ordering::Relaxed);
-
-                // prevent getting stuck in loop
-                if packet_batch.len() >= PACKETS_PER_BATCH {
-                    break;
-                }
-            }
-        }
-    }
-}
-
 fn track_streamer_fetch_packet_performance(
     packet_perf_measure: &[([u8; 64], Instant)],
     stats: &StreamerStats,
@@ -800,7 +590,7 @@ fn track_streamer_fetch_packet_performance(
 }
 
 async fn handle_connection<Q, C>(
-    packet_sender: Sender<PacketAccumulator>,
+    packet_sender: Sender<PacketBatch>,
     remote_address: SocketAddr,
     connection: Connection,
     stats: Arc<StreamerStats>,
@@ -843,8 +633,11 @@ async fn handle_connection<Q, C>(
         let mut meta = Meta::default();
         meta.set_socket_addr(&remote_address);
         meta.set_from_staked_node(matches!(peer_type, ConnectionPeerType::Staked(_)));
-        let mut accum = PacketAccumulator::new(meta);
+        if let Some(pubkey) = context.remote_pubkey() {
+            meta.set_remote_pubkey(pubkey);
+        }
 
+        let mut accum = PacketAccumulator::new(meta);
         // Virtually all small transactions will fit in 1 chunk. Larger transactions will fit in 1
         // or 2 chunks if the first chunk starts towards the end of a datagram. A small number of
         // transaction will have other protocol frames inserted in the middle. Empirically it's been
@@ -946,7 +739,7 @@ enum StreamState {
 fn handle_chunks(
     chunks: impl ExactSizeIterator<Item = Bytes>,
     accum: &mut PacketAccumulator,
-    packet_sender: &Sender<PacketAccumulator>,
+    packet_sender: &Sender<PacketBatch>,
     stats: &StreamerStats,
     peer_type: ConnectionPeerType,
 ) -> Result<StreamState, ()> {
@@ -988,35 +781,64 @@ fn handle_chunks(
 
     // done receiving chunks
     let bytes_sent = accum.meta.size;
-    let chunks_sent = accum.chunks.len();
 
-    if let Err(err) = packet_sender.try_send(accum.clone()) {
+    // 86% of transactions/packets come in one chunk. In that case,
+    // we can just move the chunk to the `Packet` and no copy is
+    // made.
+    // 14% of them come in multiple chunks. In that case, we copy
+    // them into one `Bytes` buffer. We make a copy once, with
+    // intention to not do it again.
+    let mut packet = if accum.chunks.len() == 1 {
+        BytesPacket::new(
+            accum.chunks.pop().expect("expected one chunk"),
+            accum.meta.clone(),
+        )
+    } else {
+        let mut buf = BytesMut::with_capacity(bytes_sent);
+        for chunk in &accum.chunks {
+            buf.put_slice(chunk);
+        }
+        BytesPacket::new(buf.freeze(), accum.meta.clone())
+    };
+
+    let packet_size = packet.meta().size;
+
+    let mut packet_perf_measure = None;
+    if let Some(signature) = signature_if_should_track_packet(&packet).ok().flatten() {
+        packet_perf_measure = Some((*signature, accum.start_time));
+        // we set the PERF_TRACK_PACKET on
+        packet.meta_mut().set_track_performance(true);
+    }
+    let packet_batch = PacketBatch::Single(packet);
+
+    if let Err(err) = packet_sender.try_send(packet_batch) {
         stats
-            .total_handle_chunk_to_packet_batcher_send_err
+            .total_handle_chunk_to_packet_send_err
             .fetch_add(1, Ordering::Relaxed);
         match err {
             TrySendError::Full(_) => {
                 stats
-                    .total_handle_chunk_to_packet_batcher_send_full_err
+                    .total_handle_chunk_to_packet_send_full_err
                     .fetch_add(1, Ordering::Relaxed);
             }
             TrySendError::Disconnected(_) => {
                 stats
-                    .total_handle_chunk_to_packet_batcher_send_disconnected_err
+                    .total_handle_chunk_to_packet_send_disconnected_err
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
         trace!("packet batch send error {err:?}");
     } else {
+        if let Some(ppm) = &packet_perf_measure {
+            track_streamer_fetch_packet_performance(core::array::from_ref(ppm), stats);
+        }
+
         stats
-            .total_packets_sent_for_batching
+            .total_bytes_sent_to_consumer
+            .fetch_add(packet_size, Ordering::Relaxed);
+        stats
+            .total_packets_sent_to_consumer
             .fetch_add(1, Ordering::Relaxed);
-        stats
-            .total_bytes_sent_for_batching
-            .fetch_add(bytes_sent, Ordering::Relaxed);
-        stats
-            .total_chunks_sent_for_batching
-            .fetch_add(chunks_sent, Ordering::Relaxed);
 
         match peer_type {
             ConnectionPeerType::Unstaked => {
@@ -1037,8 +859,7 @@ fn handle_chunks(
     Ok(StreamState::Finished)
 }
 
-#[derive(Debug)]
-struct ConnectionEntry {
+struct ConnectionEntry<S: OpaqueStreamerCounter> {
     cancel: CancellationToken,
     peer_type: ConnectionPeerType,
     last_update: Arc<AtomicU64>,
@@ -1046,10 +867,10 @@ struct ConnectionEntry {
     // We do not explicitly use it, but its drop is triggered when ConnectionEntry is dropped.
     _client_connection_tracker: ClientConnectionTracker,
     connection: Option<Connection>,
-    stream_counter: Arc<ConnectionStreamCounter>,
+    stream_counter: Arc<S>,
 }
 
-impl ConnectionEntry {
+impl<S: OpaqueStreamerCounter> ConnectionEntry<S> {
     fn new(
         cancel: CancellationToken,
         peer_type: ConnectionPeerType,
@@ -1057,7 +878,7 @@ impl ConnectionEntry {
         port: u16,
         client_connection_tracker: ClientConnectionTracker,
         connection: Option<Connection>,
-        stream_counter: Arc<ConnectionStreamCounter>,
+        stream_counter: Arc<S>,
     ) -> Self {
         Self {
             cancel,
@@ -1082,7 +903,7 @@ impl ConnectionEntry {
     }
 }
 
-impl Drop for ConnectionEntry {
+impl<S: OpaqueStreamerCounter> Drop for ConnectionEntry<S> {
     fn drop(&mut self) {
         if let Some(conn) = self.connection.take() {
             conn.close(
@@ -1114,8 +935,8 @@ pub(crate) enum ConnectionTableType {
 }
 
 // Map of IP to list of connection entries
-pub(crate) struct ConnectionTable {
-    table: IndexMap<ConnectionTableKey, Vec<ConnectionEntry>>,
+pub(crate) struct ConnectionTable<S: OpaqueStreamerCounter> {
+    table: IndexMap<ConnectionTableKey, Vec<ConnectionEntry<S>>>,
     pub(crate) total_size: usize,
     table_type: ConnectionTableType,
     cancel: CancellationToken,
@@ -1124,7 +945,7 @@ pub(crate) struct ConnectionTable {
 /// Prune the connection which has the oldest update
 ///
 /// Return number pruned
-impl ConnectionTable {
+impl<S: OpaqueStreamerCounter> ConnectionTable<S> {
     pub(crate) fn new(table_type: ConnectionTableType, cancel: CancellationToken) -> Self {
         Self {
             table: IndexMap::default(),
@@ -1168,12 +989,12 @@ impl ConnectionTable {
         let num_pruned = std::iter::once(self.table.len())
             .filter(|&size| size > 0)
             .flat_map(|size| {
-                let mut rng = thread_rng();
-                repeat_with(move || rng.gen_range(0..size))
+                let mut rng = rng();
+                repeat_with(move || rng.random_range(0..size))
             })
             .map(|index| {
                 let connection = self.table[index].first();
-                let stake = connection.map(|connection: &ConnectionEntry| connection.stake());
+                let stake = connection.map(|connection: &ConnectionEntry<S>| connection.stake());
                 (index, stake)
             })
             .take(sample_size)
@@ -1186,7 +1007,7 @@ impl ConnectionTable {
         num_pruned
     }
 
-    pub(crate) fn try_add_connection(
+    pub(crate) fn try_add_connection<F: FnOnce() -> Arc<S>>(
         &mut self,
         key: ConnectionTableKey,
         port: u16,
@@ -1195,11 +1016,8 @@ impl ConnectionTable {
         peer_type: ConnectionPeerType,
         last_update: Arc<AtomicU64>,
         max_connections_per_peer: usize,
-    ) -> Option<(
-        Arc<AtomicU64>,
-        CancellationToken,
-        Arc<ConnectionStreamCounter>,
-    )> {
+        stream_counter_factory: F,
+    ) -> Option<(Arc<AtomicU64>, CancellationToken, Arc<S>)> {
         let connection_entry = self.table.entry(key).or_default();
         let has_connection_capacity = connection_entry
             .len()
@@ -1211,7 +1029,7 @@ impl ConnectionTable {
             let stream_counter = connection_entry
                 .first()
                 .map(|entry| entry.stream_counter.clone())
-                .unwrap_or(Arc::new(ConnectionStreamCounter::new()));
+                .unwrap_or_else(stream_counter_factory);
             connection_entry.push(ConnectionEntry::new(
                 cancel.clone(),
                 peer_type,
@@ -1294,12 +1112,16 @@ impl Future for EndpointAccept<'_> {
 pub mod test {
     use {
         super::*,
-        crate::nonblocking::testing_utilities::{
-            check_multiple_streams, get_client_config, make_client_endpoint, setup_quic_server,
-            SpawnTestServerResult,
+        crate::nonblocking::{
+            qos::NullStreamerCounter,
+            swqos::SwQosConfig,
+            testing_utilities::{
+                SpawnTestServerResult, check_multiple_streams, get_client_config,
+                make_client_endpoint, setup_quic_server, spawn_stake_weighted_qos_server,
+            },
         },
         assert_matches::assert_matches,
-        crossbeam_channel::{unbounded, Receiver},
+        crossbeam_channel::{Receiver, unbounded},
         quinn::{ApplicationClose, ConnectionError},
         solana_keypair::Keypair,
         solana_net_utils::sockets::bind_to_localhost_unique,
@@ -1478,51 +1300,6 @@ pub mod test {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_packet_batcher() {
-        agave_logger::setup();
-        let (pkt_batch_sender, pkt_batch_receiver) = unbounded();
-        let (ptk_sender, pkt_receiver) = unbounded();
-        let cancel = CancellationToken::new();
-        let stats = Arc::new(StreamerStats::default());
-
-        let handle = task::spawn_blocking({
-            let cancel = cancel.clone();
-            move || {
-                run_packet_batch_sender(pkt_batch_sender, pkt_receiver, stats, cancel);
-            }
-        });
-
-        let num_packets = 1000;
-
-        for _i in 0..num_packets {
-            let mut meta = Meta::default();
-            let bytes = Bytes::from("Hello world");
-            let size = bytes.len();
-            meta.size = size;
-            let packet_accum = PacketAccumulator {
-                meta,
-                chunks: smallvec::smallvec![bytes],
-                start_time: Instant::now(),
-            };
-            ptk_sender.send(packet_accum).unwrap();
-        }
-        let mut i = 0;
-        let start = Instant::now();
-        while i < num_packets && start.elapsed().as_secs() < 2 {
-            if let Ok(batch) = pkt_batch_receiver.try_recv() {
-                i += batch.len();
-            } else {
-                sleep(Duration::from_millis(1)).await;
-            }
-        }
-        assert_eq!(i, num_packets);
-        cancel.cancel();
-        // Explicit drop to wake up packet_batch_sender
-        drop(ptk_sender);
-        handle.await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn test_quic_stream_timeout() {
         agave_logger::setup();
         let SpawnTestServerResult {
@@ -1574,7 +1351,7 @@ pub mod test {
         } = setup_quic_server(
             None,
             QuicStreamerConfig::default_for_tests(),
-            SwQosConfig::default(),
+            SwQosConfig::default_for_tests(),
         );
         check_block_multiple_connections(server_address).await;
         cancel.cancel();
@@ -1595,10 +1372,12 @@ pub mod test {
         } = setup_quic_server(
             None,
             QuicStreamerConfig {
-                max_connections_per_peer: 2,
                 ..QuicStreamerConfig::default_for_tests()
             },
-            SwQosConfig::default(),
+            SwQosConfig {
+                max_connections_per_unstaked_peer: 2,
+                ..SwQosConfig::default_for_tests()
+            },
         );
 
         let client_socket = bind_to_localhost_unique().expect("should bind - client");
@@ -1798,17 +1577,19 @@ pub mod test {
             stats: _,
             thread: t,
             max_concurrent_connections: _,
-        } = spawn_server_with_cancel(
+        } = spawn_stake_weighted_qos_server(
             "quic_streamer_test",
             [s],
             &keypair,
             sender,
             staked_nodes,
             QuicStreamerConfig {
-                max_unstaked_connections: 0, // Do not allow any connection from unstaked clients/nodes
                 ..QuicStreamerConfig::default_for_tests()
             },
-            SwQosConfig::default(),
+            SwQosConfig {
+                max_unstaked_connections: 0, // Do not allow any connection from unstaked clients/nodes
+                ..Default::default()
+            },
             cancel.clone(),
         )
         .unwrap();
@@ -1832,17 +1613,19 @@ pub mod test {
             stats,
             thread: t,
             max_concurrent_connections: _,
-        } = spawn_server_with_cancel(
+        } = spawn_stake_weighted_qos_server(
             "quic_streamer_test",
             [s],
             &keypair,
             sender,
             staked_nodes,
             QuicStreamerConfig {
-                max_connections_per_peer: 2,
                 ..QuicStreamerConfig::default_for_tests()
             },
-            SwQosConfig::default(),
+            SwQosConfig {
+                max_connections_per_unstaked_peer: 2,
+                ..Default::default()
+            },
             cancel.clone(),
         )
         .unwrap();
@@ -1881,6 +1664,7 @@ pub mod test {
                     ConnectionPeerType::Unstaked,
                     Arc::new(AtomicU64::new(i as u64)),
                     max_connections_per_peer,
+                    || Arc::new(NullStreamerCounter {}),
                 )
                 .unwrap();
         }
@@ -1894,6 +1678,7 @@ pub mod test {
                 ConnectionPeerType::Unstaked,
                 Arc::new(AtomicU64::new(5)),
                 max_connections_per_peer,
+                || Arc::new(NullStreamerCounter {}),
             )
             .unwrap();
 
@@ -1937,6 +1722,7 @@ pub mod test {
                     ConnectionPeerType::Unstaked,
                     Arc::new(AtomicU64::new(i as u64)),
                     max_connections_per_peer,
+                    || Arc::new(NullStreamerCounter {}),
                 )
                 .unwrap();
         }
@@ -1973,38 +1759,45 @@ pub mod test {
                     ConnectionPeerType::Unstaked,
                     Arc::new(AtomicU64::new(i as u64)),
                     max_connections_per_peer,
+                    || Arc::new(NullStreamerCounter {}),
                 )
                 .unwrap();
         });
 
         // We should NOT be able to add more entries than max_connections_per_peer, since we are
         // using the same peer pubkey.
-        assert!(table
-            .try_add_connection(
-                ConnectionTableKey::Pubkey(pubkey),
-                0,
-                ClientConnectionTracker::new(stats.clone(), 1000).unwrap(),
-                None,
-                ConnectionPeerType::Unstaked,
-                Arc::new(AtomicU64::new(10)),
-                max_connections_per_peer,
-            )
-            .is_none());
+        assert!(
+            table
+                .try_add_connection(
+                    ConnectionTableKey::Pubkey(pubkey),
+                    0,
+                    ClientConnectionTracker::new(stats.clone(), 1000).unwrap(),
+                    None,
+                    ConnectionPeerType::Unstaked,
+                    Arc::new(AtomicU64::new(10)),
+                    max_connections_per_peer,
+                    || Arc::new(NullStreamerCounter {})
+                )
+                .is_none()
+        );
 
         // We should be able to add an entry from another peer pubkey
         let num_entries = max_connections_per_peer + 1;
         let pubkey2 = Pubkey::new_unique();
-        assert!(table
-            .try_add_connection(
-                ConnectionTableKey::Pubkey(pubkey2),
-                0,
-                ClientConnectionTracker::new(stats.clone(), 1000).unwrap(),
-                None,
-                ConnectionPeerType::Unstaked,
-                Arc::new(AtomicU64::new(10)),
-                max_connections_per_peer,
-            )
-            .is_some());
+        assert!(
+            table
+                .try_add_connection(
+                    ConnectionTableKey::Pubkey(pubkey2),
+                    0,
+                    ClientConnectionTracker::new(stats.clone(), 1000).unwrap(),
+                    None,
+                    ConnectionPeerType::Unstaked,
+                    Arc::new(AtomicU64::new(10)),
+                    max_connections_per_peer,
+                    || Arc::new(NullStreamerCounter {})
+                )
+                .is_some()
+        );
 
         assert_eq!(table.total_size, num_entries);
 
@@ -2043,6 +1836,7 @@ pub mod test {
                     ConnectionPeerType::Staked((i + 1) as u64),
                     Arc::new(AtomicU64::new(i as u64)),
                     max_connections_per_peer,
+                    || Arc::new(NullStreamerCounter {}),
                 )
                 .unwrap();
         }
@@ -2087,6 +1881,7 @@ pub mod test {
                     ConnectionPeerType::Unstaked,
                     Arc::new(AtomicU64::new((i * 2) as u64)),
                     max_connections_per_peer,
+                    || Arc::new(NullStreamerCounter {}),
                 )
                 .unwrap();
 
@@ -2099,6 +1894,7 @@ pub mod test {
                     ConnectionPeerType::Unstaked,
                     Arc::new(AtomicU64::new((i * 2 + 1) as u64)),
                     max_connections_per_peer,
+                    || Arc::new(NullStreamerCounter {}),
                 )
                 .unwrap();
         }
@@ -2114,6 +1910,7 @@ pub mod test {
                 ConnectionPeerType::Unstaked,
                 Arc::new(AtomicU64::new((num_ips * 2) as u64)),
                 max_connections_per_peer,
+                || Arc::new(NullStreamerCounter {}),
             )
             .unwrap();
 

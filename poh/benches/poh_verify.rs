@@ -2,7 +2,7 @@
 extern crate test;
 
 use {
-    solana_entry::entry::{self, next_entry_mut, Entry, EntrySlice},
+    solana_entry::entry::{self, Entry, EntrySlice, next_entry_mut},
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_sha256_hasher::hash,
@@ -33,7 +33,7 @@ fn bench_poh_verify_ticks(bencher: &mut Bencher) {
     }
 
     bencher.iter(|| {
-        assert!(ticks.verify(&start_hash, &thread_pool));
+        assert!(ticks.verify(&start_hash, &thread_pool).status());
     })
 }
 
@@ -55,6 +55,6 @@ fn bench_poh_verify_transaction_entries(bencher: &mut Bencher) {
     }
 
     bencher.iter(|| {
-        assert!(ticks.verify(&start_hash, &thread_pool));
+        assert!(ticks.verify(&start_hash, &thread_pool).status());
     })
 }

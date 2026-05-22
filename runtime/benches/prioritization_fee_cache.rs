@@ -2,19 +2,19 @@
 extern crate test;
 
 use {
-    rand::{thread_rng, Rng},
+    rand::{Rng, rng},
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_message::Message,
     solana_pubkey::Pubkey,
     solana_runtime::{
         bank::Bank,
         bank_forks::BankForks,
-        genesis_utils::{create_genesis_config, GenesisConfigInfo},
+        genesis_utils::{GenesisConfigInfo, create_genesis_config},
         prioritization_fee_cache::*,
     },
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_system_interface::instruction as system_instruction,
-    solana_transaction::{sanitized::SanitizedTransaction, Transaction},
+    solana_transaction::{Transaction, sanitized::SanitizedTransaction},
     std::sync::Arc,
     test::Bencher,
 };
@@ -84,7 +84,7 @@ fn process_transactions_multiple_slots(banks: &[Arc<Bank>], num_slots: usize, nu
                 })
                 .collect();
 
-            let index = thread_rng().gen_range(0..num_slots);
+            let index = rng().random_range(0..num_slots);
 
             prioritization_fee_cache.update(&banks[index], transactions.iter());
         })

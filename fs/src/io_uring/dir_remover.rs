@@ -1,6 +1,6 @@
 use {
-    agave_io_uring::{Completion, Ring, RingOp},
-    io_uring::{opcode, squeue, types, IoUring},
+    agave_io_uring::{Completion, Ring, RingAccess as _, RingOp},
+    io_uring::{IoUring, opcode, squeue, types},
     slab::Slab,
     std::{
         collections::VecDeque,
@@ -84,7 +84,8 @@ impl RingDirRemover {
             // dir.set_finished_scanning(), we must close the dir fd now. Otherwise it gets
             // closed by the last UnlinkOp::complete() call.
             if dir.scanned_and_unlinked() {
-                if let Some(fd) = dir.fd.take() {
+                let fd = dir.fd.take();
+                if let Some(fd) = fd {
                     self.ring
                         .push(Op::Close(CloseOp::new(dir_key, fd.into_raw_fd())))?;
                 }
@@ -195,7 +196,7 @@ impl UnlinkOp {
             //
             // Safety: the entry doesn't hold any pointers
             if let Some(fd) = dir.fd.take() {
-                comp.push(Op::Close(CloseOp::new(self.dir_key, fd.into_raw_fd())));
+                comp.push(Op::Close(CloseOp::new(self.dir_key, fd.into_raw_fd())))?;
             }
         }
 

@@ -17,10 +17,11 @@ use {
         poh_controller::PohController, poh_service::PohService, record_channels::record_channels,
         transaction_recorder::TransactionRecorder,
     },
+    agave_votor_messages::migration::MigrationStatus,
     arc_swap::ArcSwap,
-    crossbeam_channel::{unbounded, Receiver, SendError, Sender, TrySendError},
+    crossbeam_channel::{Receiver, SendError, Sender, TrySendError, bounded, unbounded},
     log::*,
-    solana_clock::{BankId, Slot, NUM_CONSECUTIVE_LEADER_SLOTS},
+    solana_clock::{BankId, NUM_CONSECUTIVE_LEADER_SLOTS, Slot},
     solana_entry::{
         entry::Entry,
         poh::{Poh, PohEntry},
@@ -35,8 +36,8 @@ use {
     std::{
         cmp,
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex, RwLock,
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         time::Instant,
     },
@@ -188,8 +189,10 @@ pub struct PohRecorder {
     // Allocation to hold PohEntrys recorded into PoHStream.
     entries: Vec<PohEntry>,
 
-    // Alpenglow related migration things
-    pub is_alpenglow_enabled: bool,
+    /// When alpenglow is enabled there will be no ticks apart from a final one
+    /// to complete the block. This tick will not be verified, and we use this
+    /// flag to unset hashes_per_tick
+    alpenglow_enabled: bool,
 }
 
 impl PohRecorder {
@@ -272,14 +275,14 @@ impl PohRecorder {
                 last_reported_slot_for_pending_fork: Arc::default(),
                 is_exited,
                 entries: Vec::with_capacity(64),
-                is_alpenglow_enabled: false,
+                alpenglow_enabled: false,
             },
             working_bank_receiver,
         )
     }
 
     // synchronize PoH with a bank
-    pub(crate) fn reset(&mut self, reset_bank: Arc<Bank>, next_leader_slot: Option<(Slot, Slot)>) {
+    pub fn reset(&mut self, reset_bank: Arc<Bank>, next_leader_slot: Option<(Slot, Slot)>) {
         self.clear_bank(false);
         let tick_height = self.reset_poh(reset_bank, true);
 
@@ -301,8 +304,7 @@ impl PohRecorder {
     }
 
     // Returns the index of `transactions.first()` in the slot, if being tracked by WorkingBank
-    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-    pub(crate) fn record(
+    pub fn record(
         &mut self,
         bank_id: BankId,
         mixins: Vec<Hash>,
@@ -416,7 +418,7 @@ impl PohRecorder {
         }
     }
 
-    pub(crate) fn set_bank(&mut self, bank: BankWithScheduler) {
+    pub fn set_bank(&mut self, bank: BankWithScheduler) {
         assert!(self.working_bank.is_none());
         let working_bank = WorkingBank {
             min_tick_height: bank.tick_height(),
@@ -465,7 +467,7 @@ impl PohRecorder {
     fn clear_bank(&mut self, set_shared_state: bool) {
         if let Some(WorkingBank { bank, start, .. }) = self.working_bank.take() {
             let next_leader_slot = self.leader_schedule_cache.next_leader_slot(
-                bank.collector_id(),
+                bank.leader_id(),
                 bank.slot(),
                 &bank,
                 Some(&self.blockstore),
@@ -512,9 +514,14 @@ impl PohRecorder {
     #[must_use]
     fn reset_poh(&mut self, reset_bank: Arc<Bank>, reset_start_bank: bool) -> u64 {
         let blockhash = reset_bank.last_blockhash();
+        let hashes_per_tick = if self.alpenglow_enabled {
+            None
+        } else {
+            *reset_bank.hashes_per_tick()
+        };
         let poh_hash = {
             let mut poh = self.poh.lock().unwrap();
-            poh.reset(blockhash, *reset_bank.hashes_per_tick());
+            poh.reset(blockhash, hashes_per_tick);
             poh.hash
         };
         info!(
@@ -637,6 +644,7 @@ impl PohRecorder {
     pub fn leader_after_n_slots(&self, slots: u64) -> Option<Pubkey> {
         self.leader_schedule_cache
             .slot_leader_at(self.current_poh_slot() + slots, None)
+            .map(|leader| leader.id)
     }
 
     /// Return the leader and slot pair after `slots_in_the_future` slots.
@@ -647,7 +655,7 @@ impl PohRecorder {
         let target_slot = self.current_poh_slot().checked_add(slots_in_the_future)?;
         self.leader_schedule_cache
             .slot_leader_at(target_slot, None)
-            .map(|leader| (leader, target_slot))
+            .map(|leader| (leader.id, target_slot))
     }
 
     pub fn shared_leader_state(&self) -> SharedLeaderState {
@@ -804,7 +812,7 @@ impl PohRecorder {
 
             // If the leader for this slot is not me, then it's the previous
             // leader's last slot.
-            if leader_for_slot != *my_pubkey {
+            if leader_for_slot.id != *my_pubkey {
                 // Check if the last slot PoH reset onto was the previous leader's last slot.
                 return slot == self.start_slot();
             }
@@ -813,7 +821,7 @@ impl PohRecorder {
     }
 
     fn start_slot_was_mine(&self, my_pubkey: &Pubkey) -> bool {
-        self.start_bank.collector_id() == my_pubkey
+        self.start_bank.leader_id() == my_pubkey
     }
 
     // Active descendants of the last reset bank that are smaller than the
@@ -892,6 +900,52 @@ impl PohRecorder {
     pub fn clear_bank_for_test(&mut self) {
         self.clear_bank(true);
     }
+
+    pub fn tick_alpenglow(&mut self, slot_max_tick_height: u64) {
+        let (poh_entry, tick_lock_contention_us) = measure_us!({
+            let mut poh_l = self.poh.lock().unwrap();
+            poh_l.tick()
+        });
+        self.metrics.tick_lock_contention_us += tick_lock_contention_us;
+
+        if let Some(poh_entry) = poh_entry {
+            self.shared_leader_state
+                .0
+                .load()
+                .tick_height
+                .store(slot_max_tick_height, Ordering::Release);
+
+            // Should be empty in most cases, but reset just to be safe
+            self.tick_cache = vec![];
+            self.tick_cache.push((
+                Entry {
+                    num_hashes: poh_entry.num_hashes,
+                    hash: poh_entry.hash,
+                    transactions: vec![],
+                },
+                self.shared_leader_state
+                    .0
+                    .load()
+                    .tick_height
+                    .load(Ordering::Acquire),
+            ));
+
+            let (_flush_res, flush_cache_and_tick_us) = measure_us!(self.flush_cache(true));
+            self.metrics.flush_cache_tick_us += flush_cache_and_tick_us;
+        }
+    }
+
+    pub fn enable_alpenglow(&mut self) {
+        info!("Enabling Alpenglow, migrating poh to low power mode");
+        self.alpenglow_enabled = true;
+        self.tick_cache = vec![];
+        {
+            let mut poh = self.poh.lock().unwrap();
+            let hashes_per_tick = None;
+            let current_hash = poh.hash;
+            poh.reset(current_hash, hashes_per_tick);
+        }
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -932,6 +986,7 @@ fn do_create_test_recorder(
     let transaction_recorder = TransactionRecorder::new(record_sender);
     let poh_recorder = Arc::new(RwLock::new(poh_recorder));
     let (mut poh_controller, poh_service_message_receiver) = PohController::new();
+    let (record_receiver_sender, _record_receiver_receiver) = bounded(1);
     let poh_service = PohService::new(
         poh_recorder.clone(),
         &poh_config,
@@ -941,6 +996,8 @@ fn do_create_test_recorder(
         crate::poh_service::DEFAULT_HASHES_PER_BATCH,
         record_receiver,
         poh_service_message_receiver,
+        Arc::new(MigrationStatus::default()),
+        record_receiver_sender,
     );
 
     poh_controller
@@ -1060,14 +1117,16 @@ mod tests {
         super::*,
         crossbeam_channel::bounded,
         solana_clock::DEFAULT_TICKS_PER_SLOT,
+        solana_leader_schedule::SlotLeader,
         solana_ledger::{
             blockstore::Blockstore,
             blockstore_meta::SlotMeta,
-            genesis_utils::{create_genesis_config, GenesisConfigInfo},
+            genesis_utils::{GenesisConfigInfo, create_genesis_config},
             get_tmp_ledger_path_auto_delete,
         },
         solana_perf::test_tx::test_tx,
         solana_sha256_hasher::hash,
+        solana_signer::Signer,
     };
 
     #[test]
@@ -1391,9 +1450,11 @@ mod tests {
         assert_eq!(poh_recorder.tick_height(), min_tick_height);
         let tx = test_tx();
         let h1 = hash(b"hello world!");
-        assert!(poh_recorder
-            .record(bank1.slot(), vec![h1], vec![vec![tx.into()]])
-            .is_ok());
+        assert!(
+            poh_recorder
+                .record(bank1.slot(), vec![h1], vec![vec![tx.into()]])
+                .is_ok()
+        );
         assert_eq!(poh_recorder.tick_cache.len(), 0);
 
         //tick in the cache + entry
@@ -1433,9 +1494,11 @@ mod tests {
         }
         let tx = test_tx();
         let h1 = hash(b"hello world!");
-        assert!(poh_recorder
-            .record(bank.slot(), vec![h1], vec![vec![tx.into()]])
-            .is_err());
+        assert!(
+            poh_recorder
+                .record(bank.slot(), vec![h1], vec![vec![tx.into()]])
+                .is_err()
+        );
         for _ in 0..num_ticks_to_max {
             let (_bank, (entry, _tick_height)) = entry_receiver.recv().unwrap();
             assert!(entry.is_tick());
@@ -1663,13 +1726,15 @@ mod tests {
 
         let tx = test_tx();
         let h1 = hash(b"hello world!");
-        assert!(poh_recorder
-            .record(bank.slot(), vec![h1], vec![vec![tx.into()]])
-            .is_err());
+        assert!(
+            poh_recorder
+                .record(bank.slot(), vec![h1], vec![vec![tx.into()]])
+                .is_err()
+        );
         assert!(poh_recorder.working_bank.is_none());
 
         // Even thought we ticked much further than working_bank.max_tick_height,
-        // the `start_slot` is still the slot of the last workign bank set by
+        // the `start_slot` is still the slot of the last working bank set by
         // the earlier call to `poh_recorder.set_bank()`
         assert_eq!(poh_recorder.start_slot(), bank.slot());
     }
@@ -1723,6 +1788,7 @@ mod tests {
         let GenesisConfigInfo {
             genesis_config,
             validator_pubkey,
+            voting_keypair,
             ..
         } = create_genesis_config(2);
 
@@ -1731,34 +1797,23 @@ mod tests {
         let prev_hash = bank.last_blockhash();
 
         // Setup leader schedule.
-        let leader_a_pubkey = validator_pubkey;
-        let leader_b_pubkey = Pubkey::new_unique();
-        let leader_c_pubkey = Pubkey::new_unique();
-        let leader_d_pubkey = Pubkey::new_unique();
+        let leader_a = SlotLeader {
+            id: validator_pubkey,
+            vote_address: voting_keypair.pubkey(),
+        };
+        let leader_b = SlotLeader::new_unique();
+        let leader_c = SlotLeader::new_unique();
+        let leader_d = SlotLeader::new_unique();
         let consecutive_leader_slots = NUM_CONSECUTIVE_LEADER_SLOTS as usize;
         let mut slot_leaders = Vec::with_capacity(consecutive_leader_slots * 3);
-        slot_leaders.extend(std::iter::repeat_n(
-            leader_a_pubkey,
-            consecutive_leader_slots,
-        ));
-        slot_leaders.extend(std::iter::repeat_n(
-            leader_b_pubkey,
-            consecutive_leader_slots,
-        ));
-        slot_leaders.extend(std::iter::repeat_n(
-            leader_c_pubkey,
-            consecutive_leader_slots,
-        ));
-        slot_leaders.extend(std::iter::repeat_n(
-            leader_d_pubkey,
-            consecutive_leader_slots,
-        ));
+        slot_leaders.extend(std::iter::repeat_n(leader_a, consecutive_leader_slots));
+        slot_leaders.extend(std::iter::repeat_n(leader_b, consecutive_leader_slots));
+        slot_leaders.extend(std::iter::repeat_n(leader_c, consecutive_leader_slots));
+        slot_leaders.extend(std::iter::repeat_n(leader_d, consecutive_leader_slots));
         let mut leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
-        let fixed_schedule = solana_ledger::leader_schedule::FixedSchedule {
-            leader_schedule: Arc::new(Box::new(
-                solana_ledger::leader_schedule::IdentityKeyedLeaderSchedule::new_from_schedule(
-                    slot_leaders,
-                ),
+        let fixed_schedule = solana_leader_schedule::FixedSchedule {
+            leader_schedule: Arc::new(solana_leader_schedule::LeaderSchedule::new_from_schedule(
+                slot_leaders,
             )),
         };
         leader_schedule_cache.set_fixed_leader_schedule(Some(fixed_schedule));
@@ -1808,7 +1863,7 @@ mod tests {
         // True, because from Leader A's perspective, the previous slot was also
         // its own slot, and validators don't give grace periods if previous
         // slot was also their own.
-        assert!(poh_recorder.reached_leader_tick(&leader_a_pubkey, leader_a_start_tick));
+        assert!(poh_recorder.reached_leader_tick(&leader_a.id, leader_a_start_tick));
 
         // Tick through grace ticks.
         for _ in 0..grace_ticks {
@@ -1816,13 +1871,13 @@ mod tests {
         }
 
         // True, because we have ticked through all the grace ticks.
-        assert!(poh_recorder.reached_leader_tick(&leader_a_pubkey, leader_a_start_tick));
+        assert!(poh_recorder.reached_leader_tick(&leader_a.id, leader_a_start_tick));
 
         // Reset PoH on Leader A's first slot 0, ticking towards Leader B's leader slots.
         poh_recorder.reset(bank.clone(), Some((leader_b_start_slot, leader_b_end_slot)));
 
         // False, because Leader B hasn't ticked to its starting slot yet.
-        assert!(!poh_recorder.reached_leader_tick(&leader_b_pubkey, leader_b_start_tick));
+        assert!(!poh_recorder.reached_leader_tick(&leader_b.id, leader_b_start_tick));
 
         // Tick through Leader A's remaining slots.
         for _ in poh_recorder.tick_height()..ticks_in_leader_slot_set {
@@ -1831,18 +1886,18 @@ mod tests {
 
         // False, because the PoH was reset on slot 0, which is a block produced
         // by previous leader A, so a grace period must be given.
-        assert!(!poh_recorder.reached_leader_tick(&leader_b_pubkey, leader_b_start_tick));
+        assert!(!poh_recorder.reached_leader_tick(&leader_b.id, leader_b_start_tick));
 
         // Reset onto Leader A's last slot.
         for _ in leader_a_start_slot + 1..leader_b_start_slot {
             let child_slot = bank.slot() + 1;
-            bank = Arc::new(Bank::new_from_parent(bank, &leader_a_pubkey, child_slot));
+            bank = Arc::new(Bank::new_from_parent(bank, &leader_a.id, child_slot));
         }
         poh_recorder.reset(bank.clone(), Some((leader_b_start_slot, leader_b_end_slot)));
 
         // True, because the PoH was reset the last slot produced by the
         // previous leader, so we can run immediately.
-        assert!(poh_recorder.reached_leader_tick(&leader_b_pubkey, leader_b_start_tick));
+        assert!(poh_recorder.reached_leader_tick(&leader_b.id, leader_b_start_tick));
 
         // Simulate skipping Leader B's first slot.
         poh_recorder.reset(
@@ -1854,11 +1909,11 @@ mod tests {
         }
 
         // True, because we're building off the previous leader A's last block.
-        assert!(poh_recorder.reached_leader_tick(&leader_b_pubkey, leader_b_start_tick));
+        assert!(poh_recorder.reached_leader_tick(&leader_b.id, leader_b_start_tick));
 
         // Simulate generating Leader B's second slot.
         let child_slot = bank.slot() + 1;
-        bank = Arc::new(Bank::new_from_parent(bank, &leader_b_pubkey, child_slot));
+        bank = Arc::new(Bank::new_from_parent(bank, &leader_b.id, child_slot));
 
         // Reset PoH targeting Leader D's slots.
         poh_recorder.reset(bank, Some((leader_d_start_slot, leader_d_end_slot)));
@@ -1875,7 +1930,7 @@ mod tests {
 
         // True, because Leader D is not building on any of Leader C's slots.
         // The PoH was last reset onto Leader B's second slot.
-        assert!(poh_recorder.reached_leader_tick(&leader_d_pubkey, leader_d_start_tick));
+        assert!(poh_recorder.reached_leader_tick(&leader_d.id, leader_d_start_tick));
 
         // Add some active (partially received) blocks to the active fork.
         let active_descendants = vec![NUM_CONSECUTIVE_LEADER_SLOTS];
@@ -1883,14 +1938,14 @@ mod tests {
 
         // True, because Leader D observes pending blocks on the active fork,
         // but the config to delay for these is not set.
-        assert!(poh_recorder.reached_leader_tick(&leader_d_pubkey, leader_d_start_tick));
+        assert!(poh_recorder.reached_leader_tick(&leader_d.id, leader_d_start_tick));
 
         // Flip the config to delay for pending blocks.
         poh_recorder.delay_leader_block_for_pending_fork = true;
 
         // False, because Leader D observes pending blocks on the active fork,
         // and the config to delay for these is set.
-        assert!(!poh_recorder.reached_leader_tick(&leader_d_pubkey, leader_d_start_tick));
+        assert!(!poh_recorder.reached_leader_tick(&leader_d.id, leader_d_start_tick));
     }
 
     #[test]
@@ -1994,7 +2049,7 @@ mod tests {
         );
         // Check that if prev slot was mine, grace ticks are ignored
         assert_eq!(
-            poh_recorder.reached_leader_slot(bank1.collector_id()),
+            poh_recorder.reached_leader_slot(bank1.leader_id()),
             PohLeaderStatus::Reached {
                 poh_slot: 3,
                 parent_slot: 1

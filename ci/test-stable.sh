@@ -27,12 +27,12 @@ cargo_build_sbf_sanity() {
   for program in "${rust_programs[@]}"
   do
     pushd "$program"
-    $cargo_build_sbf --arch "$1"
+    $cargo_build_sbf --arch "$1" --tools-version v1.54
     popd
   done
   popd
 
-  cargo test --features=sbf_rust --test programs test_program_sbf_sanity
+  SBF_OUT_DIR=target/deploy cargo test --features=sbf_rust --test programs test_program_sbf_sanity
   popd
 }
 
@@ -93,6 +93,11 @@ test-stable-sbf)
   _ make -C programs/sbf clean-all test-v2
   _ make -C programs/sbf clean-all
   _ cargo_build_sbf_sanity "v2"
+
+  # SBPFv3 program tests
+  _ make -C programs/sbf clean-all test-v3
+  _ make -C programs/sbf clean-all
+  _ cargo_build_sbf_sanity "v3"
 
   exit 0
   ;;

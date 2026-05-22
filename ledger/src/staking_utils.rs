@@ -1,14 +1,16 @@
 #[cfg(test)]
 pub(crate) mod tests {
     use {
+        agave_votor_messages::consensus_message::BLS_KEYPAIR_DERIVE_SEED,
         rand::Rng,
-        solana_account::{AccountSharedData, WritableAccount},
+        solana_account::AccountSharedData,
+        solana_bls_signatures::keypair::Keypair as BLSKeypair,
         solana_clock::Clock,
         solana_instruction::Instruction,
         solana_keypair::Keypair,
         solana_pubkey::Pubkey,
         solana_runtime::bank::Bank,
-        solana_signer::{signers::Signers, Signer},
+        solana_signer::{Signer, signers::Signers},
         solana_stake_interface::{
             program as stake_program,
             stake_flags::StakeFlags,
@@ -18,8 +20,12 @@ pub(crate) mod tests {
         solana_vote::vote_account::{VoteAccount, VoteAccounts},
         solana_vote_program::{
             vote_instruction,
-            vote_state::{VoteInit, VoteStateV4, VoteStateVersions},
+            vote_state::{
+                VoteAuthorize, VoteInit, VoteStateV4, VoteStateVersions, VoterWithBLSArgs,
+                create_bls_proof_of_possession,
+            },
         },
+        std::sync::Arc,
     };
 
     pub(crate) fn setup_vote_and_stake_accounts(
@@ -60,6 +66,27 @@ pub(crate) mod tests {
             ),
         );
 
+        // Add BLS pubkey to the vote account using the authorize instruction with BLS.
+        // This sets the authorized voter to the same pubkey but adds the BLS key.
+        let bls_keypair =
+            BLSKeypair::derive_from_signer(vote_account, BLS_KEYPAIR_DERIVE_SEED).unwrap();
+        let (bls_pubkey, bls_proof_of_possession) =
+            create_bls_proof_of_possession(&vote_pubkey, &bls_keypair);
+
+        process_instructions(
+            bank,
+            &[from_account, vote_account],
+            &[vote_instruction::authorize(
+                &vote_pubkey,
+                &vote_pubkey, // currently authorized voter
+                &vote_pubkey, // new authorized voter (same, just adding BLS)
+                VoteAuthorize::VoterWithBLS(VoterWithBLSArgs {
+                    bls_pubkey,
+                    bls_proof_of_possession,
+                }),
+            )],
+        );
+
         let stake_account_keypair = Keypair::new();
         let stake_account_pubkey = stake_account_keypair.pubkey();
 
@@ -79,9 +106,9 @@ pub(crate) mod tests {
             StakeFlags::default(),
         );
 
-        let account = AccountSharedData::create(
+        let account = AccountSharedData::create_from_existing_shared_data(
             1,
-            bincode::serialize(&stake_account).unwrap(),
+            Arc::new(bincode::serialize(&stake_account).unwrap()),
             stake_program::id(),
             false,
             u64::MAX,
@@ -100,7 +127,7 @@ pub(crate) mod tests {
         for i in 0..3 {
             stakes.push((
                 i,
-                VoteStateV4::new(
+                VoteStateV4::new_with_defaults(
                     &vote_pubkey1,
                     &VoteInit {
                         node_pubkey: node1,
@@ -117,7 +144,7 @@ pub(crate) mod tests {
 
         stakes.push((
             5,
-            VoteStateV4::new(
+            VoteStateV4::new_with_defaults(
                 &vote_pubkey2,
                 &VoteInit {
                     node_pubkey: node2,
@@ -126,10 +153,10 @@ pub(crate) mod tests {
                 &Clock::default(),
             ),
         ));
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let vote_accounts = stakes.into_iter().map(|(stake, vote_state)| {
             let account = AccountSharedData::new_data(
-                rng.gen(), // lamports
+                rng.random(), // lamports
                 &VoteStateVersions::new_v4(vote_state),
                 &solana_vote_program::id(), // owner
             )

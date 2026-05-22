@@ -12,8 +12,6 @@
 
 # shellcheck disable=SC2034
 AGAVE_BINS_DEV=(
-  cargo-build-sbf
-  cargo-test-sbf
   solana-test-validator
 )
 
@@ -33,6 +31,7 @@ AGAVE_BINS_VAL_OP=(
 
 AGAVE_BINS_DCOU=(
   agave-ledger-tool
+  solana-bench-tps
 )
 
 # These bins are deprecated and will be removed in a future release
@@ -49,8 +48,5 @@ DCOU_TAINTED_PACKAGES=(
   solana-accounts-cluster-bench
   solana-banking-bench
   solana-bench-tps
-  solana-dos
   solana-local-cluster
-  solana-transaction-dos
-  solana-vortexor
 )

@@ -1,32 +1,32 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
-    clap::{crate_description, crate_name, value_t, values_t, values_t_or_exit, App, Arg},
+    clap::{App, Arg, crate_description, crate_name, value_t, values_t, values_t_or_exit},
     log::*,
-    rand::{thread_rng, Rng},
+    rand::{Rng, rng},
     rayon::prelude::*,
     solana_clap_utils::{
         hidden_unless_forced, input_parsers::pubkey_of, input_validators::is_url_or_moniker,
     },
-    solana_cli_config::{ConfigInput, CONFIG_FILE},
+    solana_cli_config::{CONFIG_FILE, ConfigInput},
     solana_client::{
         rpc_client::SerializableTransaction, rpc_config::RpcBlockConfig,
         rpc_request::MAX_GET_CONFIRMED_BLOCKS_RANGE, transaction_executor::TransactionExecutor,
     },
     solana_clock::Slot,
     solana_commitment_config::CommitmentConfig,
-    solana_gossip::gossip_service::discover,
+    solana_gossip::gossip_service::discover_peers,
     solana_hash::Hash,
     solana_instruction::{AccountMeta, Instruction},
-    solana_keypair::{read_keypair_file, Keypair},
+    solana_keypair::{Keypair, read_keypair_file},
     solana_measure::measure::Measure,
     solana_message::Message,
+    solana_net_utils::SocketAddrSpace,
     solana_program_pack::Pack,
     solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::request::TokenAccountsFilter,
     solana_signature::Signature,
     solana_signer::Signer,
-    solana_streamer::socket::SocketAddrSpace,
     solana_system_interface::{instruction as system_instruction, program as system_program},
     solana_transaction::Transaction,
     solana_transaction_status::UiTransactionEncoding,
@@ -39,10 +39,10 @@ use {
         process::exit,
         str::FromStr,
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Barrier, RwLock,
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
-        thread::{sleep, Builder, JoinHandle},
+        thread::{Builder, JoinHandle, sleep},
         time::{Duration, Instant},
     },
 };
@@ -163,7 +163,7 @@ impl TransactionSignatureTracker {
         if signatures.is_empty() {
             None
         } else {
-            let random_index = thread_rng().gen_range(0..signatures.len());
+            let random_index = rng().random_range(0..signatures.len());
             let random_signature = signatures.get(random_index);
             random_signature.cloned()
         }
@@ -195,7 +195,7 @@ fn make_create_message(
     let space = if mint.is_some() {
         Account::get_packed_len() as u64
     } else {
-        maybe_space.unwrap_or_else(|| thread_rng().gen_range(0..1000))
+        maybe_space.unwrap_or_else(|| rng().random_range(0..1000))
     };
 
     let instructions: Vec<_> = (0..num_instructions)
@@ -372,7 +372,7 @@ fn process_get_multiple_accounts(
             Ok(accounts) => {
                 rpc_time.stop();
                 for account in accounts.into_iter().flatten() {
-                    if thread_rng().gen_ratio(1, 10_000) {
+                    if rng().random_ratio(1, 10_000) {
                         info!(
                             "account: lamports {:?} size: {} owner: {:?}",
                             account.lamports,
@@ -466,19 +466,11 @@ fn run_rpc_bench_loop(
             "t({}) rpc({:?}) iters: {} success: {} errors: {}",
             thread, rpc_bench, iters, stats.success, stats.errors
         );
-        if stats.success > 0 {
-            info!(
-                " t({}) rpc({:?} average success_time: {} us",
-                thread,
-                rpc_bench,
-                stats.total_success_time_us / stats.success
-            );
+        if let Some(avg_success) = stats.total_success_time_us.checked_div(stats.success) {
+            info!(" t({thread}) rpc({rpc_bench:?} average success_time: {avg_success} us",);
         }
-        if stats.errors > 0 {
-            info!(
-                " rpc average average errors time: {} us",
-                stats.total_errors_time_us / stats.errors
-            );
+        if let Some(avg_errors) = stats.total_errors_time_us.checked_div(stats.errors) {
+            info!(" rpc average average errors time: {avg_errors} us");
         }
         *last_print = Instant::now();
         *stats = RpcBenchStats::default();
@@ -497,7 +489,7 @@ fn run_rpc_bench_loop(
                     info!("get_account_info: No accounts have yet been created; skipping");
                     continue;
                 }
-                let seed = thread_rng().gen_range(seed_range).to_string();
+                let seed = rng().random_range(seed_range).to_string();
                 let account_pubkey =
                     Pubkey::create_with_seed(base_keypair_pubkey, &seed, program_id).unwrap();
                 let mut rpc_time = Measure::start("rpc-get-account-info");
@@ -643,7 +635,7 @@ fn run_rpc_bench_loop(
                         rpc_time.stop();
                         stats.success += 1;
                         stats.total_success_time_us += rpc_time.as_us();
-                        if thread_rng().gen_ratio(1, 100) {
+                        if rng().random_ratio(1, 100) {
                             info!("accounts: {} first: {:?}", accounts.len(), accounts.first());
                         }
                     }
@@ -1361,15 +1353,15 @@ fn main() {
 
         let rpc_addr = if !skip_gossip {
             info!("Finding cluster entry: {entrypoint_addr:?}");
-            let (gossip_nodes, _validators) = discover(
-                None, // keypair
-                Some(&entrypoint_addr),
-                None,                    // num_nodes
-                Duration::from_secs(60), // timeout
-                None,                    // find_nodes_by_pubkey
-                Some(&entrypoint_addr),  // find_node_by_gossip_addr
-                None,                    // my_gossip_addr
-                shred_version.unwrap(),  // my_shred_version
+            let (gossip_nodes, _validators) = discover_peers(
+                None,
+                &vec![entrypoint_addr],
+                None,
+                Duration::from_secs(60),
+                None,
+                &[entrypoint_addr],
+                None,
+                shred_version.unwrap(),
                 SocketAddrSpace::Unspecified,
             )
             .unwrap_or_else(|err| {

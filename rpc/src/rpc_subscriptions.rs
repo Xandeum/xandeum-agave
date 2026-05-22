@@ -10,8 +10,8 @@ use {
             AccountSubscriptionParams, BlockSubscriptionKind, BlockSubscriptionParams, LogsSubscriptionKind, LogsSubscriptionParams, ProgramSubscriptionParams, SignatureSubscriptionParams, SignatureSubscriptionType, SubscriptionControl, SubscriptionId, SubscriptionInfo, SubscriptionParams, SubscriptionsTracker
         },
     }, crossbeam_channel::{Receiver, RecvTimeoutError, SendError, Sender}, itertools::Either, rayon::prelude::*, serde::Serialize, solana_account::{AccountSharedData, ReadableAccount}, solana_account_decoder::{
-        UiAccount, UiAccountEncoding, encode_ui_account, parse_token::is_known_spl_token_id
-    }, solana_client::rpc_response::RpcApiVersion, solana_clock::Slot, solana_commitment_config::CommitmentConfig, solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path}, solana_measure::measure::Measure, solana_pubkey::Pubkey, solana_rpc_client_api::response::{
+        UiAccount, UiAccountEncoding, encode_ui_account, parse_token::is_known_spl_token_id,
+    }, solana_client::rpc_response::RpcApiVersion, solana_clock::Slot, solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path}, solana_measure::measure::Measure, solana_pubkey::Pubkey, solana_rpc_client_api::response::{
         ProcessedSignatureResult, ReceivedSignatureResult, Response as RpcResponse, RpcBlockUpdate,
         RpcBlockUpdateError, RpcKeyedAccount, RpcLogsResponse, RpcResponseContext,
         RpcSignatureResult, RpcVote, SlotInfo, SlotUpdate,
@@ -402,7 +402,7 @@ fn filter_program_results(
     params: &ProgramSubscriptionParams,
     last_notified_slot: Slot,
     bank: Arc<Bank>,
-) -> (impl Iterator<Item = RpcKeyedAccount>, Slot) {
+) -> (impl Iterator<Item = RpcKeyedAccount> + use<>, Slot) {
     let accounts_is_empty = accounts.is_empty();
     let encoding = params.encoding;
     let filters = params.filters.clone();
@@ -432,7 +432,7 @@ fn filter_logs_results(
     _params: &LogsSubscriptionParams,
     last_notified_slot: Slot,
     _bank: Arc<Bank>,
-) -> (impl Iterator<Item = RpcLogsResponse>, Slot) {
+) -> (impl Iterator<Item = RpcLogsResponse> + use<>, Slot) {
     let responses = logs.into_iter().flatten().map(|log| RpcLogsResponse {
         signature: log.signature.to_string(),
         err: log.result.err().map(Into::into),
@@ -1036,7 +1036,7 @@ impl RpcSubscriptions {
 							// Notify subscribers listening for logs (e.g., logsSubscribe)
 							if let Some(sub) = subscriptions.node_progress_watchers().get(&SubscriptionParams::Logs(LogsSubscriptionParams {
 								kind: LogsSubscriptionKind::All, // Adjust based on your subscription logic
-								commitment: CommitmentConfig::processed(), // Adjust as needed
+								commitment: solana_commitment_config::CommitmentConfig::processed(), // Adjust as needed
 							})) {
 								debug!("Logs notify: {:?}", logs);
 								inc_new_counter_info!("rpc-subscription-notify-logs", 1);
@@ -1202,7 +1202,7 @@ impl RpcSubscriptions {
                                             RpcResponse::from(RpcNotificationResponse {
                                                 context: RpcNotificationContext { slot: s },
                                                 value: RpcBlockUpdate {
-                                                    slot,
+                                                    slot: s,
                                                     block: None,
                                                     err: Some(err),
                                                 },
@@ -1393,7 +1393,7 @@ pub(crate) mod tests {
         },
         solana_runtime::{
             commitment::BlockCommitment,
-            genesis_utils::{create_genesis_config, GenesisConfigInfo},
+            genesis_utils::{GenesisConfigInfo, create_genesis_config},
             prioritization_fee_cache::PrioritizationFeeCache,
         },
         solana_signer::Signer,
@@ -2148,6 +2148,8 @@ pub(crate) mod tests {
         let mut highest_confirmed_slot: Slot = 0;
         let mut highest_root_slot: Slot = 0;
         let mut last_notified_confirmed_slot: Slot = 0;
+        let prioritization_fee_cache_inner: Option<Arc<PrioritizationFeeCache>> = None;
+        let prioritization_fee_cache = prioritization_fee_cache_inner.as_deref();
         // Optimistically notifying slot 3 without notifying slot 1 and 2, bank3 is unfrozen, we expect
         // to see transaction for alice and bob to be notified in order.
         OptimisticallyConfirmedBankTracker::process_notification(
@@ -2163,7 +2165,7 @@ pub(crate) mod tests {
             &mut highest_confirmed_slot,
             &mut highest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            prioritization_fee_cache,
             &None, // no dependency tracker
         );
 
@@ -2220,7 +2222,7 @@ pub(crate) mod tests {
             &mut highest_confirmed_slot,
             &mut highest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            prioritization_fee_cache,
             &None, // no dependency tracker
         );
 
@@ -2236,8 +2238,8 @@ pub(crate) mod tests {
     #[test]
     #[serial]
     #[should_panic]
-    fn test_check_program_subscribe_for_missing_optimistically_confirmed_slot_with_no_banks_no_notifications(
-    ) {
+    fn test_check_program_subscribe_for_missing_optimistically_confirmed_slot_with_no_banks_no_notifications()
+     {
         // Testing if we can get the pubsub notification if a slot does not
         // receive OptimisticallyConfirmed but its descendant slot get the confirmed
         // notification with a bank in the BankForks. We are not expecting to receive any notifications -- should panic.
@@ -2328,6 +2330,8 @@ pub(crate) mod tests {
         let mut highest_confirmed_slot: Slot = 0;
         let mut highest_root_slot: Slot = 0;
         let mut last_notified_confirmed_slot: Slot = 0;
+        let prioritization_fee_cache_inner: Option<Arc<PrioritizationFeeCache>> = None;
+        let prioritization_fee_cache = prioritization_fee_cache_inner.as_deref();
         // Optimistically notifying slot 3 without notifying slot 1 and 2, bank3 is not in the bankforks, we do not
         // expect to see any RPC notifications.
         OptimisticallyConfirmedBankTracker::process_notification(
@@ -2343,7 +2347,7 @@ pub(crate) mod tests {
             &mut highest_confirmed_slot,
             &mut highest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            prioritization_fee_cache,
             &None, // no dependency tracker
         );
 
@@ -2407,6 +2411,7 @@ pub(crate) mod tests {
         let exit = Arc::new(AtomicBool::new(false));
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
+
         let mut pending_optimistically_confirmed_banks = HashSet::new();
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
         let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
@@ -2446,6 +2451,8 @@ pub(crate) mod tests {
         let mut highest_confirmed_slot: Slot = 0;
         let mut highest_root_slot: Slot = 0;
         let mut last_notified_confirmed_slot: Slot = 0;
+        let prioritization_fee_cache_inner: Option<Arc<PrioritizationFeeCache>> = None;
+        let prioritization_fee_cache = prioritization_fee_cache_inner.as_deref();
         // Optimistically notifying slot 3 without notifying slot 1 and 2, bank3 is not in the bankforks, we expect
         // to see transaction for alice and bob to be notified only when bank3 is added to the fork and
         // frozen. The notifications should be in the increasing order of the slot.
@@ -2462,7 +2469,7 @@ pub(crate) mod tests {
             &mut highest_confirmed_slot,
             &mut highest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            prioritization_fee_cache,
             &None, // no dependency tracker
         );
 
@@ -2521,7 +2528,7 @@ pub(crate) mod tests {
             &mut highest_confirmed_slot,
             &mut highest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            prioritization_fee_cache,
             &None, // no dependency tracker
         );
 
@@ -2678,12 +2685,16 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        assert!(subscriptions
-            .control
-            .signature_subscribed(&unprocessed_tx.signatures[0]));
-        assert!(subscriptions
-            .control
-            .signature_subscribed(&processed_tx.signatures[0]));
+        assert!(
+            subscriptions
+                .control
+                .signature_subscribed(&unprocessed_tx.signatures[0])
+        );
+        assert!(
+            subscriptions
+                .control
+                .signature_subscribed(&processed_tx.signatures[0])
+        );
 
         let mut commitment_slots = CommitmentSlots::default();
         let received_slot = 1;
@@ -2763,17 +2774,23 @@ pub(crate) mod tests {
 
         // Subscription should be automatically removed after notification
 
-        assert!(!subscriptions
-            .control
-            .signature_subscribed(&processed_tx.signatures[0]));
-        assert!(!subscriptions
-            .control
-            .signature_subscribed(&past_bank_tx.signatures[0]));
+        assert!(
+            !subscriptions
+                .control
+                .signature_subscribed(&processed_tx.signatures[0])
+        );
+        assert!(
+            !subscriptions
+                .control
+                .signature_subscribed(&past_bank_tx.signatures[0])
+        );
 
         // Unprocessed signature subscription should not be removed
-        assert!(subscriptions
-            .control
-            .signature_subscribed(&unprocessed_tx.signatures[0]));
+        assert!(
+            subscriptions
+                .control
+                .signature_subscribed(&unprocessed_tx.signatures[0])
+        );
     }
 
     #[test]
@@ -2942,6 +2959,9 @@ pub(crate) mod tests {
         let mut highest_confirmed_slot: Slot = 0;
         let mut highest_root_slot: Slot = 0;
         let mut last_notified_confirmed_slot: Slot = 0;
+        let prioritization_fee_cache_inner: Option<Arc<PrioritizationFeeCache>> = None;
+        let prioritization_fee_cache = prioritization_fee_cache_inner.as_deref();
+
         OptimisticallyConfirmedBankTracker::process_notification(
             (BankNotification::OptimisticallyConfirmed(2), None),
             &bank_forks,
@@ -2952,7 +2972,7 @@ pub(crate) mod tests {
             &mut highest_confirmed_slot,
             &mut highest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            prioritization_fee_cache,
             &None, // no dependency tracker
         );
 
@@ -2971,7 +2991,7 @@ pub(crate) mod tests {
             &mut highest_confirmed_slot,
             &mut highest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            prioritization_fee_cache,
             &None, // no dependency tracker
         );
 
@@ -3030,7 +3050,7 @@ pub(crate) mod tests {
             &mut highest_confirmed_slot,
             &mut highest_root_slot,
             &None,
-            &PrioritizationFeeCache::default(),
+            prioritization_fee_cache,
             &None, // no dependency tracker
         );
         let response = receiver1.recv();
@@ -3139,13 +3159,15 @@ pub(crate) mod tests {
             &system_program::id(),
         );
 
-        assert!(bank_forks
-            .read()
-            .unwrap()
-            .get(0)
-            .unwrap()
-            .process_transaction_with_metadata(tx.clone())
-            .is_ok());
+        assert!(
+            bank_forks
+                .read()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .process_transaction_with_metadata(tx.clone())
+                .is_ok()
+        );
 
         subscriptions.notify_subscribers(CommitmentSlots::new_from_slot(0));
 

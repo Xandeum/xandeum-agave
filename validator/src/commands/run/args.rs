@@ -1,11 +1,11 @@
 use {
     crate::{
         bootstrap::RpcBootstrapConfig,
-        cli::{hash_validator, port_range_validator, port_validator, DefaultArgs},
+        cli::{DefaultArgs, hash_validator, port_range_validator, port_validator},
         commands::{FromClapArgMatches, Result},
     },
-    agave_snapshots::{SnapshotVersion, SUPPORTED_ARCHIVE_COMPRESSION},
-    clap::{values_t, App, Arg, ArgMatches},
+    agave_snapshots::{SUPPORTED_ARCHIVE_COMPRESSION, SnapshotVersion},
+    clap::{App, Arg, ArgMatches, values_t},
     solana_accounts_db::utils::create_and_canonicalize_directory,
     solana_clap_utils::{
         hidden_unless_forced,
@@ -24,36 +24,17 @@ use {
     },
     solana_keypair::Keypair,
     solana_ledger::{blockstore_options::BlockstoreOptions, use_snapshot_archives_at_startup},
+    solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
     solana_rpc::{rpc::JsonRpcConfig, rpc_pubsub_service::PubSubConfig},
     solana_send_transaction_service::send_transaction_service::Config as SendTransactionServiceConfig,
     solana_signer::Signer,
-    solana_streamer::socket::SocketAddrSpace,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{collections::HashSet, net::SocketAddr, path::PathBuf, str::FromStr},
 };
 
 const EXCLUDE_KEY: &str = "account-index-exclude-key";
 const INCLUDE_KEY: &str = "account-index-include-key";
-
-// Declared out of line to allow use of #[rustfmt::skip]
-#[rustfmt::skip]
-const WEN_RESTART_HELP: &str =
-    "Only used during coordinated cluster restarts.\n\n\
-     Need to also specify the leader's pubkey in --wen-restart-leader.\n\n\
-     When specified, the validator will enter Wen Restart mode which pauses normal activity. \
-     Validators in this mode will gossip their last vote to reach consensus on a safe restart \
-     slot and repair all blocks on the selected fork. The safe slot will be a descendant of the \
-     latest optimistically confirmed slot to ensure we do not roll back any optimistically \
-     confirmed slots.\n\n\
-     The progress in this mode will be saved in the file location provided. If consensus is \
-     reached, the validator will automatically exit with 200 status code. Then the operators are \
-     expected to restart the validator with --wait_for_supermajority and other arguments \
-     (including new shred_version, supermajority slot, and bankhash) given in the error log \
-     before the exit so the cluster will resume execution. The progress file will be kept around \
-     for future debugging.\n\n\
-     If wen_restart fails, refer to the progress file (in proto3 format) for further debugging and \
-     watch the discord channel for instructions.";
 
 pub mod account_secondary_indexes;
 pub mod blockstore_options;
@@ -340,7 +321,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .takes_value(true)
             .validator(solana_net_utils::is_host_port)
             .help(
-                "Specify TPU address to advertise in gossip [default: ask --entrypoint or \
+                "Specify TPU QUIC address to advertise in gossip [default: ask --entrypoint or \
                  localhost when --entrypoint is not provided]",
             ),
     )
@@ -351,20 +332,20 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .takes_value(true)
             .validator(solana_net_utils::is_host_port)
             .help(
-                "Specify TPU Forwards address to advertise in gossip [default: ask --entrypoint \
-                 or localhostwhen --entrypoint is not provided]",
+                "Specify TPU Forwards QUIC address to advertise in gossip [default: ask \
+                 --entrypoint or localhostwhen --entrypoint is not provided]",
             ),
     )
     .arg(
-        Arg::with_name("tpu_vortexor_receiver_address")
-            .long("tpu-vortexor-receiver-address")
+        Arg::with_name("public_tvu_addr")
+            .long("public-tvu-address")
+            .alias("tvu-host-addr")
             .value_name("HOST:PORT")
             .takes_value(true)
-            .hidden(hidden_unless_forced())
             .validator(solana_net_utils::is_host_port)
             .help(
-                "TPU Vortexor Receiver address to which verified transaction packet will be \
-                 forwarded.",
+                "Specify TVU address to advertise in gossip [default: ask --entrypoint or \
+                 localhost when --entrypoint is not provided]",
             ),
     )
     .arg(
@@ -554,54 +535,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Output snapshot version"),
     )
     .arg(
-        Arg::with_name("limit_ledger_size")
-            .long("limit-ledger-size")
-            .value_name("SHRED_COUNT")
-            .takes_value(true)
-            .min_values(0)
-            .max_values(1)
-            /* .default_value() intentionally not used here! */
-            .help("Keep this amount of shreds in root slots."),
-    )
-    .arg(
-        Arg::with_name("rocksdb_shred_compaction")
-            .long("rocksdb-shred-compaction")
-            .value_name("ROCKSDB_COMPACTION_STYLE")
-            .takes_value(true)
-            .possible_values(&["level"])
-            .default_value(&default_args.rocksdb_shred_compaction)
-            .help(
-                "Controls how RocksDB compacts shreds. *WARNING*: You will lose your Blockstore \
-                 data when you switch between options.",
-            ),
-    )
-    .arg(
-        Arg::with_name("rocksdb_ledger_compression")
-            .hidden(hidden_unless_forced())
-            .long("rocksdb-ledger-compression")
-            .value_name("COMPRESSION_TYPE")
-            .takes_value(true)
-            .possible_values(&["none", "lz4", "snappy", "zlib"])
-            .default_value(&default_args.rocksdb_ledger_compression)
-            .help(
-                "The compression algorithm that is used to compress transaction status data. \
-                 Turning on compression can save ~10% of the ledger size.",
-            ),
-    )
-    .arg(
-        Arg::with_name("rocksdb_perf_sample_interval")
-            .hidden(hidden_unless_forced())
-            .long("rocksdb-perf-sample-interval")
-            .value_name("ROCKS_PERF_SAMPLE_INTERVAL")
-            .takes_value(true)
-            .validator(is_parsable::<usize>)
-            .default_value(&default_args.rocksdb_perf_sample_interval)
-            .help(
-                "Controls how often RocksDB read/write performance samples are collected. Perf \
-                 samples are collected in 1 / ROCKS_PERF_SAMPLE_INTERVAL sampling rate.",
-            ),
-    )
-    .arg(
         Arg::with_name("skip_startup_ledger_verification")
             .long("skip-startup-ledger-verification")
             .takes_value(false)
@@ -741,14 +674,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
-        Arg::with_name("tpu_connection_pool_size")
-            .long("tpu-connection-pool-size")
-            .takes_value(true)
-            .default_value(&default_args.tpu_connection_pool_size)
-            .validator(is_parsable::<usize>)
-            .help("Controls the TPU connection pool size per remote address"),
-    )
-    .arg(
         Arg::with_name("tpu_max_connections_per_ipaddr_per_minute")
             .long("tpu-max-connections-per-ipaddr-per-minute")
             .takes_value(true)
@@ -769,10 +694,30 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
         Arg::with_name("tpu_max_connections_per_peer")
             .long("tpu-max-connections-per-peer")
             .takes_value(true)
-            .default_value(&default_args.tpu_max_connections_per_peer)
             .validator(is_parsable::<u32>)
             .hidden(hidden_unless_forced())
-            .help("Controls the max concurrent connections per IpAddr."),
+            .help(
+                "Controls the max concurrent connections per IpAddr or staked identity.Overrides \
+                 tpu-max-connections-per-unstaked-peer and tpu-max-connections-per-staked-peer",
+            ),
+    )
+    .arg(
+        Arg::with_name("tpu_max_connections_per_unstaked_peer")
+            .long("tpu-max-connections-per-unstaked-peer")
+            .takes_value(true)
+            .default_value(&default_args.tpu_max_connections_per_unstaked_peer)
+            .validator(is_parsable::<u32>)
+            .hidden(hidden_unless_forced())
+            .help("Controls the max concurrent connections per IpAddr for unstaked clients."),
+    )
+    .arg(
+        Arg::with_name("tpu_max_connections_per_staked_peer")
+            .long("tpu-max-connections-per-staked-peer")
+            .takes_value(true)
+            .default_value(&default_args.tpu_max_connections_per_staked_peer)
+            .validator(is_parsable::<u32>)
+            .hidden(hidden_unless_forced())
+            .help("Controls the max concurrent connections per staked identity."),
     )
     .arg(
         Arg::with_name("tpu_max_staked_connections")
@@ -907,19 +852,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                  generally produce higher compression ratio at the expense of speed and memory. \
                  See the zstd manpage for more information.",
             ),
-    )
-    .arg(
-        Arg::with_name("wal_recovery_mode")
-            .long("wal-recovery-mode")
-            .value_name("MODE")
-            .takes_value(true)
-            .possible_values(&[
-                "tolerate_corrupted_tail_records",
-                "absolute_consistency",
-                "point_in_time",
-                "skip_any_corrupted_record",
-            ])
-            .help("Mode to recovery the ledger db write ahead log."),
     )
     .arg(
         Arg::with_name("poh_pinned_cpu_core")
@@ -1085,14 +1017,26 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
     .arg(
         Arg::with_name("accounts_db_mark_obsolete_accounts")
             .long("accounts-db-mark-obsolete-accounts")
-            .help("Enables experimental obsolete account tracking")
+            .help("Controls obsolete account tracking")
+            .takes_value(true)
+            .possible_values(&["enabled", "disabled"])
             .long_help(
-                "Enables experimental obsolete account tracking. This feature tracks obsolete \
-                 accounts in the account storage entry allowing for earlier cleaning of obsolete \
-                 accounts in the storages and index. At this time this feature is not compatible \
-                 with booting from local snapshot state and must unpack from archives.",
+                "Controls obsolete account tracking. This feature tracks obsolete accounts in the \
+                 account storage entry allowing for earlier cleaning of obsolete accounts in the \
+                 storages and index. This value is currently enabled by default.",
             )
             .hidden(hidden_unless_forced()),
+    )
+    .arg(
+        Arg::with_name("no_accounts_db_snapshots_direct_io")
+            .long("no-accounts-db-snapshots-direct-io")
+            .help("Disable direct I/O use for accounts-db snapshot operations")
+            .long_help(
+                "Do *not* use direct I/O for accounts-db file operations related to snapshot \
+                 processsing. Direct I/O can improve performance by bypassing OS page cache, but \
+                 requires the file systems hosting snapshots and accounts-db directories to \
+                 support files opened with the O_DIRECT flag.",
+            ),
     )
     .arg(
         Arg::with_name("accounts_index_scan_results_limit_mb")
@@ -1114,6 +1058,32 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Number of bins to divide the accounts index into"),
     )
     .arg(
+        Arg::with_name("accounts_index_limit")
+            .long("accounts-index-limit")
+            .value_name("VALUE")
+            .takes_value(true)
+            .possible_values(&[
+                "minimal",
+                "25GB",
+                "50GB",
+                "100GB",
+                "200GB",
+                "400GB",
+                "800GB",
+                "unlimited",
+            ])
+            .default_value("unlimited")
+            .help("Sets the memory limit for the accounts index")
+            .long_help(
+                "Sets the memory limit for the accounts index. The size options will limit the \
+                 accounts index memory to the specified value. E.g. \"50GB\" means the accounts \
+                 index may use up to 50 GB of memory. The \"unlimited\" option keeps the entire \
+                 accounts index in memory. The \"minimal\" option reduces memory usage as much as \
+                 possible. All index entries that are not in memory are kept in the disk-backed \
+                 index. The disk-backed index has lower performance; prefer higher limits here.",
+            ),
+    )
+    .arg(
         Arg::with_name("accounts_index_initial_accounts_count")
             .long("accounts-index-initial-accounts-count")
             .value_name("NUMBER")
@@ -1128,19 +1098,9 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .value_name("PATH")
             .takes_value(true)
             .multiple(true)
-            .requires("enable_accounts_disk_index")
             .help(
                 "Persistent accounts-index location. May be specified multiple times. [default: \
                  <LEDGER>/accounts_index]",
-            ),
-    )
-    .arg(
-        Arg::with_name("enable_accounts_disk_index")
-            .long("enable-accounts-disk-index")
-            .help("Enables the disk-based accounts index")
-            .long_help(
-                "Enables the disk-based accounts index. Reduce the memory footprint of the \
-                 accounts index at the cost of index performance.",
             ),
     )
     .arg(
@@ -1254,36 +1214,18 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("enable_scheduler_bindings")
+            .long("enable-scheduler-bindings")
+            .takes_value(false)
+            .help("Enables external processes to connect and manage block production"),
+    )
+    .arg(
         Arg::with_name("unified_scheduler_handler_threads")
             .long("unified-scheduler-handler-threads")
             .value_name("COUNT")
             .takes_value(true)
             .validator(|s| is_within_range(s, 1..))
             .help(DefaultSchedulerPool::cli_message()),
-    )
-    .arg(
-        Arg::with_name("wen_restart")
-            .long("wen-restart")
-            .hidden(hidden_unless_forced())
-            .value_name("FILE")
-            .takes_value(true)
-            .required(false)
-            .conflicts_with("wait_for_supermajority")
-            .requires("wen_restart_coordinator")
-            .help(WEN_RESTART_HELP),
-    )
-    .arg(
-        Arg::with_name("wen_restart_coordinator")
-            .long("wen-restart-coordinator")
-            .hidden(hidden_unless_forced())
-            .value_name("PUBKEY")
-            .takes_value(true)
-            .required(false)
-            .requires("wen_restart")
-            .help(
-                "Specifies the pubkey of the leader used in wen restart. May get stuck if the \
-                 leader used is different from others.",
-            ),
     )
     .arg(
         Arg::with_name("retransmit_xdp_interface")
@@ -1313,20 +1255,12 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .requires("retransmit_xdp_cpu_cores")
             .help("EXPERIMENTAL: Enable XDP zero copy. Requires hardware support"),
     )
-    .arg(
-        Arg::with_name("use_connection_cache")
-            .long("use-connection-cache")
-            .takes_value(false)
-            .help(
-                "Use connection-cache crate to send transactions over TPU ports. If not \
-                 set,tpu-client-next is used by default.",
-            ),
-    )
     .args(&pub_sub_config::args(/*test_validator:*/ false))
     .args(&json_rpc_config::args())
     .args(&rpc_bigtable_config::args())
     .args(&send_transaction_config::args())
     .args(&rpc_bootstrap_config::args())
+    .args(&blockstore_options::args())
 }
 
 fn validators_set(
@@ -1363,7 +1297,7 @@ mod tests {
         std::{
             fs,
             net::{IpAddr, Ipv4Addr},
-            path::{absolute, PathBuf},
+            path::{PathBuf, absolute},
         },
     };
 

@@ -1,5 +1,4 @@
 use {
-    agave_logger::redirect_stderr_to_file,
     agave_validator::{
         admin_rpc_service, cli, commands::FromClapArgMatches, dashboard::Dashboard,
         ledger_lockfile, lock_ledger, println_name_value,
@@ -17,10 +16,11 @@ use {
     solana_clock::Slot,
     solana_core::consensus::tower_storage::FileTowerStorage,
     solana_epoch_schedule::EpochSchedule,
-    solana_faucet::faucet::{run_faucet, Faucet},
+    solana_faucet::faucet::{Faucet, run_faucet},
     solana_inflation::Inflation,
-    solana_keypair::{read_keypair_file, write_keypair_file, Keypair},
+    solana_keypair::{Keypair, read_keypair_file, write_keypair_file},
     solana_native_token::sol_str_to_lamports,
+    solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_rpc::{
@@ -29,12 +29,11 @@ use {
     },
     solana_rpc_client::rpc_client::RpcClient,
     solana_signer::Signer,
-    solana_streamer::socket::SocketAddrSpace,
     solana_system_interface::program as system_program,
     solana_test_validator::*,
     std::{
         collections::{HashMap, HashSet},
-        fs, io,
+        env, fs, io,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         process::exit,
@@ -44,6 +43,10 @@ use {
     },
 };
 
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 #[derive(PartialEq, Eq)]
 enum Output {
     None,
@@ -52,6 +55,12 @@ enum Output {
 }
 
 fn main() {
+    // Debugging panics is easier with a backtrace
+    if env::var_os("RUST_BACKTRACE").is_none() {
+        // Safety: env update is made before any spawned threads might access the environment
+        unsafe { env::set_var("RUST_BACKTRACE", "1") }
+    }
+
     let default_args = cli::DefaultTestArgs::new();
     let version = solana_version::version!();
     let matches = cli::test_app(version, &default_args).get_matches();
@@ -122,7 +131,7 @@ fn main() {
     } else {
         None
     };
-    let _logger_thread = redirect_stderr_to_file(logfile);
+    agave_logger::initialize_logging(logfile);
 
     info!("{} {}", crate_name!(), solana_version::version!());
     info!("Starting validator with: {:#?}", std::env::args_os());
@@ -155,13 +164,6 @@ fn main() {
     let ticks_per_slot = value_t!(matches, "ticks_per_slot", u64).ok();
     let slots_per_epoch = value_t!(matches, "slots_per_epoch", Slot).ok();
     let inflation_fixed = value_t!(matches, "inflation_fixed", f64).ok();
-    let gossip_host = matches.value_of("gossip_host").map(|gossip_host| {
-        warn!("--gossip-host is deprecated. Use --bind-address instead.");
-        solana_net_utils::parse_host(gossip_host).unwrap_or_else(|err| {
-            eprintln!("Failed to parse --gossip-host: {err}");
-            exit(1);
-        })
-    });
     let gossip_port = value_t!(matches, "gossip_port", u16).ok();
     let dynamic_port_range = matches.value_of("dynamic_port_range").map(|port_range| {
         solana_net_utils::parse_port_range(port_range).unwrap_or_else(|| {
@@ -179,9 +181,7 @@ fn main() {
         exit(1);
     });
 
-    let advertised_ip = if let Some(ip) = gossip_host {
-        ip
-    } else if !bind_address.is_unspecified() && !bind_address.is_loopback() {
+    let advertised_ip = if !bind_address.is_unspecified() && !bind_address.is_loopback() {
         bind_address
     } else {
         IpAddr::V4(Ipv4Addr::LOCALHOST)
@@ -406,6 +406,7 @@ fn main() {
     genesis.log_messages_bytes_limit = value_t!(matches, "log_messages_bytes_limit", usize).ok();
     genesis.transaction_account_lock_limit =
         value_t!(matches, "transaction_account_lock_limit", usize).ok();
+    genesis.enable_scheduler_bindings = matches.is_present("enable_scheduler_bindings");
 
     let tower_storage = Arc::new(FileTowerStorage::new(ledger_path.clone()));
 
