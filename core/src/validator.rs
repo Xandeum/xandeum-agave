@@ -152,7 +152,7 @@ use {
         borrow::Cow,
         cmp,
         collections::{HashMap, HashSet},
-        net::{IpAddr, SocketAddr},
+        net::{SocketAddr},
         num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
         str::FromStr,

@@ -18,7 +18,6 @@ use {
     agave_snapshots::{paths as snapshot_paths, snapshot_config::SnapshotConfig},
     base64::{Engine, prelude::BASE64_STANDARD},
     bincode::{config::Options, serialize},
-    common::consts::XAND_SHIELD_PROGRAM_ID,
     crossbeam_channel::{unbounded, Receiver, Sender},
     jsonrpc_core::{
         BoxFuture, Error, Metadata, Result,
@@ -147,6 +146,7 @@ type RpcCustomResult<T> = std::result::Result<T, RpcCustomError>;
 
 pub const MAX_REQUEST_BODY_SIZE: usize = 50 * (1 << 10); // 50kB
 pub const PERFORMANCE_SAMPLES_LIMIT: usize = 720;
+pub const XAND_SHIELD_PROGRAM_ID :&str = "xSHLJPXU8QW3A9kGiRoL94bksJ7ZZPY4dUwJPAT8CVK";
 
 fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
     RpcResponse {
