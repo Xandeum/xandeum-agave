@@ -10,6 +10,7 @@ pub enum ClientId {
     Firedancer,
     AgaveBam,
     Sig,
+    Xandeum,
     // If new variants are added, update From<u16> and TryFrom<ClientId>.
     Unknown(u16),
 }
@@ -25,6 +26,7 @@ impl fmt::Display for ClientId {
             Self::Firedancer => write!(f, "Firedancer"),
             Self::AgaveBam => write!(f, "AgaveBam"),
             Self::Sig => write!(f, "Sig"),
+            Self::Xandeum => write!(f, "Xandeum"),
             Self::Unknown(id) => write!(f, "Unknown({id})"),
         }
     }
@@ -41,6 +43,7 @@ impl From<u16> for ClientId {
             5u16 => Self::Firedancer,
             6u16 => Self::AgaveBam,
             7u16 => Self::Sig,
+            8u16 => Self::Xandeum,
             _ => Self::Unknown(client),
         }
     }
@@ -59,7 +62,8 @@ impl TryFrom<ClientId> for u16 {
             ClientId::Firedancer => Ok(5u16),
             ClientId::AgaveBam => Ok(6u16),
             ClientId::Sig => Ok(7u16),
-            ClientId::Unknown(client @ 0u16..=7u16) => Err(format!("Invalid client: {client}")),
+            ClientId::Xandeum => Ok(8u16),
+            ClientId::Unknown(client @ 0u16..=8u16) => Err(format!("Invalid client: {client}")),
             ClientId::Unknown(client) => Ok(client),
         }
     }
@@ -68,7 +72,7 @@ impl TryFrom<ClientId> for u16 {
 impl ClientId {
     pub const fn this_client() -> Self {
         // Other client implementations need to modify this line.
-        Self::Agave
+        Self::Xandeum
     }
 }
 

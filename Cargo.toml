@@ -131,6 +131,7 @@ members = [
     "votor",
     "votor-messages",
     "watchtower",
+    "xandeum-protos",
     "xdp",
     "xdp-ebpf",
 ]
