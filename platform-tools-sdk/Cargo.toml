@@ -4,7 +4,11 @@ exclude = ["gen-headers"]
 resolver = "2"
 
 [workspace.package]
+<<<<<<< HEAD
 version = "4.0.0"
+=======
+version = "4.0.3"
+>>>>>>> v4.0.3
 authors = ["Anza Maintainers <maintainers@anza.xyz>"]
 description = "Blockchain, Rebuilt for Scale"
 repository = "https://github.com/anza-xyz/agave"

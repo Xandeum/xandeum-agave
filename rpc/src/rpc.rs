@@ -18,7 +18,7 @@ use {
     agave_snapshots::{paths as snapshot_paths, snapshot_config::SnapshotConfig},
     base64::{Engine, prelude::BASE64_STANDARD},
     bincode::{config::Options, serialize},
-    crossbeam_channel::{unbounded, Receiver, Sender},
+    crossbeam_channel::{Receiver, Sender, unbounded},
     jsonrpc_core::{
         BoxFuture, Error, Metadata, Result,
         futures::future::{self, FutureExt, OptionFuture},
@@ -613,7 +613,7 @@ impl JsonRpcRequestProcessor {
             responses: Arc::new(Mutex::new(HashMap::new())),
             request_id_counter: Arc::new(AtomicU64::new(0)),
             response_channels: Arc::new(Mutex::new(HashMap::new())),
-            metrics: Arc::new(RpcMetrics::default()),
+            // metrics: Arc::new(RpcMetrics::default()),
         }
     }
 
@@ -3806,7 +3806,9 @@ pub mod rpc_bank {
                 }
             };
 
-            let slot_history = bank.get_slot_history();
+            let Some(slot_history) = bank.get_slot_history() else {
+                return Err(RpcCustomError::NoSlotHistory.into());
+            };
             if first_slot < slot_history.oldest() {
                 return Err(Error::invalid_params(format!(
                     "firstSlot, {}, is too small; min {}",
@@ -4162,8 +4164,8 @@ pub mod rpc_full {
     use {
         super::*,
         solana_message::{SanitizedVersionedMessage, VersionedMessage},
-        solana_transaction_status::parse_ui_inner_instructions,
         xandeum_protos::types::{Opcode, Request},
+        solana_transaction_status::{parse_ui_inner_instructions},
     };
     #[rpc]
     pub trait Full {

@@ -539,7 +539,7 @@ impl JsonRpcService {
             cancel,
         );
 
-        let json_rpc_service: JsonRpcService = Self::new(
+        let json_rpc_service = Self::new(
             config.rpc_addr,
             config.rpc_config.clone(),
             config.snapshot_config,

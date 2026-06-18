@@ -59,7 +59,9 @@ use {
             MAX_ALLOWABLE_DRIFT_PERCENTAGE_FAST, MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW_V2,
             MaxAllowableDrift, calculate_stake_weighted_timestamp,
         },
-        stakes::{DeserializableStakes, SerdeStakesToStakeFormat, Stakes, StakesCache},
+        stakes::{
+            DelegatedStakes, DeserializableStakes, SerdeStakesToStakeFormat, Stakes, StakesCache,
+        },
         status_cache::{SlotDelta, StatusCache},
         transaction_batch::{OwnedOrBorrowed, TransactionBatch},
     },
@@ -1088,6 +1090,8 @@ impl AtomicBankHashStats {
 struct NewEpochBundle {
     stake_history: CowStakeHistory,
     vote_accounts: VoteAccounts,
+    /// Current effective stake delegated to each vote account pubkey.
+    delegated_stakes: DelegatedStakes,
     rewards_calculation: Arc<PartitionedRewardsCalculation>,
     calculate_activated_stake_time_us: u64,
     update_rewards_with_thread_pool_time_us: u64,
@@ -1685,7 +1689,7 @@ impl Bank {
         // snapshot of stakes in epoch stakes
         let stakes = self.stakes_cache.stakes();
         let stake_delegations = stakes.stake_delegations_vec();
-        let ((stake_history, vote_accounts), calculate_activated_stake_time_us) =
+        let ((stake_history, vote_accounts, delegated_stakes), calculate_activated_stake_time_us) =
             measure_us!(stakes.calculate_activated_stake(
                 self.epoch(),
                 thread_pool,
@@ -1712,6 +1716,7 @@ impl Bank {
         NewEpochBundle {
             stake_history,
             vote_accounts,
+            delegated_stakes,
             rewards_calculation,
             calculate_activated_stake_time_us,
             update_rewards_with_thread_pool_time_us,
@@ -1743,6 +1748,7 @@ impl Bank {
         let NewEpochBundle {
             stake_history,
             vote_accounts,
+            delegated_stakes,
             rewards_calculation,
             calculate_activated_stake_time_us,
             update_rewards_with_thread_pool_time_us,
@@ -1754,7 +1760,7 @@ impl Bank {
         );
 
         self.stakes_cache
-            .activate_epoch(epoch, stake_history, vote_accounts);
+            .activate_epoch(epoch, stake_history, vote_accounts, delegated_stakes);
 
         // Save a snapshot of stakes for use in consensus and stake weighted networking
         let leader_schedule_epoch = self.epoch_schedule.get_leader_schedule_epoch(slot);
@@ -2326,8 +2332,8 @@ impl Bank {
         });
     }
 
-    pub fn get_slot_history(&self) -> SlotHistory {
-        from_account(&self.get_account(&sysvar::slot_history::id()).unwrap()).unwrap()
+    pub fn get_slot_history(&self) -> Option<SlotHistory> {
+        from_account(&self.get_account(&sysvar::slot_history::id())?)
     }
 
     fn update_epoch_stakes(&mut self, leader_schedule_epoch: Epoch) {
@@ -2938,7 +2944,7 @@ impl Bank {
             blockhash_queue.get_lamports_per_signature(message.recent_blockhash())
         }
         .or_else(|| {
-            self.load_message_nonce_data(message)
+            self.load_message_nonce_data(message, false)
                 .map(|(_nonce_address, nonce_data)| nonce_data.get_lamports_per_signature())
         })?;
         Some(self.get_fee_for_message_with_lamports_per_signature(message, lamports_per_signature))
@@ -3451,6 +3457,7 @@ impl Bank {
                 },
                 drop_on_failure: false,
                 all_or_nothing: false,
+                strict_nonce_size_check: false,
             },
         );
 
@@ -3613,6 +3620,7 @@ impl Bank {
             sanitized_txs,
             batch.lock_results(),
             max_age,
+            processing_config.strict_nonce_size_check,
             error_counters,
         ));
         timings.saturating_add_in_place(ExecuteTimingType::CheckUs, check_us);
@@ -4190,6 +4198,7 @@ impl Bank {
                 recording_config,
                 drop_on_failure: false,
                 all_or_nothing: false,
+                strict_nonce_size_check: false,
             },
         );
 
@@ -5598,6 +5607,8 @@ impl Bank {
         }
 
         self.compute_and_apply_features_after_snapshot_restore();
+        self.stakes_cache
+            .refresh_delegated_stakes(self.new_warmup_cooldown_rate_epoch());
 
         self.recalculate_partitioned_rewards_if_active(rewards_thread_pool_builder);
 
