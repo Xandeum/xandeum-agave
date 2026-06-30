@@ -67,7 +67,7 @@ static CORE_BPF_PROGRAMS: &[(Pubkey, Option<Pubkey>, &[u8])] = &[
     (
         solana_sdk_ids::stake::ID,
         None,
-        include_bytes!("programs/core_bpf_stake-1.0.1.so"),
+        include_bytes!("programs/core_bpf_stake-4.0.0.so"),
     ),
     // Add more programs here post-migration...
 ];
@@ -75,7 +75,11 @@ static CORE_BPF_PROGRAMS: &[(Pubkey, Option<Pubkey>, &[u8])] = &[
 /// Returns a tuple `(Pubkey, Account)` for a BPF program, where the key is the
 /// provided program ID and the account is a valid BPF Loader program account
 /// containing the ELF.
-fn bpf_loader_program_account(program_id: &Pubkey, elf: &[u8], rent: &Rent) -> (Pubkey, Account) {
+pub fn bpf_loader_program_account(
+    program_id: &Pubkey,
+    elf: &[u8],
+    rent: &Rent,
+) -> (Pubkey, Account) {
     (
         *program_id,
         Account {

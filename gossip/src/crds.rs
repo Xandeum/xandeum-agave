@@ -40,7 +40,7 @@ use {
         map::{Entry, IndexMap, rayon::ParValues},
         set::IndexSet,
     },
-    lru::LruCache,
+    lazy_lru::LruCache,
     rand::{rng, seq::IteratorRandom},
     rayon::{ThreadPool, prelude::*},
     solana_clock::Slot,
@@ -453,24 +453,16 @@ impl Crds {
 
     /// Returns all crds values which the first 'mask_bits'
     /// of their hash value is equal to 'mask'.
-    /// Excludes deprecated values and ContactInfo with invalid shred version
+    /// Excludes deprecated values.
     pub(crate) fn filter_bitmask(
         &self,
         mask: u64,
         mask_bits: u32,
-        self_shred_version: u16,
     ) -> impl Iterator<Item = &VersionedCrdsValue> {
         self.shards
             .find(mask, mask_bits)
             .map(move |i| self.table.index(i))
-            .filter(move |VersionedCrdsValue { value, .. }| {
-                let data = value.data();
-                !value.data().is_deprecated()
-                    && match data {
-                        CrdsData::ContactInfo(info) => info.shred_version() == self_shred_version,
-                        _ => true,
-                    }
-            })
+            .filter(move |VersionedCrdsValue { value, .. }| !value.data().is_deprecated())
     }
 
     /// Update the timestamp's of all the labels that are associated with Pubkey
@@ -793,10 +785,18 @@ impl CrdsStats {
 mod tests {
     use {
         super::*,
-        crate::crds_data::{AccountsHashes, new_rand_timestamp},
+        crate::{
+            crds_data::{
+                AccountsHashes, LegacyVersion, LowestSlot, NodeInstance, SnapshotHashes, Version,
+                new_rand_timestamp,
+            },
+            legacy_contact_info::LegacyContactInfo,
+            restart_crds_values::{RestartHeaviestFork, RestartLastVotedForkSlots},
+        },
         rand::{Rng, rng},
         rayon::ThreadPoolBuilder,
         solana_keypair::Keypair,
+        solana_sanitize::Sanitize,
         solana_signer::Signer,
         solana_time_utils::timestamp,
         std::{
@@ -1328,8 +1328,12 @@ mod tests {
         );
         assert_eq!(crds.get_shred_version(&pubkey), Some(8));
         // Add other crds values with the same pubkey.
-        let val = AccountsHashes::new_rand(&mut rng, Some(pubkey));
-        let val = CrdsData::AccountsHashes(val);
+        let val = CrdsData::SnapshotHashes(SnapshotHashes {
+            from: pubkey,
+            full: (0, solana_hash::Hash::default()),
+            incremental: vec![],
+            wallclock: 0,
+        });
         let val = CrdsValue::new_unsigned(val);
         assert_eq!(
             crds.insert(val, timestamp(), GossipRoute::LocalMessage),
@@ -1341,7 +1345,7 @@ mod tests {
         assert_eq!(crds.get::<&ContactInfo>(pubkey), None);
         assert_eq!(crds.get_shred_version(&pubkey), None);
         // Remove the remaining entry with the same pubkey.
-        crds.remove(&CrdsValueLabel::AccountsHashes(pubkey), timestamp());
+        crds.remove(&CrdsValueLabel::SnapshotHashes(pubkey), timestamp());
         assert_eq!(crds.get_records(&pubkey).count(), 0);
     }
 
@@ -1521,5 +1525,67 @@ mod tests {
         assert_ne!(v1, v2);
         assert!(!(v1 == v2));
         assert!(!overrides(&v2.value, &v1));
+    }
+
+    #[test]
+    fn test_filter_bitmask_excludes_deprecated() {
+        let mut crds = Crds::default();
+        let mut rng = rng();
+
+        // Insert a non-deprecated value; it must appear in filter_bitmask results.
+        let ci = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
+            &solana_pubkey::new_rand(),
+            timestamp(),
+        )));
+        crds.insert(ci, timestamp(), GossipRoute::LocalMessage)
+            .unwrap();
+
+        // label() panics via unreachable!() on these deprecated types, and
+        // insert() calls label(), so sanitize() must reject them before any
+        // caller reaches insert(). Verify each is rejected, since that is
+        // the barrier all real code paths (pull/push handlers) rely on.
+        let sanitize_blocked = vec![
+            CrdsData::LegacyContactInfo(LegacyContactInfo {}),
+            CrdsData::LegacySnapshotHashes(AccountsHashes {}),
+            CrdsData::AccountsHashes(AccountsHashes {}),
+            CrdsData::LegacyVersion(LegacyVersion {}),
+            CrdsData::Version(Version {}),
+            CrdsData::NodeInstance(NodeInstance {}),
+            CrdsData::LowestSlot(
+                1,
+                LowestSlot::new(solana_pubkey::new_rand(), 0, timestamp()),
+            ),
+        ];
+        for data in sanitize_blocked {
+            assert!(CrdsValue::new_unsigned(data).sanitize().is_err());
+        }
+
+        // These deprecated types pass sanitize() and have valid labels, so
+        // they can arrive over the wire and be inserted. filter_bitmask()
+        // must exclude them.
+        crds.insert(
+            CrdsValue::new_unsigned(CrdsData::RestartLastVotedForkSlots(
+                RestartLastVotedForkSlots::new_rand(&mut rng, Some(solana_pubkey::new_rand())),
+            )),
+            timestamp(),
+            GossipRoute::LocalMessage,
+        )
+        .unwrap();
+        crds.insert(
+            CrdsValue::new_unsigned(CrdsData::RestartHeaviestFork(
+                RestartHeaviestFork::new_rand(&mut rng, Some(solana_pubkey::new_rand())),
+            )),
+            timestamp(),
+            GossipRoute::LocalMessage,
+        )
+        .unwrap();
+
+        // All 3 values were inserted, but the 2 deprecated ones must not appear
+        // in filter_bitmask results.
+        assert_eq!(crds.table.len(), 3);
+        assert!(
+            crds.filter_bitmask(0, 0)
+                .all(|e| !e.value.data().is_deprecated())
+        );
     }
 }

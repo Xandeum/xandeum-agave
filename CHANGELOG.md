@@ -7,6 +7,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 and follows a [Backwards Compatibility Policy](https://docs.anza.xyz/backwards-compatibility)
 
+## 4.1.0
+### Validator
+#### Breaking
+* `--block-production-method central-scheduler` is no longer supported. If passed, a warning is emitted and behavior
+  will default to the greedy-scheduler implementation.
+* scheduler-bindings version has been increased to 4. Connecting external schedulers must be updated.
+* Validator now requires 26 ports, `--dynamic-port-range` must be at least 26 wide.
+#### Deprecations
+* Using `minimal` for `--accounts-index-limit` is now deprecated.
+* `--account-shrink-path` is now deprecated.
+* `sbf-sdk.tar.bz2` is not included anymore in the Agave release tarball. The file will be made available in the new
+  [`cargo-build-sbf`](https://github.com/anza-xyz/cargo-build-sbf) repository.
+* XDP support is no longer experimental. The `--experimental-retransmit-xdp-interface`, `--experimental-retransmit-xdp-cpu-cores`, and
+  `--experimental-retransmit-xdp-zero-copy` flags have been deprecated. Use `--xdp-interface`, `--xdp-cpu-cores`, and `--xdp-zero-copy` instead. Behavior is unchanged: pass `--xdp-cpu-cores` to enable XDP on the specified cores.
+
 ## 4.0.0
 ### RPC
 #### Breaking

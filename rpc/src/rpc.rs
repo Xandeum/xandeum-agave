@@ -17,7 +17,6 @@ use {
     },
     agave_snapshots::{paths as snapshot_paths, snapshot_config::SnapshotConfig},
     base64::{Engine, prelude::BASE64_STANDARD},
-    bincode::{config::Options, serialize},
     crossbeam_channel::{Receiver, Sender, unbounded},
     jsonrpc_core::{
         BoxFuture, Error, Metadata, Result,
@@ -33,12 +32,11 @@ use {
     },
     solana_accounts_db::{
         accounts::AccountAddressFilter,
-        accounts_index::{
-            AccountIndex, AccountSecondaryIndexes, IndexKey, ScanConfig, ScanOrder, ScanResult,
-        },
+        accounts_index::{AccountIndex, AccountSecondaryIndexes, IndexKey},
+        accounts_scan::ScanResult,
     },
     solana_client::connection_cache::Protocol,
-    solana_clock::{MAX_PROCESSING_AGE, Slot, UnixTimestamp},
+    solana_clock::{Slot, UnixTimestamp},
     solana_commitment_config::{CommitmentConfig, CommitmentLevel},
     solana_entry::entry::Entry,
     solana_epoch_info::EpochInfo,
@@ -129,6 +127,7 @@ use {
     solana_gossip::contact_info::ContactInfo,
     solana_ledger::get_tmp_ledger_path,
     solana_net_utils::SocketAddrSpace,
+    solana_program_runtime::solana_sbpf::program::BuiltinFunctionDefinition,
     solana_runtime::commitment::CommitmentSlots,
     solana_send_transaction_service::{
         send_transaction_service::Config as SendTransactionServiceConfig,
@@ -146,7 +145,7 @@ type RpcCustomResult<T> = std::result::Result<T, RpcCustomError>;
 
 pub const MAX_REQUEST_BODY_SIZE: usize = 50 * (1 << 10); // 50kB
 pub const PERFORMANCE_SAMPLES_LIMIT: usize = 720;
-pub const XAND_SHIELD_PROGRAM_ID :&str = "xSHLJPXU8QW3A9kGiRoL94bksJ7ZZPY4dUwJPAT8CVK";
+pub const XAND_SHIELD_PROGRAM_ID: &str = "xSHLJPXU8QW3A9kGiRoL94bksJ7ZZPY4dUwJPAT8CVK";
 
 fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
     RpcResponse {
@@ -181,6 +180,8 @@ pub struct JsonRpcConfig {
     pub full_api: bool,
     pub rpc_scan_and_fix_roots: bool,
     pub max_request_body_size: Option<usize>,
+    /// If set, abort index scans whose accumulated results exceed this many bytes.
+    pub scan_results_limit_bytes: Option<usize>,
     /// Disable the health check, used for tests and TestValidator
     pub disable_health_check: bool,
 }
@@ -202,6 +203,7 @@ impl Default for JsonRpcConfig {
             full_api: Default::default(),
             rpc_scan_and_fix_roots: Default::default(),
             max_request_body_size: Option::default(),
+            scan_results_limit_bytes: Option::default(),
             disable_health_check: Default::default(),
         }
     }
@@ -384,15 +386,12 @@ impl JsonRpcRequestProcessor {
         filters: Vec<RpcFilterType>,
         sort_results: bool,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
-        let scan_order = if sort_results {
-            ScanOrder::Sorted
-        } else {
-            ScanOrder::Unsorted
-        };
         let bank = Arc::clone(bank);
         let index_key = index_key.to_owned();
         let program_id = program_id.to_owned();
-        self.runtime
+        let byte_limit_for_scans = self.config.scan_results_limit_bytes;
+        let mut accounts = self
+            .runtime
             .spawn_blocking(move || {
                 bank.get_filtered_indexed_accounts(
                     &index_key,
@@ -407,12 +406,16 @@ impl JsonRpcRequestProcessor {
                                 .iter()
                                 .all(|filter_type| filter_allows(filter_type, account))
                     },
-                    &ScanConfig::new(scan_order),
-                    bank.byte_limit_for_scans(),
+                    byte_limit_for_scans,
                 )
             })
             .await
-            .expect("Failed to spawn blocking task")
+            .expect("Failed to spawn blocking task")?;
+        if sort_results {
+            // Avoid copying pubkeys (using Ord::cmp(a, b) silences clippy::unnecessary_sort_by).
+            accounts.sort_unstable_by(|(addr_a, _), (addr_b, _)| Ord::cmp(addr_a, addr_b));
+        }
+        Ok(accounts)
     }
 
     #[allow(deprecated)]
@@ -1080,7 +1083,6 @@ impl JsonRpcRequestProcessor {
                 slot_leaders.extend(
                     leader_schedule
                         .get_slot_leaders()
-                        .iter()
                         .map(|slot_leader| slot_leader.id)
                         .skip(slot_index as usize)
                         .take(limit.saturating_sub(slot_leaders.len())),
@@ -1140,7 +1142,6 @@ impl JsonRpcRequestProcessor {
     ) -> RpcCustomResult<RpcResponse<Vec<RpcAccountBalance>>> {
         let config = config.unwrap_or_default();
         let bank = self.bank(config.commitment);
-        let sort_results = config.sort_results.unwrap_or(true);
 
         if let Some((slot, accounts)) = self.get_cached_largest_accounts(&config.filter) {
             Ok(RpcResponse {
@@ -1169,12 +1170,7 @@ impl JsonRpcRequestProcessor {
                 .spawn_blocking({
                     let bank = Arc::clone(&bank);
                     move || {
-                        bank.get_largest_accounts(
-                            NUM_LARGEST_ACCOUNTS,
-                            &addresses,
-                            address_filter,
-                            sort_results,
-                        )
+                        bank.get_largest_accounts(NUM_LARGEST_ACCOUNTS, &addresses, address_filter)
                     }
                 })
                 .await
@@ -1241,6 +1237,9 @@ impl JsonRpcRequestProcessor {
         };
 
         let bank = self.bank(config.commitment);
+        let commission_rate_in_basis_points = bank
+            .feature_set
+            .is_active(&agave_feature_set::commission_rate_in_basis_points::id());
         let vote_accounts = bank.vote_accounts();
         let epoch_vote_accounts = bank
             .epoch_vote_accounts(bank.get_epoch_and_slot_index(bank.slot()).0)
@@ -1276,7 +1275,18 @@ impl JsonRpcRequestProcessor {
                     vote_pubkey: vote_pubkey.to_string(),
                     node_pubkey: vote_state_view.node_pubkey().to_string(),
                     activated_stake: *activated_stake,
-                    commission: vote_state_view.commission(),
+                    commission: if commission_rate_in_basis_points {
+                        // Derive percent from native bps, clamping to u8::MAX.
+                        let bps = vote_state_view.inflation_rewards_commission();
+                        bps.div_ceil(100).min(u8::MAX as u16) as u8
+                    } else {
+                        vote_state_view.commission()
+                    },
+                    inflation_rewards_commission_bps: Some(if commission_rate_in_basis_points {
+                        vote_state_view.inflation_rewards_commission()
+                    } else {
+                        vote_state_view.commission() as u16 * 100
+                    }),
                     root_slot: vote_state_view.root_slot().unwrap_or(0),
                     epoch_credits,
                     epoch_vote_account: epoch_vote_accounts.contains_key(vote_pubkey),
@@ -1374,6 +1384,7 @@ impl JsonRpcRequestProcessor {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     pub async fn get_block(
         &self,
         slot: Slot,
@@ -2272,7 +2283,7 @@ impl JsonRpcRequestProcessor {
             // Filter on Delegate is_some()
             RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
                 72,
-                bincode::serialize(&1u32).unwrap(),
+                wincode::serialize(&1u32).unwrap(),
             )),
             // Filter on Delegate address
             RpcFilterType::Memcmp(Memcmp::new_raw_bytes(76, delegate.to_bytes().into())),
@@ -2315,6 +2326,7 @@ impl JsonRpcRequestProcessor {
     }
 
     /// Use a set of filters to get an iterator of keyed program accounts from a bank
+    #[allow(clippy::result_large_err)]
     async fn get_filtered_program_accounts(
         &self,
         bank: Arc<Bank>,
@@ -2346,12 +2358,8 @@ impl JsonRpcRequestProcessor {
             })
         } else {
             // this path does not need to provide a mb limit because we only want to support secondary indexes
-            let scan_order = if sort_results {
-                ScanOrder::Sorted
-            } else {
-                ScanOrder::Unsorted
-            };
-            self.runtime
+            let mut accounts = self
+                .runtime
                 .spawn_blocking(move || {
                     bank.get_filtered_program_accounts(
                         &program_id,
@@ -2360,14 +2368,18 @@ impl JsonRpcRequestProcessor {
                                 .iter()
                                 .all(|filter_type| filter_allows(filter_type, account))
                         },
-                        &ScanConfig::new(scan_order),
                     )
                     .map_err(|e| RpcCustomError::ScanError {
                         message: e.to_string(),
                     })
                 })
                 .await
-                .expect("Failed to spawn blocking task")
+                .expect("Failed to spawn blocking task")?;
+            if sort_results {
+                // Avoid copying pubkeys (using Ord::cmp(a, b) silences clippy::unnecessary_sort_by).
+                accounts.sort_unstable_by(|(addr_a, _), (addr_b, _)| Ord::cmp(addr_a, addr_b));
+            }
+            Ok(accounts)
         }
     }
 
@@ -2496,8 +2508,7 @@ impl JsonRpcRequestProcessor {
     fn get_stake_minimum_delegation(&self, config: RpcContextConfig) -> Result<RpcResponse<u64>> {
         let bank = self.get_bank_with_config(config)?;
         let stake_minimum_delegation = stake_utils::get_minimum_delegation(
-            bank.feature_set
-                .is_active(&agave_feature_set::upgrade_bpf_stake_program_to_v5::id()),
+            bank.feature_set.snapshot().upgrade_bpf_stake_program_to_v5,
         );
         Ok(new_response(&bank, stake_minimum_delegation))
     }
@@ -3593,7 +3604,6 @@ pub mod rpc_minimal {
                         solana_runtime::leader_schedule_utils::leader_schedule_by_identity(
                             leader_schedule
                                 .get_slot_leaders()
-                                .iter()
                                 .map(|slot_leader| &slot_leader.id)
                                 .enumerate(),
                         );
@@ -4164,8 +4174,8 @@ pub mod rpc_full {
     use {
         super::*,
         solana_message::{SanitizedVersionedMessage, VersionedMessage},
+        solana_transaction_status::parse_ui_inner_instructions,
         xandeum_protos::types::{Opcode, Request},
-        solana_transaction_status::{parse_ui_inner_instructions},
     };
     #[rpc]
     pub trait Full {
@@ -4518,17 +4528,17 @@ pub mod rpc_full {
                     },
                 )?;
 
-            let wire_transaction = serialize(&transaction).map_err(|err| {
+            let wire_transaction = wincode::serialize(&transaction).map_err(|err| {
                 info!("request_airdrop: serialize error: {err:?}");
                 Error::internal_error()
             })?;
 
-            let message_hash = transaction.message().hash();
             let signature = if !transaction.signatures.is_empty() {
                 transaction.signatures[0]
             } else {
                 return Err(RpcCustomError::TransactionSignatureVerificationFailure.into());
             };
+            let message_hash = transaction.message().hash();
 
             _send_transaction(
                 meta,
@@ -4584,10 +4594,8 @@ pub mod rpc_full {
                 preflight_bank.get_reserved_account_keys(),
                 preflight_bank
                     .feature_set
-                    .is_active(&agave_feature_set::static_instruction_limit::id()),
-                preflight_bank
-                    .feature_set
-                    .is_active(&agave_feature_set::limit_instruction_accounts::id()),
+                    .snapshot()
+                    .limit_instruction_accounts,
             )?;
 
             let blockhash = *transaction.message().recent_blockhash();
@@ -4606,7 +4614,8 @@ pub mod rpc_full {
                 // It provides a fallback timeout for durable-nonce transaction retries in case of
                 // malicious packing of the retry queue. Durable-nonce transactions are otherwise
                 // retried until the nonce is advanced.
-                last_valid_block_height = preflight_bank.block_height() + MAX_PROCESSING_AGE as u64;
+                last_valid_block_height =
+                    preflight_bank.block_height() + preflight_bank.max_processing_age() as u64;
             }
 
             if !skip_preflight {
@@ -4684,8 +4693,6 @@ pub mod rpc_full {
                 }
             }
 
-           
-
             // StartXandeum
             let msg = transaction.message();
             let xand_shield_pubkey =
@@ -4708,6 +4715,11 @@ pub mod rpc_full {
                         .iter()
                         .position(|key| key == &xand_shield_pubkey)
                 }
+                SanitizedMessage::V1(ref v1_msg) => v1_msg
+                    .message
+                    .account_keys
+                    .iter()
+                    .position(|key| key == &xand_shield_pubkey),
             };
             // Checking if the Transaction is Xtransaction or not
             if let Some(xand_shield_pos) = xand_shield_index {
@@ -4715,6 +4727,7 @@ pub mod rpc_full {
                 let instructions = match msg {
                     SanitizedMessage::Legacy(legacy_msg) => &legacy_msg.message.instructions,
                     SanitizedMessage::V0(v0_msg) => &v0_msg.message.instructions,
+                    SanitizedMessage::V1(v1_msg) => &v1_msg.message.instructions
                 };
 
                 let has_xand_shield_ix = instructions
@@ -4727,7 +4740,7 @@ pub mod rpc_full {
                         .filter(|ix| ix.program_id_index as usize == xand_shield_pos)
                         .filter(|ix| {
                             // check if the instruction call is for storage tx first
-                            ix.data.first() == Some(&0)  
+                            ix.data.first() == Some(&0)
                                 && ix.data.get(1).map(|&op| op == 4).unwrap_or(false)
                         })
                         .collect();
@@ -4797,7 +4810,7 @@ pub mod rpc_full {
                                         data: request_data,
                                         signature: tx_hash.clone(),
                                     };
-                                    info!("Sending request to docks : {:?}",req);
+                                    info!("Sending request to docks : {:?}", req);
 
                                     if let Ok(req_bytes) = bincode::serialize(&req) {
                                         match meta.to_dock_push_socket.lock() {
@@ -4859,7 +4872,6 @@ pub mod rpc_full {
                 } else {
                     info!("No Xandeum tx detected")
                 }
-
             }
             // EndXandeum
 
@@ -4873,7 +4885,7 @@ pub mod rpc_full {
                 durable_nonce_info,
                 max_retries,
             );
-            info!("resssssss : {:?}",res);
+            info!("resssssss : {:?}", res);
             res
         }
 
@@ -4930,10 +4942,7 @@ pub mod rpc_full {
                 unsanitized_tx,
                 bank,
                 bank.get_reserved_account_keys(),
-                bank.feature_set
-                    .is_active(&agave_feature_set::static_instruction_limit::id()),
-                bank.feature_set
-                    .is_active(&agave_feature_set::limit_instruction_accounts::id()),
+                bank.feature_set.snapshot().limit_instruction_accounts,
             )?;
 
             let verification_error = if sig_verify {
@@ -5308,7 +5317,7 @@ fn decode_and_deserialize<T>(
     encoding: TransactionBinaryEncoding,
 ) -> Result<(Vec<u8>, T)>
 where
-    T: serde::de::DeserializeOwned,
+    T: for<'a> wincode::SchemaRead<'a, wincode::config::DefaultConfig, Dst = T>,
 {
     let wire_output = match encoding {
         TransactionBinaryEncoding::Base58 => {
@@ -5350,11 +5359,8 @@ where
             PACKET_DATA_SIZE
         )));
     }
-    bincode::options()
-        .with_limit(PACKET_DATA_SIZE as u64)
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .deserialize_from(&wire_output[..])
+
+    wincode::deserialize(&wire_output[..])
         .map_err(|err| {
             Error::invalid_params(format!(
                 "failed to deserialize {}: {}",
@@ -5369,7 +5375,6 @@ fn sanitize_transaction(
     transaction: VersionedTransaction,
     address_loader: impl AddressLoader,
     reserved_account_keys: &HashSet<Pubkey>,
-    enable_static_instruction_limit: bool,
     enable_instruction_accounts_limit: bool,
 ) -> Result<RuntimeTransaction<SanitizedTransaction>> {
     RuntimeTransaction::try_create(
@@ -5378,7 +5383,6 @@ fn sanitize_transaction(
         None,
         address_loader,
         reserved_account_keys,
-        enable_static_instruction_limit,
         enable_instruction_accounts_limit,
     )
     .map_err(|err| Error::invalid_params(format!("invalid transaction: {err}")))
@@ -5487,7 +5491,6 @@ pub mod tests {
             rpc_subscriptions::RpcSubscriptions,
         },
         agave_reserved_account_keys::ReservedAccountKeys,
-        bincode::deserialize,
         jsonrpc_core::{ErrorCode, MetaIoHandler, Output, Response, Value, futures},
         jsonrpc_core_client::transports::local,
         serde::de::DeserializeOwned,
@@ -5516,9 +5519,8 @@ pub mod tests {
         solana_nonce::{self as nonce, state::DurableNonce},
         solana_program_option::COption,
         solana_program_runtime::{
-            invoke_context::InvokeContext,
-            loaded_programs::ProgramCacheEntry,
-            solana_sbpf::{declare_builtin_function, memory_region::MemoryMapping},
+            invoke_context::InvokeContext, program_cache_entry::ProgramCacheEntry,
+            solana_sbpf::declare_builtin_function,
         },
         solana_rpc_client_api::{
             custom_error::{
@@ -5529,7 +5531,7 @@ pub mod tests {
             filter::MemcmpEncodedBytes,
         },
         solana_runtime::{
-            bank::BankTestConfig,
+            bank::{BankTestConfig, SlotLeader},
             commitment::{BlockCommitment, CommitmentSlots},
             non_circulating_supply::non_circulating_accounts,
         },
@@ -5636,7 +5638,9 @@ pub mod tests {
         invoke_context: &mut InvokeContext,
     ) -> std::result::Result<u64, Box<dyn std::error::Error>> {
         let log_collector = invoke_context.get_log_collector();
-        invoke_context.consume_checked(TestBuiltinEntrypoint::COMPUTE_UNITS)?;
+        invoke_context
+            .compute_meter
+            .consume_checked(TestBuiltinEntrypoint::COMPUTE_UNITS)?;
 
         let transaction_context = &invoke_context.transaction_context;
         let instruction_context = transaction_context.get_current_instruction_context()?;
@@ -5674,14 +5678,13 @@ pub mod tests {
     declare_builtin_function!(
         TestBuiltinEntrypoint,
         fn rust(
-            invoke_context: &mut InvokeContext,
+            invoke_context: &mut InvokeContext<'_, '_>,
             _arg0: u64,
             _arg1: u64,
             _arg2: u64,
             _arg3: u64,
             _arg4: u64,
-            _memory_mapping: &mut MemoryMapping,
-        ) -> std::result::Result<u64, Box<dyn std::error::Error>> {
+        ) -> Result<u64, Box<dyn std::error::Error>> {
             test_builtin_processor(invoke_context)
         }
     );
@@ -5693,7 +5696,7 @@ pub mod tests {
             solana_pubkey::pubkey!("TestProgram11111111111111111111111111111111");
 
         fn cache_entry() -> ProgramCacheEntry {
-            ProgramCacheEntry::new_builtin(0, Self::NAME.len(), Self::vm)
+            ProgramCacheEntry::new_builtin(0, Self::NAME.len(), Self::register)
         }
 
         fn instruction(
@@ -5952,7 +5955,7 @@ pub mod tests {
             let mut parent_bank = self.bank_forks.read().unwrap().working_bank();
             for (i, root) in roots.iter().enumerate() {
                 let new_bank =
-                    Bank::new_from_parent(parent_bank.clone(), parent_bank.leader_id(), *root);
+                    Bank::new_from_parent(parent_bank.clone(), *parent_bank.leader(), *root);
                 parent_bank = self
                     .bank_forks
                     .write()
@@ -5971,7 +5974,7 @@ pub mod tests {
             self.blockstore.set_roots(roots.iter()).unwrap();
             let new_bank = Bank::new_from_parent(
                 parent_bank.clone(),
-                parent_bank.leader_id(),
+                *parent_bank.leader(),
                 roots.iter().max().unwrap() + 1,
             );
             self.bank_forks.write().unwrap().insert(new_bank);
@@ -5995,11 +5998,13 @@ pub mod tests {
 
         fn advance_bank_to_confirmed_slot(&self, slot: Slot) -> Arc<Bank> {
             let parent_bank = self.working_bank();
+            let leader = *parent_bank.leader();
+            let child_bank = Bank::new_from_parent(parent_bank, leader, slot);
             let bank = self
                 .bank_forks
                 .write()
                 .unwrap()
-                .insert(Bank::new_from_parent(parent_bank, &Pubkey::default(), slot))
+                .insert(child_bank)
                 .clone_without_scheduler();
 
             let new_block_commitment = BlockCommitmentCache::new(
@@ -6976,11 +6981,13 @@ pub mod tests {
             rent_exempt_amount,
             recent_blockhash,
         );
-        let tx_serialized_encoded = bs58::encode(serialize(&tx).unwrap()).into_string();
+        let tx_serialized_encoded = bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
         tx.signatures[0] = Signature::default();
-        let tx_badsig_serialized_encoded = bs58::encode(serialize(&tx).unwrap()).into_string();
+        let tx_badsig_serialized_encoded =
+            bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
         tx.message.recent_blockhash = Hash::default();
-        let tx_invalid_recent_blockhash = bs58::encode(serialize(&tx).unwrap()).into_string();
+        let tx_invalid_recent_blockhash =
+            bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
 
         // Simulation bank must be frozen
         bank.freeze();
@@ -7366,7 +7373,7 @@ pub mod tests {
         let recent_blockhash = bank.confirmed_last_blockhash();
         let tx =
             system_transaction::transfer(&fee_payer, &token_account_pubkey, 1, recent_blockhash);
-        let tx_serialized_encoded = bs58::encode(serialize(&tx).unwrap()).into_string();
+        let tx_serialized_encoded = bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
 
         // Simulation bank must be frozen
         bank.freeze();
@@ -7487,7 +7494,7 @@ pub mod tests {
             recent_blockhash,
         );
         let tx_serialized_encoded =
-            base64::prelude::BASE64_STANDARD.encode(serialize(&tx).unwrap());
+            base64::prelude::BASE64_STANDARD.encode(wincode::serialize(&tx).unwrap());
 
         // Simulation bank must be frozen
         bank.freeze();
@@ -7678,7 +7685,7 @@ pub mod tests {
 
         let bob_pubkey = Pubkey::new_unique();
         let tx = system_transaction::transfer(&mint_keypair, &bob_pubkey, 1234, recent_blockhash);
-        let tx_serialized_encoded = bs58::encode(serialize(&tx).unwrap()).into_string();
+        let tx_serialized_encoded = bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
 
         assert!(!bank.is_frozen());
 
@@ -7885,7 +7892,7 @@ pub mod tests {
         // sendTransaction will fail because the blockhash is invalid
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["{}"]}}"#,
-            bs58::encode(serialize(&bad_transaction).unwrap()).into_string()
+            bs58::encode(wincode::serialize(&bad_transaction).unwrap()).into_string()
         );
         let res = io.handle_request_sync(&req, meta.clone());
         assert_eq!(
@@ -7901,7 +7908,7 @@ pub mod tests {
         bad_transaction.sign(&[&mint_keypair], recent_blockhash);
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["{}"]}}"#,
-            bs58::encode(serialize(&bad_transaction).unwrap()).into_string()
+            bs58::encode(wincode::serialize(&bad_transaction).unwrap()).into_string()
         );
         let res = io.handle_request_sync(&req, meta.clone());
         assert_eq!(
@@ -7921,7 +7928,7 @@ pub mod tests {
         health.stub_set_health_status(Some(RpcHealthStatus::Behind { num_slots: 42 }));
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["{}"]}}"#,
-            bs58::encode(serialize(&bad_transaction).unwrap()).into_string()
+            bs58::encode(wincode::serialize(&bad_transaction).unwrap()).into_string()
         );
         let res = io.handle_request_sync(&req, meta.clone());
         assert_eq!(
@@ -7937,7 +7944,7 @@ pub mod tests {
 
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["{}"]}}"#,
-            bs58::encode(serialize(&bad_transaction).unwrap()).into_string()
+            bs58::encode(wincode::serialize(&bad_transaction).unwrap()).into_string()
         );
         let res = io.handle_request_sync(&req, meta.clone());
         let expected = json!({
@@ -7975,7 +7982,7 @@ pub mod tests {
         // transaction
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["{}", {{"skipPreflight": true}}]}}"#,
-            bs58::encode(serialize(&bad_transaction).unwrap()).into_string()
+            bs58::encode(wincode::serialize(&bad_transaction).unwrap()).into_string()
         );
         let res = io.handle_request_sync(&req, meta.clone());
         assert_eq!(
@@ -7989,7 +7996,7 @@ pub mod tests {
         bad_transaction.signatures.clear();
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":["{}"]}}"#,
-            bs58::encode(serialize(&bad_transaction).unwrap()).into_string()
+            bs58::encode(wincode::serialize(&bad_transaction).unwrap()).into_string()
         );
         let res = io.handle_request_sync(&req, meta);
         assert_eq!(
@@ -8059,13 +8066,12 @@ pub mod tests {
             ..
         } = create_genesis_config(TEST_MINT_LAMPORTS);
 
-        genesis_config.rent.lamports_per_byte_year = 50;
-        genesis_config.rent.exemption_threshold = 2.0;
+        genesis_config.rent.lamports_per_byte = 100;
         genesis_config.epoch_schedule =
             EpochSchedule::custom(TEST_SLOTS_PER_EPOCH, TEST_SLOTS_PER_EPOCH, false);
         genesis_config.fee_rate_governor = FeeRateGovernor::new(TEST_SIGNATURE_FEE, 0);
 
-        let bank = Bank::new_with_config_for_tests(&genesis_config, config);
+        let bank = Bank::new_with_paths_for_tests(&genesis_config, Some(config), vec![], None);
 
         // Add the test builtin.
         bank.add_builtin(
@@ -8362,7 +8368,7 @@ pub mod tests {
             );
             if let EncodedTransaction::LegacyBinary(transaction) = transaction {
                 let decoded_transaction: Transaction =
-                    deserialize(&bs58::decode(&transaction).into_vec().unwrap()).unwrap();
+                    wincode::deserialize(&bs58::decode(&transaction).into_vec().unwrap()).unwrap();
                 if decoded_transaction.signatures[0] == confirmed_block_signatures[0] {
                     let meta = meta.unwrap();
                     assert_eq!(meta.status, Ok(()));
@@ -9898,13 +9904,13 @@ pub mod tests {
 
         let bank_forks = BankForks::new_rw_arc(bank);
         let bank0 = bank_forks.read().unwrap().get(0).unwrap();
-        let bank1 = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
+        let bank1 = Bank::new_from_parent(bank0, SlotLeader::default(), 1);
         bank_forks.write().unwrap().insert(bank1);
         let bank1 = bank_forks.read().unwrap().get(1).unwrap();
-        let bank2 = Bank::new_from_parent(bank1, &Pubkey::default(), 2);
+        let bank2 = Bank::new_from_parent(bank1, SlotLeader::default(), 2);
         bank_forks.write().unwrap().insert(bank2);
         let bank2 = bank_forks.read().unwrap().get(2).unwrap();
-        let bank3 = Bank::new_from_parent(bank2, &Pubkey::default(), 3);
+        let bank3 = Bank::new_from_parent(bank2, SlotLeader::default(), 3);
         bank_forks.write().unwrap().insert(bank3);
 
         let prioritization_fee_cache_inner = None;
@@ -10124,14 +10130,13 @@ pub mod tests {
 
         let tx_ser = vec![0xffu8; PACKET_DATA_SIZE - 2];
         let mut tx64 = BASE64_STANDARD.encode(&tx_ser);
-        assert_eq!(
+        let err =
             decode_and_deserialize::<Transaction>(tx64.clone(), TransactionBinaryEncoding::Base64)
-                .unwrap_err(),
-            Error::invalid_params(
-                "failed to deserialize solana_transaction::Transaction: invalid value: continue \
-                 signal on byte-three, expected a terminal signal on or before byte-three"
-                    .to_string()
-            )
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams,);
+        assert!(
+            err.message
+                .starts_with("failed to deserialize solana_transaction::Transaction")
         );
 
         tx64.push('!');
@@ -10142,14 +10147,13 @@ pub mod tests {
         );
 
         let mut tx58 = bs58::encode(&tx_ser).into_string();
-        assert_eq!(
+        let err =
             decode_and_deserialize::<Transaction>(tx58.clone(), TransactionBinaryEncoding::Base58)
-                .unwrap_err(),
-            Error::invalid_params(
-                "failed to deserialize solana_transaction::Transaction: invalid value: continue \
-                 signal on byte-three, expected a terminal signal on or before byte-three"
-                    .to_string()
-            )
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidParams,);
+        assert!(
+            err.message
+                .starts_with("failed to deserialize solana_transaction::Transaction")
         );
 
         tx58.push('!');
@@ -10187,7 +10191,6 @@ pub mod tests {
                 SimpleAddressLoader::Disabled,
                 &ReservedAccountKeys::empty_key_set(),
                 true,
-                true,
             )
             .unwrap_err(),
             expect58
@@ -10214,7 +10217,6 @@ pub mod tests {
                 SimpleAddressLoader::Disabled,
                 &ReservedAccountKeys::empty_key_set(),
                 true,
-                true,
             )
             .unwrap_err(),
             Error::invalid_params(
@@ -10228,8 +10230,7 @@ pub mod tests {
         let rpc = RpcHandler::start();
         let bank = rpc.working_bank();
         let expected_stake_minimum_delegation = stake_utils::get_minimum_delegation(
-            bank.feature_set
-                .is_active(&agave_feature_set::upgrade_bpf_stake_program_to_v5::id()),
+            bank.feature_set.snapshot().upgrade_bpf_stake_program_to_v5,
         );
 
         let request = create_test_request("getStakeMinimumDelegation", None);
@@ -10265,7 +10266,7 @@ pub mod tests {
             let request = create_test_request(
                 "getFeeForMessage",
                 Some(json!([
-                    BASE64_STANDARD.encode(serialize(&legacy_msg).unwrap())
+                    BASE64_STANDARD.encode(wincode::serialize(&legacy_msg).unwrap())
                 ])),
             );
             let response: RpcResponse<u64> = parse_success_result(rpc.handle_request_sync(request));
@@ -10285,7 +10286,9 @@ pub mod tests {
 
             let request = create_test_request(
                 "getFeeForMessage",
-                Some(json!([BASE64_STANDARD.encode(serialize(&v0_msg).unwrap())])),
+                Some(json!([
+                    BASE64_STANDARD.encode(wincode::serialize(&v0_msg).unwrap())
+                ])),
             );
             let response: RpcResponse<u64> = parse_success_result(rpc.handle_request_sync(request));
             assert_eq!(response.value, TEST_SIGNATURE_FEE);
@@ -10309,6 +10312,15 @@ pub mod tests {
             assert_eq!(expected, actual);
         }
 
+        fn get_effective_price(price: u64, transaction_cu_limit: u64) -> u64 {
+            price
+                .saturating_mul(transaction_cu_limit) // fee in micro lamports
+                .div_ceil(1_000_000) // fee in lamports rounded up
+                .saturating_mul(1_000_000) // fee in micro-lamports rounded up
+                .checked_div(transaction_cu_limit) // effective price in micro-lamports per CU
+                .unwrap_or(0)
+        }
+
         let rpc = RpcHandler::start();
         assert_eq!(
             rpc.get_prioritization_fee_cache().available_block_count(),
@@ -10319,7 +10331,9 @@ pub mod tests {
         let account0 = Pubkey::new_unique();
         let account1 = Pubkey::new_unique();
         let account2 = Pubkey::new_unique();
-        let price0 = 42;
+        let price0 = 42u64;
+        let transaction_cu_limit = 6_000;
+        let effective_price0 = get_effective_price(price0, transaction_cu_limit);
         let transactions = vec![
             Transaction::new_unsigned(Message::new(
                 &[
@@ -10359,7 +10373,7 @@ pub mod tests {
             &mut response,
             &mut vec![RpcPrioritizationFee {
                 slot: slot0,
-                prioritization_fee: price0,
+                prioritization_fee: effective_price0,
             }],
         );
 
@@ -10381,6 +10395,7 @@ pub mod tests {
         let slot1 = rpc.working_bank().slot();
         let bank1_id = rpc.working_bank().bank_id();
         let price1 = 11;
+        let effective_price1 = get_effective_price(price1, transaction_cu_limit);
         let transactions = vec![
             Transaction::new_unsigned(Message::new(
                 &[
@@ -10427,7 +10442,7 @@ pub mod tests {
             &mut vec![
                 RpcPrioritizationFee {
                     slot: slot0,
-                    prioritization_fee: price0,
+                    prioritization_fee: effective_price0,
                 },
                 RpcPrioritizationFee {
                     slot: slot1,
@@ -10451,7 +10466,7 @@ pub mod tests {
                 },
                 RpcPrioritizationFee {
                     slot: slot1,
-                    prioritization_fee: price1,
+                    prioritization_fee: effective_price1,
                 },
             ],
         );

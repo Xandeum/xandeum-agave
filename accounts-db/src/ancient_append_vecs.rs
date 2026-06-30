@@ -61,7 +61,7 @@ struct SlotInfo {
     slot: Slot,
     /// total capacity of storage
     capacity: u64,
-    /// # alive bytes in storage
+    /// # alive bytes in storage *after* shrinking
     alive_bytes: u64,
     /// true if this should be shrunk due to ratio
     should_shrink: bool,
@@ -95,14 +95,14 @@ impl AncientSlotInfos {
         &mut self,
         slot: Slot,
         storage: Arc<AccountStorageEntry>,
+        alive_bytes_after_shrink: u64,
         can_randomly_shrink: bool,
         ideal_size: NonZeroU64,
         is_high_slot: bool,
         is_candidate_for_shrink: bool,
     ) -> bool {
         let mut was_randomly_shrunk = false;
-        let alive_bytes = storage.alive_bytes() as u64;
-        if alive_bytes > 0 {
+        if alive_bytes_after_shrink > 0 {
             let capacity = storage.accounts.capacity();
             let should_shrink = if capacity > 0 {
                 if is_candidate_for_shrink {
@@ -123,11 +123,11 @@ impl AncientSlotInfos {
             if should_shrink {
                 // alive ratio is too low, so prioritize combining this slot with others
                 // to reduce disk space used
-                self.total_alive_bytes_shrink += alive_bytes;
+                self.total_alive_bytes_shrink += alive_bytes_after_shrink;
                 self.shrink_indexes.push(self.all_infos.len());
             } else {
                 let already_ideal_size = u64::from(ideal_size) * 80 / 100;
-                if alive_bytes > already_ideal_size {
+                if alive_bytes_after_shrink > already_ideal_size {
                     // do not include this append vec at all. It is already ideal size and not a candidate for shrink.
                     return was_randomly_shrunk;
                 }
@@ -136,11 +136,11 @@ impl AncientSlotInfos {
                 slot,
                 capacity,
                 storage,
-                alive_bytes,
+                alive_bytes: alive_bytes_after_shrink,
                 should_shrink,
                 is_high_slot,
             });
-            self.total_alive_bytes += alive_bytes;
+            self.total_alive_bytes += alive_bytes_after_shrink;
         }
         was_randomly_shrunk
     }
@@ -557,8 +557,12 @@ impl AccountsDb {
         write_ancient_accounts: &mut WriteAncientAccounts<'b>,
     ) {
         let target_slot = accounts_to_write.target_slot();
+        let old_store = self
+            .storage
+            .get_slot_storage_entry_shrinking_in_progress_ok(target_slot)
+            .expect("ancient shrink target slot must already have a storage");
         let (shrink_in_progress, create_and_insert_store_elapsed_us) =
-            measure_us!(self.get_store_for_shrink(target_slot, bytes));
+            measure_us!(self.get_store_for_shrink(target_slot, old_store, bytes));
         let (store_accounts_timing, rewrite_elapsed_us) = measure_us!(self.store_accounts_frozen(
             accounts_to_write,
             shrink_in_progress.new_storage(),
@@ -597,9 +601,11 @@ impl AccountsDb {
         for slot in &slots {
             if let Some(storage) = self.storage.get_slot_storage_entry(*slot) {
                 let is_candidate_for_shrink = self.is_candidate_for_shrink(&storage);
+                let alive_bytes_after_shrink = self.alive_bytes_after_shrink(&storage) as u64;
                 if infos.add(
                     *slot,
                     storage,
+                    alive_bytes_after_shrink,
                     tuning.can_randomly_shrink,
                     tuning.ideal_storage_size,
                     is_high_slot(*slot),
@@ -1584,9 +1590,13 @@ mod tests {
                         if all_slots_shrunk {
                             // make it look like each of the slots was shrunk
                             slots.clone().for_each(|slot| {
+                                let old_store = db
+                                    .storage
+                                    .get_slot_storage_entry_shrinking_in_progress_ok(slot)
+                                    .unwrap();
                                 write_ancient_accounts
                                     .shrinks_in_progress
-                                    .insert(slot, db.get_store_for_shrink(slot, 1));
+                                    .insert(slot, db.get_store_for_shrink(slot, old_store, 1));
                             });
                         }
 
@@ -1682,10 +1692,8 @@ mod tests {
                             .map(|store| db.get_unique_accounts_from_storage(store))
                             .collect::<Vec<_>>();
 
-                        let mut accounts_per_storage = infos
-                            .iter()
-                            .zip(original_results.into_iter())
-                            .collect::<Vec<_>>();
+                        let mut accounts_per_storage =
+                            infos.iter().zip(original_results).collect::<Vec<_>>();
 
                         let accounts_to_combine = db.calc_accounts_to_combine(
                             &mut accounts_per_storage,
@@ -1815,10 +1823,8 @@ mod tests {
                                     .map(|store| db.get_unique_accounts_from_storage(store))
                                     .collect::<Vec<_>>();
 
-                                let mut accounts_per_storage = infos
-                                    .iter()
-                                    .zip(original_results.into_iter())
-                                    .collect::<Vec<_>>();
+                                let mut accounts_per_storage =
+                                    infos.iter().zip(original_results).collect::<Vec<_>>();
 
                                 let accounts_to_combine = db.calc_accounts_to_combine(
                                     &mut accounts_per_storage,
@@ -2015,10 +2021,7 @@ mod tests {
                 .map(|store| db.get_unique_accounts_from_storage(store))
                 .collect::<Vec<_>>();
             assert_eq!(original_results.first().unwrap().stored_accounts.len(), 2);
-            let mut accounts_per_storage = infos
-                .iter()
-                .zip(original_results.into_iter())
-                .collect::<Vec<_>>();
+            let mut accounts_per_storage = infos.iter().zip(original_results).collect::<Vec<_>>();
 
             let accounts_to_combine = db.calc_accounts_to_combine(
                 &mut accounts_per_storage,
@@ -2210,10 +2213,7 @@ mod tests {
                 .map(|store| db.get_unique_accounts_from_storage(store))
                 .collect::<Vec<_>>();
             assert_eq!(original_results.first().unwrap().stored_accounts.len(), 2);
-            let mut accounts_per_storage = infos
-                .iter()
-                .zip(original_results.into_iter())
-                .collect::<Vec<_>>();
+            let mut accounts_per_storage = infos.iter().zip(original_results).collect::<Vec<_>>();
 
             let accounts_to_combine = db.calc_accounts_to_combine(
                 &mut accounts_per_storage,
@@ -2375,11 +2375,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_ancient_append_vec_capacity() {
-        assert_eq!(get_ancient_append_vec_capacity(), 128 * 1024 * 1024);
-    }
-
     fn get_one_packed_ancient_append_vec_and_others(
         alive: bool,
         num_normal_slots: usize,
@@ -2447,6 +2442,7 @@ mod tests {
                         infos.add(
                             slot1,
                             Arc::clone(&storage),
+                            db.alive_bytes_after_shrink(&storage) as u64,
                             can_randomly_shrink,
                             NonZeroU64::new(get_ancient_append_vec_capacity()).unwrap(),
                             high_slot,
@@ -2502,6 +2498,7 @@ mod tests {
                 infos.add(
                     slot1,
                     Arc::clone(&storage),
+                    db.alive_bytes_after_shrink(&storage) as u64,
                     can_randomly_shrink,
                     NonZeroU64::new(get_ancient_append_vec_capacity()).unwrap(),
                     high_slot,

@@ -229,6 +229,7 @@ impl RpcSender for MockSender {
                                         stack_height: Some(TRANSACTION_LEVEL_STACK_HEIGHT as u32),
                                     }],
                                     address_table_lookups: None,
+                                    transaction_config: None,
                                 })
                         }),
                     meta: Some(UiTransactionStatusMeta {
@@ -326,7 +327,8 @@ impl RpcSender for MockSender {
                         vote_pubkey: PUBKEY.to_string(),
                         node_pubkey: PUBKEY.to_string(),
                         activated_stake: 0,
-                        commission: 0,
+                        commission: 100,
+                        inflation_rewards_commission_bps: Some(10_000), // 100 * 100
                         epoch_vote_account: false,
                         epoch_credits: vec![],
                         last_vote: 0,

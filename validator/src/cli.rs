@@ -18,6 +18,7 @@ use {
         hidden_unless_forced,
         input_validators::{
             is_parsable, is_pubkey, is_pubkey_or_keypair, is_slot, is_url_or_moniker,
+            validate_cpu_ranges,
         },
     },
     solana_clock::Slot,
@@ -129,12 +130,57 @@ fn deprecated_arguments() -> Vec<DeprecatedArg> {
     }
 
     add_arg!(
+        // deprecated in v4.1.0
+        Arg::with_name("account_shrink_path")
+            .long("account-shrink-path")
+            .value_name("PATH")
+            .takes_value(true)
+            .multiple(true)
+            .help("Path to accounts shrink path which can hold a compacted account set."),
+    );
+    add_arg!(
         // deprecated in v4.0.0
         Arg::with_name("enable_accounts_disk_index")
             .long("enable-accounts-disk-index")
             .help("Enables the disk-based accounts index")
             .conflicts_with("accounts_index_limit"),
         replaced_by: "accounts-index-limit",
+    );
+    add_arg!(
+        // deprecated in v4.1.0
+        Arg::with_name("experimental_retransmit_xdp_cpu_cores")
+            .long("experimental-retransmit-xdp-cpu-cores")
+            .takes_value(true)
+            .value_name("CPU_LIST")
+            .conflicts_with("xdp_cpu_cores")
+            .validator(|value| {
+                validate_cpu_ranges(value, "--experimental-retransmit-xdp-cpu-cores")
+            })
+            .help(
+                "Enable XDP retransmit on the specified CPU cores. Use --xdp-cpu-cores instead",
+            ),
+        replaced_by: "xdp-cpu-cores",
+    );
+    add_arg!(
+        // deprecated in v4.1.0
+        Arg::with_name("experimental_retransmit_xdp_interface")
+            .long("experimental-retransmit-xdp-interface")
+            .takes_value(true)
+            .value_name("INTERFACE")
+            .conflicts_with("xdp_interface")
+            .requires("experimental_retransmit_xdp_cpu_cores")
+            .help("Network interface to use for XDP retransmit. Use --xdp-interface instead"),
+        replaced_by: "xdp-interface",
+    );
+    add_arg!(
+        // deprecated in v4.1.0
+        Arg::with_name("experimental_retransmit_xdp_zero_copy")
+            .long("experimental-retransmit-xdp-zero-copy")
+            .takes_value(false)
+            .conflicts_with("xdp_zero_copy")
+            .requires("experimental_retransmit_xdp_cpu_cores")
+            .help("Enable XDP zero copy. Use --xdp-zero-copy instead"),
+        replaced_by: "xdp-zero-copy",
     );
     add_arg!(
         // deprecated in v4.0.0
@@ -608,7 +654,7 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 .validator(solana_net_utils::is_host)
                 .default_value("127.0.0.1")
                 .help(
-                    "IP address to bind the validator ports. Can be repeated. The first \
+                    "IPv4 address to bind the validator ports. Can be repeated. The first \
                      --bind-address MUST be your public internet address. ALL protocols (gossip, \
                      repair, IP echo, TVU, TPU, etc.) bind to this address on startup. Additional \
                      --bind-address values enable multihoming for Gossip/TVU/TPU - these \

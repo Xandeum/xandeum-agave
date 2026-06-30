@@ -28,6 +28,7 @@ log-*/
 .idea/
 /solana.iml
 /.vscode/
+/.zed/
 
 # fetch-core-bpf.sh artifacts
 /core-bpf-genesis-args.sh

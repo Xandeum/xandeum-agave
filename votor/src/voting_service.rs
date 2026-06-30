@@ -23,7 +23,10 @@ use {
 };
 
 const STAKED_VALIDATORS_CACHE_TTL_S: u64 = 5;
-const STAKED_VALIDATORS_CACHE_NUM_EPOCH_CAP: usize = 5;
+/// Target number of epochs to keep in the staked validators cache. Due to lazy-lru eviction
+/// semantics, the cache may hold up to `2 * STAKED_VALIDATORS_CACHE_NUM_EPOCH_TARGET` entries
+/// before evicting down to this target.
+const STAKED_VALIDATORS_CACHE_NUM_EPOCH_TARGET: usize = 3;
 
 #[derive(Debug)]
 pub enum BLSOp {
@@ -135,7 +138,7 @@ impl VotingService {
                 let mut staked_validators_cache = StakedValidatorsCache::new(
                     bank_forks.clone(),
                     Duration::from_secs(STAKED_VALIDATORS_CACHE_TTL_S),
-                    STAKED_VALIDATORS_CACHE_NUM_EPOCH_CAP,
+                    STAKED_VALIDATORS_CACHE_NUM_EPOCH_TARGET,
                     false,
                     alpenglow_port_override,
                 );
@@ -251,7 +254,7 @@ mod tests {
             consensus_message::{Certificate, CertificateType, ConsensusMessage, VoteMessage},
             vote::Vote,
         },
-        solana_bls_signatures::Signature as BLSSignature,
+        solana_bls_signatures::{BLS_SIGNATURE_AFFINE_SIZE, Signature as BLSSignature},
         solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
         solana_keypair::Keypair,
         solana_net_utils::{SocketAddrSpace, sockets::bind_to_localhost_unique},
@@ -265,7 +268,7 @@ mod tests {
         solana_signer::Signer,
         solana_streamer::{
             nonblocking::swqos::SwQosConfig,
-            quic::{QuicStreamerConfig, SpawnServerResult, spawn_stake_wighted_qos_server},
+            quic::{QuicStreamerConfig, SpawnServerResult, spawn_stake_weighted_qos_server},
             streamer::StakedNodes,
         },
         std::{
@@ -321,25 +324,25 @@ mod tests {
     #[test_case(BLSOp::PushVote {
         message: Arc::new(ConsensusMessage::Vote(VoteMessage {
             vote: Vote::new_skip_vote(5),
-            signature: BLSSignature::default(),
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
             rank: 1,
         })),
         slot: 5,
         saved_vote_history: SavedVoteHistoryVersions::Current(SavedVoteHistory::default()),
     }, ConsensusMessage::Vote(VoteMessage {
         vote: Vote::new_skip_vote(5),
-        signature: BLSSignature::default(),
+        signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
         rank: 1,
     }))]
     #[test_case(BLSOp::PushCertificate {
         certificate: Arc::new(Certificate {
             cert_type: CertificateType::Skip(5),
-            signature: BLSSignature::default(),
+            signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
             bitmap: Vec::new(),
         }),
     }, ConsensusMessage::Certificate(Certificate {
         cert_type: CertificateType::Skip(5),
-        signature: BLSSignature::default(),
+        signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
         bitmap: Vec::new(),
     }))]
     fn test_send_message(bls_op: BLSOp, expected_message: ConsensusMessage) {
@@ -372,10 +375,10 @@ mod tests {
             endpoints: _,
             thread: quic_server_thread,
             key_updater: _,
-        } = spawn_stake_wighted_qos_server(
+        } = spawn_stake_weighted_qos_server(
             "AlpenglowLocalClusterTest",
             "voting_service_test",
-            [socket],
+            [socket.into()],
             &Keypair::new(),
             sender,
             staked_nodes,

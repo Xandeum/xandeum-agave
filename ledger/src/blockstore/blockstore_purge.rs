@@ -138,12 +138,29 @@ impl Blockstore {
     /// that preserves `slot`'s `next_slots`. This ensures that `slot`'s fork is
     /// replayable upon repair of `slot`.
     pub(crate) fn purge_slot_cleanup_chaining(&self, slot: Slot) -> Result<()> {
+        self.do_purge_slot_cleanup_chaining(slot, /* purge_alt_columns */ true)
+    }
+
+    /// Like `purge_slot_cleanup_chaining` but preserves alternate block columns.
+    /// Used when switching from an alternate block to allow repair data to be retained.
+    #[allow(dead_code)]
+    pub(crate) fn purge_slot_cleanup_chaining_keep_alt(&self, slot: Slot) -> Result<()> {
+        self.do_purge_slot_cleanup_chaining(slot, /* purge_alt_columns */ false)
+    }
+
+    fn do_purge_slot_cleanup_chaining(&self, slot: Slot, purge_alt_columns: bool) -> Result<()> {
         let Some(mut slot_meta) = self.meta(slot)? else {
             return Err(BlockstoreError::SlotUnavailable);
         };
         let mut write_batch = self.get_write_batch()?;
 
-        self.purge_range(&mut write_batch, slot, slot, PurgeType::Exact)?;
+        self.purge_range(
+            &mut write_batch,
+            slot,
+            slot,
+            PurgeType::Exact,
+            purge_alt_columns,
+        )?;
 
         if let Some(parent_slot) = slot_meta.parent_slot {
             let parent_slot_meta = self.meta(parent_slot)?;
@@ -194,7 +211,13 @@ impl Blockstore {
         let mut write_batch = self.get_write_batch()?;
 
         let mut delete_range_timer = Measure::start("delete_range");
-        self.purge_range(&mut write_batch, from_slot, to_slot, purge_type)?;
+        self.purge_range(
+            &mut write_batch,
+            from_slot,
+            to_slot,
+            purge_type,
+            /* purge_alt_columns */ true,
+        )?;
         delete_range_timer.stop();
 
         let mut write_timer = Measure::start("write_batch");
@@ -236,39 +259,65 @@ impl Blockstore {
         from_slot: Slot,
         to_slot: Slot,
         purge_type: PurgeType,
+        purge_alt_columns: bool,
     ) -> Result<()> {
         self.meta_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.bank_hash_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.roots_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.data_shred_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.code_shred_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.dead_slots_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.duplicate_slots_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.erasure_meta_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.orphans_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.index_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.rewards_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.blocktime_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.perf_samples_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.block_height_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.optimistic_slots_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
         self.merkle_root_meta_cf
-            .delete_range_in_batch(write_batch, from_slot, to_slot)?;
+            .delete_range_in_batch(write_batch, from_slot, to_slot);
+
+        if purge_alt_columns {
+            // Purge all alternate columns
+            self.alt_meta_cf
+                .delete_range_in_batch(write_batch, from_slot, to_slot);
+            self.alt_index_cf
+                .delete_range_in_batch(write_batch, from_slot, to_slot);
+            self.alt_data_shred_cf
+                .delete_range_in_batch(write_batch, from_slot, to_slot);
+            self.alt_merkle_root_meta_cf
+                .delete_range_in_batch(write_batch, from_slot, to_slot);
+            // This column stores information for both the original and alternate
+            // columns. When `purge_alt_columns` is specified we delete the
+            // entire column.
+            self.double_merkle_meta_cf
+                .delete_range_in_batch(write_batch, from_slot, to_slot);
+        } else {
+            // This column stores information for both the original and alternate
+            // locations. When `purge_alt_columns` is not specified we only delete the
+            // data associated with the original column.
+            for slot in from_slot..=to_slot {
+                self.double_merkle_meta_cf
+                    .delete_in_batch(write_batch, (slot, BlockLocation::Original));
+            }
+        }
 
         match purge_type {
             PurgeType::Exact => self.purge_special_columns_exact(write_batch, from_slot, to_slot),
@@ -307,6 +356,14 @@ impl Blockstore {
         self.optimistic_slots_cf
             .delete_file_in_range(from_slot, to_slot)?;
         self.merkle_root_meta_cf
+            .delete_file_in_range(from_slot, to_slot)?;
+        self.alt_meta_cf.delete_file_in_range(from_slot, to_slot)?;
+        self.alt_index_cf.delete_file_in_range(from_slot, to_slot)?;
+        self.alt_data_shred_cf
+            .delete_file_in_range(from_slot, to_slot)?;
+        self.alt_merkle_root_meta_cf
+            .delete_file_in_range(from_slot, to_slot)?;
+        self.double_merkle_meta_cf
             .delete_file_in_range(from_slot, to_slot)
     }
 
@@ -359,9 +416,9 @@ impl Blockstore {
             for (i, transaction) in transactions.enumerate() {
                 if let Some(&signature) = transaction.signatures.first() {
                     self.transaction_status_cf
-                        .delete_in_batch(batch, (signature, slot))?;
+                        .delete_in_batch(batch, (signature, slot));
                     self.transaction_memos_cf
-                        .delete_in_batch(batch, (signature, slot))?;
+                        .delete_in_batch(batch, (signature, slot));
 
                     let meta = self.read_transaction_status((signature, slot))?;
                     let loaded_addresses = meta.map(|meta| meta.loaded_addresses);
@@ -373,10 +430,8 @@ impl Blockstore {
                     let transaction_index =
                         u32::try_from(i).map_err(|_| BlockstoreError::TransactionIndexOverflow)?;
                     for pubkey in account_keys.iter() {
-                        self.address_signatures_cf.delete_in_batch(
-                            batch,
-                            (*pubkey, slot, transaction_index, signature),
-                        )?;
+                        self.address_signatures_cf
+                            .delete_in_batch(batch, (*pubkey, slot, transaction_index, signature));
                     }
                 }
             }

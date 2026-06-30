@@ -131,7 +131,10 @@
 /// ```
 use {
     crate::entry::{Entry, MaxDataShredsLen},
-    agave_votor_messages::consensus_message::{Certificate, CertificateType},
+    agave_votor_messages::{
+        consensus_message::{Certificate, CertificateType},
+        reward_certificate::{NotarRewardCertificate, SkipRewardCertificate},
+    },
     solana_bls_signatures::{
         BlsError, Signature as BLSSignature, SignatureCompressed as BLSSignatureCompressed,
         signature::AsSignatureAffine,
@@ -142,23 +145,21 @@ use {
     wincode::{
         ReadResult, SchemaRead, SchemaWrite, WriteResult,
         config::{Config, DefaultConfig},
-        containers::{Pod, Vec as WincodeVec},
+        containers::Vec as WincodeVec,
         error::write_length_encoding_overflow,
         io::{Reader, Writer},
         len::{BincodeLen, FixIntLen},
+        pod_wrapper,
     },
 };
 
-/// Placeholder for skip reward certificate.
-#[derive(Clone, PartialEq, Eq, Debug, SchemaWrite, SchemaRead)]
-pub struct SkipRewardCertificate {
-    pub data: Vec<u8>,
-}
-
-/// Placeholder for notar reward certificate.
-#[derive(Clone, PartialEq, Eq, Debug, SchemaWrite, SchemaRead)]
-pub struct NotarRewardCertificate {
-    pub data: Vec<u8>,
+pod_wrapper! {
+    // Use `BLSSignature` directly once `BLSSignature` wincode support
+    // is released in solana-sdk.
+    unsafe struct PodBLSSignature(BLSSignature);
+    // Use `BLSSignatureCompressed` directly once `BLSSignature` wincode support
+    // is released in solana-sdk.
+    unsafe struct PodBLSSignatureCompressed(BLSSignatureCompressed);
 }
 
 /// Wraps a value with a u16 length prefix for TLV-style serialization.
@@ -231,7 +232,7 @@ pub struct UpdateParentV1 {
 pub struct GenesisCertificate {
     pub slot: Slot,
     pub block_id: Hash,
-    #[wincode(with = "Pod<BLSSignature>")]
+    #[wincode(with = "PodBLSSignature")]
     pub bls_signature: BLSSignature,
     #[wincode(with = "WincodeVec<u8, BincodeLen>")]
     pub bitmap: Vec<u8>,
@@ -290,7 +291,9 @@ impl FinalCertificate {
             slot: 1234567890,
             block_id: Hash::new_from_array([1u8; 32]),
             final_aggregate: VotesAggregate {
-                signature: BLSSignatureCompressed::default(),
+                signature: BLSSignatureCompressed(
+                    [0; solana_bls_signatures::BLS_SIGNATURE_COMPRESSED_SIZE],
+                ),
                 bitmap: vec![42; 64],
             },
             notar_aggregate: None,
@@ -300,7 +303,7 @@ impl FinalCertificate {
 
 #[derive(Clone, PartialEq, Eq, Debug, SchemaRead, SchemaWrite)]
 pub struct VotesAggregate {
-    #[wincode(with = "Pod<BLSSignatureCompressed>")]
+    #[wincode(with = "PodBLSSignatureCompressed")]
     signature: BLSSignatureCompressed,
     #[wincode(with = "WincodeVec<u8, FixIntLen<u16>>")]
     bitmap: Vec<u8>,
@@ -475,6 +478,14 @@ impl BlockComponent {
         Self::BlockMarker(marker)
     }
 
+    pub fn new_block_header(parent_slot: Slot, parent_block_id: Hash) -> Self {
+        let header = BlockHeaderV1 {
+            parent_slot,
+            parent_block_id,
+        };
+        Self::new_block_marker(VersionedBlockMarker::new_block_header(header))
+    }
+
     pub const fn as_marker(&self) -> Option<&VersionedBlockMarker> {
         match self {
             Self::BlockMarker(m) => Some(m),
@@ -526,25 +537,16 @@ unsafe impl<'de, C: Config> SchemaRead<'de, C> for BlockComponent {
     type Dst = Self;
 
     fn read(mut reader: impl Reader<'de>, dst: &mut MaybeUninit<Self::Dst>) -> ReadResult<()> {
-        // Read the entry count (first 8 bytes) to determine variant
-        let count_bytes = reader.fill_array::<8>()?;
-        let entry_count = u64::from_le_bytes(*count_bytes);
+        let entries =
+            <WincodeVec<Entry, MaxDataShredsLen> as SchemaRead<'de, C>>::get(reader.by_ref())?;
 
-        if entry_count == 0 {
-            // This is a BlockMarker - consume the count bytes and read the marker
-            // SAFETY: fill_array::<8>() above guarantees at least 8 bytes are available
-            unsafe { reader.consume_unchecked(8) };
+        if entries.is_empty() {
             dst.write(Self::BlockMarker(<VersionedBlockMarker as SchemaRead<
                 C,
             >>::get(reader)?));
+        } else if entries.len() >= Self::MAX_ENTRIES {
+            return Err(wincode::ReadError::Custom("Too many entries"));
         } else {
-            let entries: Vec<Entry> =
-                <WincodeVec<Entry, MaxDataShredsLen> as SchemaRead<'de, C>>::get(reader)?;
-
-            if entries.len() >= Self::MAX_ENTRIES {
-                return Err(wincode::ReadError::Custom("Too many entries"));
-            }
-
             dst.write(Self::EntryBatch(entries));
         }
 
@@ -554,7 +556,10 @@ unsafe impl<'de, C: Config> SchemaRead<'de, C> for BlockComponent {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, std::iter::repeat_n, wincode::config::DEFAULT_PREALLOCATION_SIZE_LIMIT};
+    use {
+        super::*, solana_bls_signatures::BLS_SIGNATURE_AFFINE_SIZE, std::iter::repeat_n,
+        wincode::config::DEFAULT_PREALLOCATION_SIZE_LIMIT,
+    };
 
     fn mock_entries(n: usize) -> Vec<Entry> {
         repeat_n(Entry::default(), n).collect()
@@ -593,7 +598,7 @@ mod tests {
         let cert = GenesisCertificate {
             slot: 999,
             block_id: Hash::new_unique(),
-            bls_signature: BLSSignature::default(),
+            bls_signature: BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
             bitmap: vec![1, 2, 3],
         };
         let bytes = wincode::serialize(&cert).unwrap();

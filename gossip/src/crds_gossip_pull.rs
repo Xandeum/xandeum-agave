@@ -90,8 +90,18 @@ impl solana_sanitize::Sanitize for CrdsFilter {
 }
 
 impl CrdsFilter {
-    #[cfg(test)]
-    pub(crate) fn new_rand(num_items: usize, max_bytes: usize) -> Self {
+    #[cfg(any(test, feature = "dev-context-only-utils"))]
+    pub(crate) fn mask(&self) -> u64 {
+        self.mask
+    }
+
+    #[cfg(any(test, feature = "dev-context-only-utils"))]
+    pub(crate) fn get_mask_bits(&self) -> u32 {
+        self.mask_bits
+    }
+
+    #[cfg(any(test, feature = "dev-context-only-utils"))]
+    pub fn new_rand(num_items: usize, max_bytes: usize) -> Self {
         let max_bits = (max_bytes * 8) as f64;
         let max_items = Self::max_items(max_bits, FALSE_RATE, KEYS);
         let mask_bits = Self::mask_bits(num_items as f64, max_items);
@@ -286,26 +296,25 @@ impl CrdsGossipPull {
             .get(&self_keypair.pubkey())
             .copied()
             .unwrap_or_default();
-        let (weights, nodes): (Vec<u64>, Vec<ContactInfo>) =
-            crds_gossip::dedup_gossip_addresses(nodes, stakes)
-                .into_values()
-                .map(|(stake, node)| {
+        let (weights, gossips): (Vec<u64>, Vec<SocketAddr>) =
+            crds_gossip::dedup_gossip_addresses(nodes)
+                .into_iter()
+                .map(|(gossip, stake, _pubkey)| {
                     let stake = stake.min(stake_cap) / LAMPORTS_PER_SOL;
                     let weight = u64::BITS - stake.leading_zeros();
                     let weight = u64::from(weight).saturating_add(1).saturating_pow(2);
-                    (weight, node)
+                    (weight, gossip)
                 })
                 .unzip();
-        if nodes.is_empty() {
+        if gossips.is_empty() {
             return Err(CrdsGossipError::NoPeers);
         }
         let filters = self.build_crds_filters(thread_pool, crds, bloom_size);
         // Associate each pull-request filter with a randomly selected peer.
         let dist = WeightedIndex::new(weights).unwrap();
-        Ok(filters.into_iter().filter_map(move |filter| {
-            let node = &nodes[dist.sample(&mut rng)];
-            Some((node.gossip()?, filter))
-        }))
+        Ok(filters
+            .into_iter()
+            .map(move |filter| (gossips[dist.sample(&mut rng)], filter)))
     }
 
     /// Create gossip responses to pull requests
@@ -316,7 +325,6 @@ impl CrdsGossipPull {
         output_size_limit: usize, // Limit number of crds values returned.
         now: u64,
         should_retain_crds_value: impl Fn(&CrdsValue) -> bool + Sync,
-        self_shred_version: u16,
         stats: &GossipStats,
     ) -> Vec<Vec<CrdsValue>> {
         Self::filter_crds_values(
@@ -326,7 +334,6 @@ impl CrdsGossipPull {
             output_size_limit,
             now,
             should_retain_crds_value,
-            self_shred_version,
             stats,
         )
     }
@@ -475,7 +482,6 @@ impl CrdsGossipPull {
         now: u64,
         // Predicate returning false if the CRDS value should be discarded.
         should_retain_crds_value: impl Fn(&CrdsValue) -> bool + Sync,
-        self_shred_version: u16,
         stats: &GossipStats,
     ) -> Vec<Vec<CrdsValue>> {
         let msg_timeout = CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS;
@@ -511,7 +517,7 @@ impl CrdsGossipPull {
                 }
             };
             let out: Vec<_> = crds
-                .filter_bitmask(filter.mask, filter.mask_bits, self_shred_version)
+                .filter_bitmask(filter.mask, filter.mask_bits)
                 .filter(pred)
                 .map(|entry| entry.value.clone())
                 .take(output_size_limit.load(Ordering::Relaxed).max(0) as usize)
@@ -573,11 +579,7 @@ impl CrdsGossipPull {
             now,
             &mut stats,
         );
-        (
-            stats.failed_timeout + stats.failed_insert,
-            stats.failed_timeout,
-            stats.success,
-        )
+        (stats.failed_insert, stats.failed_timeout, stats.success)
     }
 }
 
@@ -675,10 +677,7 @@ pub(crate) fn get_max_bloom_filter_bytes(caller: &CrdsValue) -> usize {
 pub(crate) mod tests {
     use {
         super::*,
-        crate::{
-            crds_data::{CrdsData, Vote},
-            protocol::Protocol,
-        },
+        crate::{crds_data::CrdsData, protocol::Protocol},
         itertools::Itertools,
         rand::{SeedableRng, prelude::IndexedRandom as _},
         rand_chacha::ChaChaRng,
@@ -686,7 +685,6 @@ pub(crate) mod tests {
         solana_hash::HASH_BYTES,
         solana_keypair::keypair_from_seed,
         solana_packet::PACKET_DATA_SIZE,
-        solana_perf::test_tx::new_test_vote_tx,
         solana_sha256_hasher::hash,
         solana_time_utils::timestamp,
         std::{
@@ -1134,7 +1132,6 @@ pub(crate) mod tests {
             usize::MAX, // output_size_limit
             now,
             |_| true, // should_retain_crds_value
-            0,        // self_shred_version
             &GossipStats::default(),
         );
 
@@ -1159,7 +1156,6 @@ pub(crate) mod tests {
             usize::MAX, // output_size_limit
             now,
             |_| true, // should_retain_crds_value
-            0,        // self_shred_version
             &GossipStats::default(),
         );
         assert_eq!(rsp[0].len(), 0);
@@ -1186,7 +1182,6 @@ pub(crate) mod tests {
             usize::MAX, // output_size_limit
             now,
             |_| true, // should_retain_crds_value
-            0,        // self_shred_version
             &GossipStats::default(),
         );
         assert_eq!(rsp.len(), 2 * MIN_NUM_BLOOM_FILTERS);
@@ -1280,7 +1275,6 @@ pub(crate) mod tests {
                 usize::MAX, // output_size_limit
                 0,          // now
                 |_| true,   // should_retain_crds_value
-                0,          // self_shred_version
                 &GossipStats::default(),
             );
             // if there is a false positive this is empty
@@ -1450,87 +1444,6 @@ pub(crate) mod tests {
                 .count(),
             2u64.pow(mask_bits) as usize
         )
-    }
-
-    #[test]
-    fn test_process_pull_response() {
-        let mut rng = rand::rng();
-        let node_crds = RwLock::<Crds>::default();
-        let node = CrdsGossipPull::default();
-
-        let peer_pubkey = solana_pubkey::new_rand();
-        let peer_entry =
-            CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(&peer_pubkey, 0)));
-        let stakes = HashMap::from([(peer_pubkey, 1u64)]);
-        let timeouts = CrdsTimeouts::new(
-            Pubkey::new_unique(),
-            node.crds_timeout, // default_timeout
-            Duration::from_millis(node.crds_timeout + 1),
-            &stakes,
-        );
-        // inserting a fresh value should be fine.
-        assert_eq!(
-            node.process_pull_response(&node_crds, &timeouts, vec![peer_entry.clone()], 1,)
-                .0,
-            0
-        );
-
-        let node_crds = RwLock::<Crds>::default();
-        let unstaked_peer_entry =
-            CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(&peer_pubkey, 0)));
-        // check that old contact infos fail if they are too old, regardless of "timeouts"
-        assert_eq!(
-            node.process_pull_response(
-                &node_crds,
-                &timeouts,
-                vec![peer_entry.clone(), unstaked_peer_entry],
-                node.crds_timeout + 100,
-            )
-            .0,
-            4
-        );
-
-        let node_crds = RwLock::<Crds>::default();
-        // check that old contact infos can still land as long as they have a "timeouts" entry
-        assert_eq!(
-            node.process_pull_response(
-                &node_crds,
-                &timeouts,
-                vec![peer_entry],
-                node.crds_timeout + 1,
-            )
-            .0,
-            0
-        );
-
-        // construct something that's not a contact info
-        let peer_vote = Vote::new(peer_pubkey, new_test_vote_tx(&mut rng), 0).unwrap();
-        let peer_vote = CrdsValue::new_unsigned(CrdsData::Vote(0, peer_vote));
-        // check that older CrdsValues (non-ContactInfos) infos pass even if are too old,
-        // but a recent contact info (inserted above) exists
-        assert_eq!(
-            node.process_pull_response(
-                &node_crds,
-                &timeouts,
-                vec![peer_vote.clone()],
-                node.crds_timeout + 1,
-            )
-            .0,
-            0
-        );
-
-        let node_crds = RwLock::<Crds>::default();
-        // without a contact info, inserting an old value should fail
-        assert_eq!(
-            node.process_pull_response(
-                &node_crds,
-                &timeouts,
-                vec![peer_vote],
-                node.crds_timeout + 2,
-            )
-            .0,
-            2
-        );
     }
 
     // Asserts that all bincode serialized pull requests fit in a Packet.

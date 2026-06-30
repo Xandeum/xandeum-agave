@@ -1,7 +1,7 @@
 use {
     crate::bank::Bank,
     solana_clock::{Epoch, Slot},
-    solana_program_runtime::loaded_programs::ProgramCacheStats,
+    solana_program_runtime::loaded_programs::{ForkGraph, ProgramCache},
     std::sync::atomic::{
         AtomicU64,
         Ordering::{self, Relaxed},
@@ -14,6 +14,7 @@ pub(crate) struct NewEpochTimings {
     pub(crate) calculate_activated_stake_time_us: u64,
     pub(crate) update_epoch_stakes_time_us: u64,
     pub(crate) update_rewards_with_thread_pool_time_us: u64,
+    pub(crate) begin_partitioned_rewards_time_us: u64,
 }
 
 #[derive(Debug, Default)]
@@ -22,6 +23,7 @@ pub(crate) struct RewardsMetrics {
     pub(crate) redeem_rewards_us: u64,
     pub(crate) store_stake_accounts_us: AtomicU64,
     pub(crate) store_commission_accounts_us: AtomicU64,
+    pub(crate) load_and_reward_commission_accounts_us: u64,
 }
 
 pub(crate) struct NewBankTimings {
@@ -39,6 +41,7 @@ pub(crate) struct NewBankTimings {
     pub(crate) feature_set_time_us: u64,
     pub(crate) ancestors_time_us: u64,
     pub(crate) update_epoch_time_us: u64,
+    pub(crate) distribute_rewards_time_us: u64,
     pub(crate) cache_preparation_time_us: u64,
     pub(crate) update_sysvars_time_us: u64,
     pub(crate) fill_sysvar_cache_time_us: u64,
@@ -79,6 +82,11 @@ pub(crate) fn report_new_epoch_metrics(
             i64
         ),
         (
+            "begin_partitioned_rewards_us",
+            timings.begin_partitioned_rewards_time_us,
+            i64
+        ),
+        (
             "calculate_points_us",
             metrics.calculate_points_us.load(Relaxed),
             i64
@@ -92,6 +100,11 @@ pub(crate) fn report_new_epoch_metrics(
         (
             "store_commission_accounts_us",
             metrics.store_commission_accounts_us.load(Relaxed),
+            i64
+        ),
+        (
+            "load_and_reward_commission_accounts_us",
+            metrics.load_and_reward_commission_accounts_us,
             i64
         ),
     );
@@ -135,6 +148,11 @@ pub(crate) fn report_new_bank_metrics(
         ("feature_set_us", timings.feature_set_time_us, i64),
         ("ancestors_us", timings.ancestors_time_us, i64),
         ("update_epoch_us", timings.update_epoch_time_us, i64),
+        (
+            "distribute_rewards_us",
+            timings.distribute_rewards_time_us,
+            i64
+        ),
         (
             "cache_preparation_time_us",
             timings.cache_preparation_time_us,
@@ -205,7 +223,8 @@ pub(crate) fn report_partitioned_reward_metrics(bank: &Bank, timings: RewardsSto
 }
 
 /// Logs the measurement values
-pub(crate) fn report_loaded_programs_stats(stats: &ProgramCacheStats, slot: Slot) {
+pub(crate) fn report_loaded_programs_stats<T: ForkGraph>(cache: &ProgramCache<T>, slot: Slot) {
+    let stats = &cache.stats;
     let hits = stats.hits.load(Ordering::Relaxed);
     let misses = stats.misses.load(Ordering::Relaxed);
     let evictions: u64 = stats.evictions.values().sum();
@@ -235,4 +254,6 @@ pub(crate) fn report_loaded_programs_stats(stats: &ProgramCacheStats, slot: Slot
         ("water_level", water_level, i64),
     );
     stats.log();
+    #[cfg(feature = "dev-context-only-utils")]
+    cache.output_entry_stats();
 }

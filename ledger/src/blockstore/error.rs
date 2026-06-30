@@ -1,26 +1,30 @@
 //! The error that can be produced from Blockstore operations.
 
 use {
-    super::PurgeType, agave_snapshots::hardened_unpack::UnpackError, solana_clock::Slot,
-    thiserror::Error,
+    super::PurgeType, crate::blockstore_meta::BlockLocation,
+    agave_snapshots::hardened_unpack::UnpackError, solana_clock::Slot, thiserror::Error,
 };
 
 #[derive(Error, Debug)]
 pub enum BlockstoreError {
     #[error("shred for index exists")]
     ShredForIndexExists,
-    #[error("invalid shred data")]
-    InvalidShredData(bincode::Error),
+    #[error("invalid shred data: {0}")]
+    InvalidShredData(String),
     #[error("RocksDB error: {0}")]
     RocksDb(#[from] rocksdb::Error),
     #[error("slot is not rooted")]
     SlotNotRooted,
+    #[error("slot is not full")]
+    SlotNotFull,
     #[error("dead slot")]
     DeadSlot,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("serialization error: {0}")]
-    Serialize(#[from] bincode::Error),
+    #[error("deserialization wincode error: {0}")]
+    WincodeRead(#[from] wincode::ReadError),
+    #[error("serialization wincode error: {0}")]
+    WincodeWrite(#[from] wincode::WriteError),
     #[error("fs extra error: {0}")]
     FsExtraError(#[from] fs_extra::error::Error),
     #[error("slot cleaned up")]
@@ -39,6 +43,12 @@ pub enum BlockstoreError {
     ProtobufDecodeError(#[from] prost::DecodeError),
     #[error("parent entries unavailable")]
     ParentEntriesUnavailable,
+    #[error("parent info unavailable: slot {0} location {1}")]
+    ParentInfoUnavailable(Slot, BlockLocation),
+    #[error("merkle tree construction failure: slot {0} location {1}")]
+    MerkleTreeConstructionFailure(Slot, BlockLocation),
+    #[error("merkle proof construction failure: slot {0} location {1}")]
+    MerkleProofConstructionFailure(Slot, BlockLocation),
     #[error("slot unavailable")]
     SlotUnavailable,
     #[error("unsupported transaction version")]
@@ -69,6 +79,31 @@ pub enum BlockstoreError {
     },
     #[error(transparent)]
     ManualPurge(#[from] BlockstoreManualPurgeError),
+    #[error("update parent matches block header for slot {0}")]
+    UpdateParentMatchesBlockHeader(Slot),
+    #[error("update parent slot greater than block header for slot {0}")]
+    UpdateParentSlotGreaterThanBlockHeader(Slot),
+    #[error("unexpected block component")]
+    UnexpectedBlockComponent,
+    #[error("multiple update parents for slot {0}")]
+    MultipleUpdateParents(Slot),
+    #[error("block component mismatch for slot {0}")]
+    BlockComponentMismatch(Slot),
+    #[error("invalid parent info for slot {slot}: parent {parent_slot}, max root {root}")]
+    InvalidParentInfo {
+        slot: Slot,
+        parent_slot: Slot,
+        root: Slot,
+    },
+    #[error(
+        "block header parent {block_header_parent_slot} does not match shred parent \
+         {shred_parent_slot} for slot {slot}"
+    )]
+    BlockHeaderParentMismatch {
+        slot: Slot,
+        block_header_parent_slot: Slot,
+        shred_parent_slot: Slot,
+    },
 }
 pub type Result<T> = std::result::Result<T, BlockstoreError>;
 

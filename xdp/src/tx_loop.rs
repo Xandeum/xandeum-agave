@@ -18,7 +18,7 @@ use {
     libc::{_SC_PAGESIZE, sysconf},
     std::{
         io,
-        net::{IpAddr, Ipv4Addr, SocketAddr},
+        net::{IpAddr, SocketAddr, SocketAddrV4},
         thread,
         time::Duration,
     },
@@ -27,17 +27,13 @@ use {
 pub struct TxLoopConfigBuilder {
     zero_copy: bool,
     maybe_src_mac: Option<MacAddress>,
-    maybe_src_ip: Option<Ipv4Addr>,
-    src_port: u16,
 }
 
 impl TxLoopConfigBuilder {
-    pub fn new(src_port: u16) -> Self {
+    pub fn new() -> Self {
         Self {
             zero_copy: false,
             maybe_src_mac: None,
-            maybe_src_ip: None,
-            src_port,
         }
     }
 
@@ -51,17 +47,10 @@ impl TxLoopConfigBuilder {
         self
     }
 
-    pub fn override_src_ip(&mut self, ip: Ipv4Addr) -> &mut Self {
-        self.maybe_src_ip = Some(ip);
-        self
-    }
-
     pub fn build_with_src_device(self, src_device: &NetworkDevice) -> TxLoopConfig {
         let Self {
             zero_copy,
             maybe_src_mac,
-            maybe_src_ip,
-            src_port,
         } = self;
 
         let src_mac = maybe_src_mac.unwrap_or_else(|| {
@@ -71,19 +60,13 @@ impl TxLoopConfigBuilder {
                 .expect("no src_mac provided, device must have a MAC address")
         });
 
-        let src_ip = maybe_src_ip.unwrap_or_else(|| {
-            // if no source IP is provided, use the device's IPv4 address
-            src_device
-                .ipv4_addr()
-                .expect("no src_ip provided, device must have an IPv4 address")
-        });
+        TxLoopConfig { zero_copy, src_mac }
+    }
+}
 
-        TxLoopConfig {
-            zero_copy,
-            src_mac,
-            src_ip,
-            src_port,
-        }
+impl Default for TxLoopConfigBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -91,16 +74,12 @@ impl TxLoopConfigBuilder {
 pub struct TxLoopConfig {
     zero_copy: bool,
     src_mac: MacAddress,
-    src_ip: Ipv4Addr,
-    src_port: u16,
 }
 
 pub struct TxLoopBuilder<U: Umem> {
     cpu_id: usize,
     zero_copy: bool,
     src_mac: MacAddress,
-    src_ip: Ipv4Addr,
-    src_port: u16,
     queue: DeviceQueue,
     tx_size: usize,
     umem: U,
@@ -113,12 +92,7 @@ impl TxLoopBuilder<OwnedUmem<PageAlignedMemory>> {
         config: TxLoopConfig,
         dev: &NetworkDevice,
     ) -> TxLoopBuilder<OwnedUmem<PageAlignedMemory>> {
-        let TxLoopConfig {
-            zero_copy,
-            src_mac,
-            src_ip,
-            src_port,
-        } = config;
+        let TxLoopConfig { zero_copy, src_mac } = config;
 
         log::info!(
             "starting xdp loop on {} queue {queue_id:?} cpu {cpu_id}",
@@ -159,8 +133,6 @@ impl TxLoopBuilder<OwnedUmem<PageAlignedMemory>> {
             cpu_id,
             zero_copy,
             src_mac,
-            src_ip,
-            src_port,
             queue,
             tx_size,
             umem,
@@ -172,24 +144,20 @@ impl TxLoopBuilder<OwnedUmem<PageAlignedMemory>> {
             cpu_id,
             zero_copy,
             src_mac,
-            src_ip,
-            src_port,
             queue,
             tx_size,
             umem,
         } = self;
 
         let queue_id = queue.id();
-        let (socket, tx) = match Socket::tx(queue, umem, zero_copy, tx_size * 2, tx_size) {
-            Ok(socket_tx) => socket_tx,
-            Err(err) => {
+        let (socket, tx) =
+            Socket::tx(queue, umem, zero_copy, tx_size * 2, tx_size).map_err(|err| {
                 log::error!(
                     "failed to create AF_XDP TX socket for queue {queue_id:?} on CPU {cpu_id}: \
                      {err}"
                 );
-                return Err(err);
-            }
-        };
+                err
+            })?;
 
         let Tx {
             // this is where we'll queue frames
@@ -202,8 +170,6 @@ impl TxLoopBuilder<OwnedUmem<PageAlignedMemory>> {
         Ok(TxLoop {
             cpu_id,
             src_mac,
-            src_ip,
-            src_port,
             socket,
             ring,
             completion,
@@ -214,21 +180,35 @@ impl TxLoopBuilder<OwnedUmem<PageAlignedMemory>> {
 pub struct TxLoop<U: Umem> {
     cpu_id: usize,
     src_mac: MacAddress,
-    src_ip: Ipv4Addr,
-    src_port: u16,
     socket: Socket<U>,
     ring: TxRing<U::Frame>,
     completion: TxCompletionRing,
 }
 
+/// [`TxPacket`] represents a packet to transmit via XDP to a list of addresses with the provided
+/// `payload` and source address.
+pub trait TxPacket {
+    type Addrs: AsRef<[SocketAddr]>;
+    type Payload: AsRef<[u8]>;
+
+    /// List of destination addresses to which the packet should be sent.
+    fn dst_addrs(&self) -> &Self::Addrs;
+
+    /// Payload of the packet to be sent.
+    fn payload(&self) -> &Self::Payload;
+
+    /// Source address used when sending the packet.
+    fn src_addr(&self) -> SocketAddrV4;
+}
+
 impl<U: Umem> TxLoop<U> {
-    pub fn run<T: AsRef<[u8]>, A: AsRef<[SocketAddr]>, R: Fn(&IpAddr) -> Option<NextHop>>(
+    pub fn run<T: TxPacket, R: Fn(&IpAddr) -> Option<NextHop>>(
         self,
-        receiver: Receiver<(A, T)>,
-        drop_sender: Sender<(A, T)>,
+        receiver: Receiver<T>,
+        drop_sender: Sender<T>,
         route_fn: R,
     ) {
-        // How long we sleep waiting to receive shreds from the channel.
+        // How long we sleep waiting to receive packets from the channel.
         const RECV_TIMEOUT: Duration = Duration::from_nanos(1000);
 
         const MAX_TIMEOUTS: usize = 1;
@@ -241,8 +221,6 @@ impl<U: Umem> TxLoop<U> {
         let TxLoop {
             cpu_id,
             src_mac,
-            src_ip,
-            src_port,
             mut socket,
             mut ring,
             mut completion,
@@ -254,20 +232,22 @@ impl<U: Umem> TxLoop<U> {
         let umem = socket.umem();
         let umem_tx_capacity = umem.available();
 
-        // Local buffer where we store packets before sending themi.
+        // Local buffer where we store packets before sending them.
         let mut batched_items = Vec::with_capacity(BATCH_SIZE);
 
         // How many packets we've batched. This is _not_ batched_items.len(), but item * peers. For
         // example if we have 3 packets to transmit to 2 destination addresses each, we have 6 batched
         // packets.
         let mut batched_packets = 0;
+        // How many descriptors are written into the TX ring but not yet committed.
+        let mut written_uncommitted = 0;
 
         let mut timeouts = 0;
         loop {
             match receiver.try_recv() {
-                Ok((addrs, payload)) => {
-                    batched_packets += addrs.as_ref().len();
-                    batched_items.push((addrs, payload));
+                Ok(item) => {
+                    batched_packets += item.dst_addrs().as_ref().len();
+                    batched_items.push(item);
                     timeouts = 0;
                     if batched_packets < BATCH_SIZE {
                         continue;
@@ -279,8 +259,8 @@ impl<U: Umem> TxLoop<U> {
                         thread::sleep(RECV_TIMEOUT);
                     } else {
                         timeouts = 0;
+                        commit_pending(&mut ring, &mut written_uncommitted);
                         // we haven't received anything in a while, kick the driver
-                        ring.commit();
                         kick(&ring);
                     }
                 }
@@ -292,13 +272,15 @@ impl<U: Umem> TxLoop<U> {
                 }
             };
 
-            // this is the number of packets after which we commit the ring and kick the driver if
-            // necessary
-            let mut chunk_remaining = BATCH_SIZE.min(batched_packets);
-
-            for (addrs, payload) in batched_items.drain(..) {
-                for addr in addrs.as_ref() {
+            for item in batched_items.drain(..) {
+                let src_addr = item.src_addr();
+                let src_ip = src_addr.ip();
+                let src_port = src_addr.port();
+                for addr in item.dst_addrs().as_ref() {
                     if ring.available() == 0 || umem.available() == 0 {
+                        commit_pending(&mut ring, &mut written_uncommitted);
+                        kick(&ring);
+
                         // loop until we have space for the next packet
                         loop {
                             completion.sync(true);
@@ -328,7 +310,8 @@ impl<U: Umem> TxLoop<U> {
                         panic!("IPv6 not supported");
                     };
 
-                    let len = payload.as_ref().len();
+                    let payload = item.payload().as_ref();
+                    let len = payload.len();
 
                     let dst = addr.ip();
                     let Some(next_hop) = route_fn(&dst) else {
@@ -341,16 +324,16 @@ impl<U: Umem> TxLoop<U> {
                     if let Some(gre) = &next_hop.gre {
                         frame.set_len(gre_packet_size(len));
                         let packet = umem.map_frame_mut(&frame);
-                        let inner_src_ip = next_hop.preferred_src_ip.unwrap_or(src_ip);
+                        let inner_src_ip = next_hop.preferred_src_ip.as_ref().unwrap_or(src_ip);
                         if let Err(err) = construct_gre_packet(
                             packet,
                             &src_mac,
                             &gre.mac_addr,
-                            &inner_src_ip,
+                            inner_src_ip,
                             &dst_ip,
                             src_port,
                             addr.port(),
-                            payload.as_ref(),
+                            payload,
                             &gre.tunnel_info,
                         ) {
                             log::warn!("dropping packet: {err}");
@@ -377,20 +360,20 @@ impl<U: Umem> TxLoop<U> {
                         let packet = umem.map_frame_mut(&frame);
 
                         // write the payload first as it's needed for checksum calculation (if enabled)
-                        packet[PACKET_HEADER_SIZE..][..len].copy_from_slice(payload.as_ref());
+                        packet[PACKET_HEADER_SIZE..][..len].copy_from_slice(payload);
 
                         write_eth_header(packet, &src_mac.0, &dest_mac.0);
 
                         write_ip_header_for_udp(
                             &mut packet[ETH_HEADER_SIZE..],
-                            &src_ip,
+                            src_ip,
                             &dst_ip,
                             (UDP_HEADER_SIZE + len) as u16,
                         );
 
                         write_udp_header(
                             &mut packet[ETH_HEADER_SIZE + IP_HEADER_SIZE..],
-                            &src_ip,
+                            src_ip,
                             src_port,
                             &dst_ip,
                             addr.port(),
@@ -406,22 +389,21 @@ impl<U: Umem> TxLoop<U> {
                         .expect("failed to write to ring");
 
                     batched_packets -= 1;
-                    chunk_remaining -= 1;
+                    written_uncommitted += 1;
 
-                    // check if it's time to commit the ring and kick the driver
-                    if chunk_remaining == 0 {
-                        chunk_remaining = BATCH_SIZE.min(batched_packets);
-
-                        // commit new frames
-                        ring.commit();
+                    // check if it's time to publish descriptors and kick the driver
+                    if written_uncommitted >= BATCH_SIZE {
+                        commit_pending(&mut ring, &mut written_uncommitted);
                         kick(&ring);
                     }
                 }
-                let _ = drop_sender.try_send((addrs, payload));
+                let _ = drop_sender.try_send(item);
             }
             debug_assert_eq!(batched_packets, 0);
         }
         assert_eq!(batched_packets, 0);
+        commit_pending(&mut ring, &mut written_uncommitted);
+        kick(&ring);
 
         // drain the ring
         while umem.available() < umem_tx_capacity || ring.available() < ring.capacity() {
@@ -442,6 +424,15 @@ impl<U: Umem> TxLoop<U> {
             kick(&ring);
         }
     }
+}
+
+#[inline(always)]
+fn commit_pending<F: Frame>(ring: &mut TxRing<F>, pending_uncommitted: &mut usize) {
+    if *pending_uncommitted == 0 {
+        return;
+    }
+    ring.commit();
+    *pending_uncommitted = 0;
 }
 
 // With some drivers, or always when we work in SKB mode, we need to explicitly kick the driver once

@@ -6,14 +6,20 @@ use {
         vote::Vote,
     },
     bitvec::vec::BitVec,
-    rayon::{iter::IntoParallelRefIterator, join},
+    rayon::iter::IntoParallelRefIterator,
     solana_bls_signatures::{
         BlsError, PubkeyProjective, Signature as BlsSignature, SignatureProjective,
-        VerifiablePubkey, pubkey::Pubkey as BlsPubkey, signature::AsSignatureAffine,
+        VerifySignature,
+        pubkey::{AggregatePubkey, PopVerified, PubkeyAffine as BlsPubkeyAffine},
+        signature::AsSignatureAffine,
     },
     solana_signer_store::{DecodeError, Decoded, decode},
     thiserror::Error,
 };
+
+/// Minimum size of the rayon thread pool required for this crate to use the thread pool.
+///  Otherwise, the operations will be done sequentially on the current thread.
+const THREAD_POOL_THRESHOLD: usize = 4;
 
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum Error {
@@ -60,7 +66,7 @@ pub enum Error {
 pub fn verify_certificate(
     cert: &Certificate,
     max_validators: usize,
-    mut rank_map: impl FnMut(usize) -> Option<(u64, BlsPubkey)>,
+    mut rank_map: impl FnMut(usize) -> Option<(u64, PopVerified<BlsPubkeyAffine>)>,
 ) -> Result<u64, Error> {
     let mut total_stake = 0u64;
 
@@ -133,7 +139,7 @@ pub fn verify_base2<S: AsSignatureAffine>(
     signature: &S,
     ranks: &[u8],
     max_validators: usize,
-    rank_map: impl FnMut(usize) -> Option<BlsPubkey>,
+    rank_map: impl FnMut(usize) -> Option<PopVerified<BlsPubkeyAffine>>,
 ) -> Result<(), Error> {
     let ranks = decode(ranks, max_validators).map_err(Error::Decode)?;
     let ranks = match ranks {
@@ -147,7 +153,7 @@ fn verify_single_vote_signature<S: AsSignatureAffine>(
     payload: &[u8],
     signature: &S,
     ranks: &BitVec<u8>,
-    rank_map: impl FnMut(usize) -> Option<BlsPubkey>,
+    rank_map: impl FnMut(usize) -> Option<PopVerified<BlsPubkeyAffine>>,
 ) -> Result<(), Error> {
     let pubkeys = collect_pubkeys(ranks, rank_map)?;
     let agg_pubkey = aggregate_pubkeys(&pubkeys)?;
@@ -166,7 +172,7 @@ fn verify_base3(
     signature: &BlsSignature,
     ranks: &[u8],
     max_validators: usize,
-    mut rank_map: impl FnMut(usize) -> Option<BlsPubkey>,
+    mut rank_map: impl FnMut(usize) -> Option<PopVerified<BlsPubkeyAffine>>,
 ) -> Result<(), Error> {
     let ranks = decode(ranks, max_validators).map_err(Error::Decode)?;
     match ranks {
@@ -178,32 +184,57 @@ fn verify_base3(
             let primary_pubkeys = collect_pubkeys(&ranks, &mut rank_map)?;
             let fallback_pubkeys = collect_pubkeys(&fallback_ranks, rank_map)?;
 
-            let (primary_agg_res, fallback_agg_res) = join(
-                || PubkeyProjective::par_aggregate(primary_pubkeys.par_iter()),
-                || PubkeyProjective::par_aggregate(fallback_pubkeys.par_iter()),
-            );
+            if primary_pubkeys.is_empty() {
+                let agg_pubkey = aggregate_pubkeys(&fallback_pubkeys)?;
+                Ok(agg_pubkey.verify_signature(signature, fallback_payload)?)
+            } else if fallback_pubkeys.is_empty() {
+                let agg_pubkey = aggregate_pubkeys(&primary_pubkeys)?;
+                Ok(agg_pubkey.verify_signature(signature, payload)?)
+            } else {
+                let mut all_pubkeys = Vec::with_capacity(
+                    primary_pubkeys.len().saturating_add(fallback_pubkeys.len()),
+                );
+                all_pubkeys.extend_from_slice(&primary_pubkeys);
+                all_pubkeys.extend_from_slice(&fallback_pubkeys);
 
-            let pubkeys = [primary_agg_res?, fallback_agg_res?];
+                let mut all_messages = Vec::with_capacity(all_pubkeys.len());
+                all_messages.resize(primary_pubkeys.len(), payload);
+                all_messages.resize(all_pubkeys.len(), fallback_payload);
 
-            Ok(SignatureProjective::par_verify_distinct_aggregated(
-                &pubkeys,
-                signature,
-                &[payload, fallback_payload],
-            )?)
+                if rayon::current_num_threads() < THREAD_POOL_THRESHOLD {
+                    Ok(SignatureProjective::verify_distinct_aggregated(
+                        all_pubkeys.iter(),
+                        signature,
+                        all_messages.into_iter(),
+                    )?)
+                } else {
+                    Ok(SignatureProjective::par_verify_distinct_aggregated(
+                        &all_pubkeys,
+                        signature,
+                        &all_messages,
+                    )?)
+                }
+            }
         }
     }
 }
 
 /// Aggregates a slice of public keys into a single projective public key.
-pub fn aggregate_pubkeys(pubkeys: &[BlsPubkey]) -> Result<PubkeyProjective, Error> {
-    PubkeyProjective::par_aggregate(pubkeys.par_iter()).map_err(Error::VerifySig)
+pub fn aggregate_pubkeys(
+    pubkeys: &[PopVerified<BlsPubkeyAffine>],
+) -> Result<AggregatePubkey<PubkeyProjective>, Error> {
+    if rayon::current_num_threads() < THREAD_POOL_THRESHOLD {
+        PubkeyProjective::aggregate(pubkeys.iter()).map_err(Error::VerifySig)
+    } else {
+        PubkeyProjective::par_aggregate(pubkeys.par_iter()).map_err(Error::VerifySig)
+    }
 }
 
 /// Collects public keys sequentially based on the provided ranks bitmap.
 pub fn collect_pubkeys(
     ranks: &BitVec<u8>,
-    mut rank_map: impl FnMut(usize) -> Option<BlsPubkey>,
-) -> Result<Vec<BlsPubkey>, Error> {
+    mut rank_map: impl FnMut(usize) -> Option<PopVerified<BlsPubkeyAffine>>,
+) -> Result<Vec<PopVerified<BlsPubkeyAffine>>, Error> {
     let mut pubkeys = Vec::with_capacity(ranks.count_ones());
     for rank in ranks.iter_ones() {
         let pubkey = rank_map(rank).ok_or(Error::MissingRank)?;
@@ -276,7 +307,7 @@ mod test {
         );
         assert_eq!(
             verify_certificate(&cert, 10, |rank| {
-                bls_keypairs.get(rank).map(|kp| (100, kp.public.into()))
+                bls_keypairs.get(rank).map(|kp| (100, kp.public))
             })
             .unwrap(),
             600
@@ -309,7 +340,7 @@ mod test {
         let cert = builder.build().expect("Failed to build certificate");
         assert_eq!(
             verify_certificate(&cert, 10, |rank| {
-                bls_keypairs.get(rank).map(|kp| (100, kp.public.into()))
+                bls_keypairs.get(rank).map(|kp| (100, kp.public))
             })
             .unwrap(),
             700
@@ -333,15 +364,41 @@ mod test {
 
         let cert = Certificate {
             cert_type,
-            signature: BLSSignature::default(), // Use a default/wrong signature
+            signature: BLSSignature([0; 192]), // Use a default/wrong signature
             bitmap: encoded_bitmap,
         };
         assert_eq!(
             verify_certificate(&cert, 10, |rank| {
-                bls_keypairs.get(rank).map(|kp| (100, kp.public.into()))
+                bls_keypairs.get(rank).map(|kp| (100, kp.public))
             })
             .unwrap_err(),
             Error::VerifySig(BlsError::PointConversion)
+        );
+    }
+
+    #[test]
+    fn base3_cert_with_no_primary_verifies() {
+        let max_validators = 10;
+        let bls_keypairs = create_bls_keypairs(max_validators);
+        let slot = 20;
+        let block_hash = Hash::new_unique();
+        let cert_type = CertificateType::NotarizeFallback(slot, block_hash);
+        let mut builder = CertificateBuilder::new(cert_type);
+        let vote = Vote::new_notarization_fallback_vote(slot, block_hash);
+        let vote_msgs = (0..max_validators)
+            .map(|i| create_signed_vote_message(&bls_keypairs, vote, i))
+            .collect::<Vec<_>>();
+        builder.aggregate(&vote_msgs).unwrap();
+        let cert = builder.build().unwrap();
+        let per_validator_stake = 100;
+        assert_eq!(
+            verify_certificate(&cert, 10, |rank| {
+                bls_keypairs
+                    .get(rank)
+                    .map(|kp| (per_validator_stake, kp.public))
+            })
+            .unwrap(),
+            per_validator_stake * max_validators as u64
         );
     }
 }

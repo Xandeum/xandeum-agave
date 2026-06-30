@@ -197,6 +197,7 @@ pub fn try_load_bank_forks_from_snapshot(
             genesis_config,
             &process_options.runtime_config,
             process_options.debug_keys.clone(),
+            None, // leader_for_tests
             process_options.limit_load_slot_count_from_snapshot,
             process_options.verify_index,
             process_options.accounts_db_config.clone(),
@@ -216,12 +217,13 @@ pub fn try_load_bank_forks_from_snapshot(
 
         snapshot_bank_utils::bank_from_snapshot_archives(
             account_paths,
-            &snapshot_config.bank_snapshots_dir,
             &full_snapshot_archive_info,
             incremental_snapshot_archive_info.as_ref(),
+            snapshot_config,
             genesis_config,
             &process_options.runtime_config,
             process_options.debug_keys.clone(),
+            None, // leader_for_tests
             process_options.limit_load_slot_count_from_snapshot,
             process_options.accounts_db_skip_shrink,
             process_options.accounts_db_force_initial_clean,
@@ -250,6 +252,13 @@ pub fn try_load_bank_forks_from_snapshot(
             .accounts
             .accounts_db
             .set_latest_full_snapshot_slot(full_snapshot_archive_info.slot());
+        // Set the last swept slot so the first full snapshot only triggers
+        // cleaning of zero lamport single ref accounts between the previous
+        // full snapshot and the new full snapshot
+        bank.rc
+            .accounts
+            .accounts_db
+            .set_last_swept_full_snapshot_slot(full_snapshot_archive_info.slot());
     } else {
         assert!(
             bank.rc

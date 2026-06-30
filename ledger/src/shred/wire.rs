@@ -84,7 +84,7 @@ pub(super) fn get_shred_variant(shred: &[u8]) -> Result<ShredVariant, Error> {
 }
 
 #[inline]
-pub(super) fn get_shred_type(shred: &[u8]) -> Result<ShredType, Error> {
+pub fn get_shred_type(shred: &[u8]) -> Result<ShredType, Error> {
     get_shred_variant(shred).map(ShredType::from)
 }
 
@@ -411,9 +411,7 @@ pub(crate) fn corrupt_packet<R: Rng>(
 mod tests {
     use {
         super::*,
-        crate::shred::{
-            SHREDS_PER_FEC_BLOCK, tests::make_merkle_shreds_for_tests, traits::ShredData,
-        },
+        crate::shred::{SHREDS_PER_FEC_BLOCK, make_merkle_shreds_for_tests, traits::ShredData},
         assert_matches::assert_matches,
         rand::Rng,
         solana_perf::packet::PacketFlags,

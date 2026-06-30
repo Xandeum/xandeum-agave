@@ -8,6 +8,7 @@ use {
     solana_bls_signatures::BlsError,
     solana_clock::Slot,
     solana_pubkey::Pubkey,
+    std::collections::HashSet,
     thiserror::Error,
 };
 
@@ -29,11 +30,8 @@ pub enum Error {
     BlsCertVerify(#[from] BlsCertVerifyError),
     #[error("verify signature failed with {0:?}")]
     VerifySig(#[from] BlsError),
-    #[error("empty certs were provided")]
-    Empty,
 }
 
-#[allow(dead_code)]
 /// Extracts the slot corresponding to the provided reward certs.
 ///
 /// Returns Ok(None) if no certs were provided.
@@ -69,35 +67,33 @@ fn extract_slot(
 }
 
 /// Struct built by validating incoming reward certs.
-#[allow(dead_code)]
-pub(crate) struct ValidatedRewardCert {
+pub struct ValidatedRewardCert {
     /// List of validators that were present in the reward certs.
-    validators: Vec<Pubkey>,
+    validators: HashSet<Pubkey>,
     /// The slot the reward certs refer to
     reward_slot: Slot,
 }
 
 impl ValidatedRewardCert {
     /// If validation of the provided reward certs succeeds, returns an instance of [`ValidatedRewardCert`].
-    #[allow(dead_code)]
-    pub(crate) fn try_new(
+    pub fn try_new(
         bank: &Bank,
         skip: &Option<SkipRewardCertificate>,
         notar: &Option<NotarRewardCertificate>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Option<Self>, Error> {
         let Some(reward_slot) = extract_slot(bank.slot(), skip, notar)? else {
-            return Err(Error::Empty);
+            return Ok(None);
         };
         let rank_map = bank
             .epoch_stakes_from_slot(reward_slot)
             .ok_or(Error::NoRankMap)?
             .bls_pubkey_to_rank_map();
         let max_validators = rank_map.len();
-        let mut validators = Vec::with_capacity(max_validators);
+        let mut validators = HashSet::with_capacity(max_validators);
 
         let mut rank_map = |ind: usize| {
             rank_map.get_pubkey_stake_entry(ind).map(|entry| {
-                validators.push(entry.pubkey);
+                validators.insert(entry.vote_account_pubkey);
                 entry.bls_pubkey
             })
         };
@@ -127,18 +123,26 @@ impl ValidatedRewardCert {
             )?
         }
         if validators.is_empty() {
-            return Err(Error::Empty);
+            return Ok(None);
         }
-        Ok(Self {
+        Ok(Some(Self {
             validators,
             reward_slot,
-        })
+        }))
     }
 
     /// Returns the validators that were extracted from the reward certs.
-    #[allow(dead_code)]
-    pub(crate) fn into_parts(self) -> (Slot, Vec<Pubkey>) {
+    pub(crate) fn into_parts(self) -> (Slot, HashSet<Pubkey>) {
         (self.reward_slot, self.validators)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(reward_slot: Slot, validators: Vec<Pubkey>) -> Self {
+        let validators = validators.into_iter().collect();
+        Self {
+            reward_slot,
+            validators,
+        }
     }
 }
 
@@ -152,12 +156,14 @@ mod tests {
         agave_votor_messages::consensus_message::VoteMessage,
         bitvec::vec::BitVec,
         solana_bls_signatures::{
-            Keypair as BlsKeypair, Pubkey as BLSPubkey, Signature as BLSSignature,
+            Keypair as BlsKeypair, Signature as BLSSignature,
             SignatureCompressed as BlsSignatureCompressed, SignatureProjective,
+            pubkey::PubkeyCompressed as BLSPubkeyCompressed,
         },
         solana_hash::Hash,
+        solana_leader_schedule::SlotLeader,
         solana_signer_store::encode_base2,
-        std::{collections::HashMap, sync::Arc},
+        std::collections::HashMap,
     };
 
     fn new_vote(vote: Vote, rank: usize, keypair: &BlsKeypair) -> VoteMessage {
@@ -199,15 +205,21 @@ mod tests {
             .collect::<Vec<_>>();
         let keypair_map = validator_keypairs
             .iter()
-            .map(|k| (BLSPubkey::from(k.bls_keypair.public), k.bls_keypair.clone()))
+            .map(|k| {
+                (
+                    BLSPubkeyCompressed::from(*k.bls_keypair.public),
+                    k.bls_keypair.clone(),
+                )
+            })
             .collect::<HashMap<_, _>>();
         let genesis = create_genesis_config_with_alpenglow_vote_accounts(
             1_000_000_000,
             &validator_keypairs,
             vec![100; validator_keypairs.len()],
         );
-        let bank = Arc::new(Bank::new_for_tests(&genesis.genesis_config));
-        let bank = Bank::new_from_parent(bank, &Pubkey::default(), bank_slot);
+        let (bank, _bank_forks) =
+            Bank::new_for_tests(&genesis.genesis_config).wrap_with_bank_forks_for_tests();
+        let bank = Bank::new_from_parent(bank, SlotLeader::default(), bank_slot);
 
         let rank_map = bank
             .epoch_stakes_from_slot(reward_slot)
@@ -215,8 +227,9 @@ mod tests {
             .bls_pubkey_to_rank_map();
         let signing_keys = (0..num_validators)
             .map(|index| {
+                let pubkey_affine = rank_map.get_pubkey_stake_entry(index).unwrap().bls_pubkey;
                 keypair_map
-                    .get(&rank_map.get_pubkey_stake_entry(index).unwrap().bls_pubkey)
+                    .get(&BLSPubkeyCompressed::from(*pubkey_affine))
                     .unwrap()
             })
             .collect::<Vec<_>>();
@@ -240,6 +253,7 @@ mod tests {
 
         let validated_reward_cert =
             ValidatedRewardCert::try_new(&bank, &Some(skip_reward_cert), &Some(notar_reward_cert))
+                .unwrap()
                 .unwrap();
         assert_eq!(validated_reward_cert.validators.len(), num_validators);
     }

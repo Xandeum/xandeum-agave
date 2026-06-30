@@ -1,11 +1,13 @@
-pub use solana_program_runtime::execution_budget::{
-    MAX_CALL_DEPTH, MAX_INSTRUCTION_STACK_DEPTH, STACK_FRAME_SIZE, SVMTransactionExecutionBudget,
-    SVMTransactionExecutionCost,
+pub use solana_program_runtime::{
+    execution_budget::{
+        MAX_CALL_DEPTH, MAX_INSTRUCTION_STACK_DEPTH, SVMTransactionExecutionBudget,
+        SVMTransactionExecutionCost,
+    },
+    solana_sbpf::vm::get_stack_frame_size,
 };
 use {
     solana_fee_structure::FeeDetails,
     solana_program_runtime::execution_budget::SVMTransactionExecutionAndFeeBudgetLimits,
-    std::num::NonZeroU32,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,10 +158,10 @@ impl Default for ComputeBudget {
 }
 
 impl ComputeBudget {
-    pub fn new_with_defaults(simd_0268_active: bool, simd_0339_active: bool) -> Self {
+    pub fn new_with_defaults(simd_0268_active: bool) -> Self {
         Self::from_budget_and_cost(
             &SVMTransactionExecutionBudget::new_with_defaults(simd_0268_active),
-            &SVMTransactionExecutionCost::new_with_defaults(simd_0339_active),
+            &SVMTransactionExecutionCost::default(),
         )
     }
 
@@ -301,7 +303,7 @@ impl ComputeBudget {
 
     pub fn get_compute_budget_and_limits(
         &self,
-        loaded_accounts_data_size_limit: NonZeroU32,
+        loaded_accounts_data_size_limit: u32,
         fee_details: FeeDetails,
     ) -> SVMTransactionExecutionAndFeeBudgetLimits {
         SVMTransactionExecutionAndFeeBudgetLimits {
