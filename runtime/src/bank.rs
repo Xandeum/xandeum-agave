@@ -101,7 +101,10 @@ use {
         storable_accounts::StorableAccounts,
         utils::create_account_shared_data,
     },
-    solana_builtins::{BUILTINS, STATELESS_BUILTINS},
+    solana_builtins::{
+        BUILTINS, STATELESS_BUILTINS,
+        core_bpf_migration::{CoreBpfMigrationConfig, CoreBpfMigrationTargetType},
+    },
     solana_clock::{
         BankId, Epoch, INITIAL_RENT_EPOCH, MAX_PROCESSING_AGE, MAX_TRANSACTION_FORWARDING_DELAY,
         Slot, SlotIndex, UnixTimestamp,
@@ -5689,6 +5692,53 @@ impl Bank {
             ) {
                 error!("Failed to upgrade Core BPF Stake program: {e}");
             }
+        }
+
+        if self
+            .feature_set
+            .is_active(&feature_set::xandeum_remigrate_stake_program_to_core_bpf::id())
+        {
+            self.remigrate_stake_program_core_bpf_migration();
+        }
+    }
+
+    fn remigrate_stake_program_core_bpf_migration(&mut self) {
+        let stake_program_id = solana_sdk_ids::stake::id();
+        let Some(stake_account) = self.get_account_with_fixed_root(&stake_program_id) else {
+            warn!("Stake program repair skipped: Stake111 account not found");
+            return;
+        };
+
+        if stake_account.owner() == &bpf_loader_upgradeable::id() {
+            return;
+        }
+
+        if stake_account.owner() != &native_loader::id() {
+            warn!(
+                "Stake program repair skipped: unexpected owner {}",
+                stake_account.owner()
+            );
+            return;
+        }
+
+        let config = CoreBpfMigrationConfig {
+            source_buffer_address:
+                feature_set::xandeum_remigrate_stake_program_to_core_bpf::buffer::id(),
+            upgrade_authority_address: None,
+            feature_id: feature_set::xandeum_remigrate_stake_program_to_core_bpf::id(),
+            verified_build_hash: None,
+            migration_target: CoreBpfMigrationTargetType::Builtin,
+            datapoint_name: "xandeum_remigrate_stake_program_to_core_bpf",
+        };
+
+        if let Err(e) = self.migrate_builtin_to_core_bpf(
+            &stake_program_id,
+            &config,
+            self.feature_set
+                .snapshot()
+                .relax_programdata_account_check_migration,
+        ) {
+            warn!("Stake program repair migration failed: {e}");
         }
     }
 

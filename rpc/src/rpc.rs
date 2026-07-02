@@ -145,7 +145,7 @@ type RpcCustomResult<T> = std::result::Result<T, RpcCustomError>;
 
 pub const MAX_REQUEST_BODY_SIZE: usize = 50 * (1 << 10); // 50kB
 pub const PERFORMANCE_SAMPLES_LIMIT: usize = 720;
-pub const XAND_SHIELD_PROGRAM_ID: &str = "xSHLJPXU8QW3A9kGiRoL94bksJ7ZZPY4dUwJPAT8CVK";
+pub const XAND_SHIELD_PROGRAM_ID: &str = "HhfFZTzmKUQvzN2K9rJ161h3hhQZYRzVitwTyy5mUhV7";
 
 fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
     RpcResponse {

@@ -1270,6 +1270,14 @@ pub mod migrate_stake_program_to_core_bpf {
     solana_pubkey::declare_id!("6M4oQ6eXneVhtLoiAr4yRYQY43eVLjrKbiDZDJc892yk");
 }
 
+pub mod xandeum_remigrate_stake_program_to_core_bpf {
+    solana_pubkey::declare_id!("DznGuQ616uZwpGM5zbbzYtTFKxEzBfgAiYupBfp4vrL6");
+
+    pub mod buffer {
+        solana_pubkey::declare_id!("3X7pcr9cAvgN8MTq8LvUMcfPqH2T4kBwED9gg3e6KaHz");
+    }
+}
+
 pub mod deplete_cu_meter_on_vm_failure {
     solana_pubkey::declare_id!("B7H2caeia4ZFcpE3QcgMqbiWiBtWrdBRBSJ1DY6Ktxbq");
 }
@@ -2382,6 +2390,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             migrate_stake_program_to_core_bpf::id(),
             "SIMD-0196: Migrate Stake program to Core BPF #3655",
+        ),
+        (
+            xandeum_remigrate_stake_program_to_core_bpf::id(),
+            "Xandeum: repair Stake program Core BPF migration",
         ),
         (
             deplete_cu_meter_on_vm_failure::id(),
