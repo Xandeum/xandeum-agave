@@ -1,5 +1,5 @@
 # populate this on the stable branch
-splTokenCliVersion=5.5.0
+splTokenCliVersion=5.6.1
 
 maybeSplTokenCliVersionArg=
 if [[ -n "$splTokenCliVersion" ]]; then

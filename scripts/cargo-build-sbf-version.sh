@@ -1,5 +1,5 @@
 # populate this on the stable branch
-cargoBuildSbfVersion=4.0.0
+cargoBuildSbfVersion=4.1.0
 cargoTestSbfVersion=4.0.0
 
 maybeCargoBuildSbfVersionArg=
